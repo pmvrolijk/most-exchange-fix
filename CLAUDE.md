@@ -1,0 +1,75 @@
+# CLAUDE.md
+
+Guidance for Claude Code working in this repository. **Rules only.** Each one is the residue of a
+defect or a decision; the reasoning lives in [`docs/Rationale.md`](docs/Rationale.md), cited as → R§n.
+Do not change a rule without reading its section there.
+
+| | |
+| --- | --- |
+| **Where things stand, what to do next** | [`docs/Status.md`](docs/Status.md) — the session entry point |
+| **Normative behaviour** | [`docs/Design.md`](docs/Design.md) — authoritative. §8 is the open list |
+| **Why a rule exists** | [`docs/Rationale.md`](docs/Rationale.md) |
+| **How a change happened** | [`docs/Handover.md`](docs/Handover.md) — archive, §2a– |
+| **What an adapter must do** | `../most-exchange/docs/Adapters.md` — the exchange's contract, which this repo implements |
+
+`docs/Design.md` is the specification. Read it before implementing anything, and update it in the
+same commit when the design changes.
+
+This is the **FIX adapter** for most-exchange, AGPL-3.0-or-later like the exchange: an Artio acceptor in front of the exchange's order
+entry gateways and market data feeds. Kotlin, packages `nl.lamia.most.exchange.fixadapter.*`. Three
+modules — `fix-session`, `order-entry`, `market-data` — scaffolded, nothing implemented yet.
+
+## Commands
+
+```sh
+./gradlew build                              # the SDK from most-exchange's GitLab registry
+./gradlew build -PmostExchange.local=true    # the SDK built from ../most-exchange instead
+./gradlew :fix-session:test                  # one module
+tools/trust-gitlab-ca.sh                     # once per machine: trust the registry's private CA
+```
+
+- **The SDK comes from the registry by default.** That needs `gitlabToken` and the trust store in
+  `~/.gradle/gradle.properties`, never in this repo. Use `-PmostExchange.local=true` only while
+  changing the SDK, and publish it before relying on the change here. → R§3
+
+## The non-negotiables
+
+1. **An order whose fate is unknown is never reported as rejected.** `OrderFate.AMBIGUOUS` is an
+   unknown status to the client. A `GATEWAY_UNAVAILABLE` is a gateway's, not the market's, and the
+   SDK never delivers it as a report. Only `NEVER_SEQUENCED` may become a reject or a resend.
+   An ambiguous order is restated with its last status and OrdStatusUnknown=Y, never as rejected,
+   cancelled, expired or Done for Day. (most-exchange Adapters.md §3–§4, Design.md §3.4) → R§6
+2. **Back-pressure is not loss.** `SendResult.BACK_PRESSURED` maps to Artio's `Action.ABORT`, so the
+   FIX message is redelivered and not consumed. Never drop it, and never spin on it on the library
+   thread.
+3. **Prices and quantities are fixed-point `int64` with 8 implied decimals** on the exchange side.
+   FIX decimals are converted with the SDK's `PriceCodec`, never through `Double`.
+4. **Exchange-facing logic lives in most-exchange's `client`**, never here. That covers connecting,
+   gateway switching, the `reportSeq` ledger, the resend fence, the mass status and the encoders.
+   If the adapter needs more of it, change `client` in `../most-exchange` (it is in this build) and
+   use it. Never copy it. → R§1
+5. **The participant comes from the FIX session, never from the message.** One session acts for one
+   configured `participantId`. A Logon that does not match a configured session's CompIDs and
+   credentials is refused. (Design.md §2)
+6. **Artio is pinned to the release built on the exchange's Aeron.** Today that is Artio 0.182 for
+   Aeron 1.53.0. Bump Artio only together with most-exchange's `aeron`. `DependencyAlignmentTest`
+   fails if Gradle resolves any other Aeron. → R§2
+7. **A `reportSeq` is consumed only behind the fsynced archive.** The durable first-missing
+   `reportSeq` advances only past reports whose 35=8 (or offline `SessionWriter` write) is at or
+   below the archive's recorded position, at `fileSyncLevel=1`. Never store what the SDK's `save()`
+   hands over as is: it is a ceiling. A back-pressured 35=8 aborts the report, never queues it.
+   RocksDB stays in point-in-time WAL recovery: its unfsynced WAL is safe only because a crash
+   leaves a prefix. (Design.md §6.1–§6.2) → R§4
+8. **The exchange `clOrdId` is `(sequenceIndex << 32) | MsgSeqNum`** of the inbound 35=D/F, never an
+   allocated counter. Refuse to start if Artio's `sequenceIndex` is below the stored one. → R§5
+
+## Provenance
+
+## Skills
+
+`.claude/skills/` holds the procedures this project runs on: `session-open`, `session-close`,
+`spec-first-test`, `decision-fork`, `verify-for-real`, `perf-claim`. They are adapted from
+most-exchange's.
+
+**Commits are the user's call.** Do not run `git commit`, `git add` or `git push` unless asked in
+that turn — propose the message instead.
