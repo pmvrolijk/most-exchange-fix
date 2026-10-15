@@ -8,20 +8,20 @@ pluginManagement {
 }
 
 // The adapter SDK (`nl.lamia.most.exchange:client` and `:sbe`, Apache-2.0) comes from most-exchange's
-// package registry (decided 2026-10-04, docs/Rationale.md §3). Only that group comes from there, and
-// it comes from nowhere else.
+// package registry on GitHub Packages (decided 2026-10-09, docs/Rationale.md §3). Only that group
+// comes from there, and it comes from nowhere else.
 //
-// Credentials, never in this repository:
-//   - in a GitLab pipeline, the job's own token (CI_JOB_TOKEN; most-exchange must allow this project
-//     in its job token allowlist);
-//   - locally, a personal access token with `read_api`, as `gitlabToken` in ~/.gradle/gradle.properties.
-// The registry's certificate is signed by a private CA, which the JVM running Gradle must trust:
-// tools/trust-gitlab-ca.sh (docs/Status.md §1).
+// GitHub Packages wants credentials even to read a public package. Never in this repository:
+//   - in a GitHub Actions job, GITHUB_ACTOR and the job's GITHUB_TOKEN (`packages: read`);
+//   - locally, `githubUser` and a classic token with `read:packages` as `githubPackagesToken`, in
+//     ~/.gradle/gradle.properties. Not as GITHUB_TOKEN in the shell: `gh` would use it over its login.
 //
 // `mostSdk.url` names the registry, so moving the projects to another host is one property.
 val mostSdkUrl = providers.gradleProperty("mostSdk.url").get()
-val ciJobToken = providers.environmentVariable("CI_JOB_TOKEN").orNull
-val personalToken = providers.gradleProperty("gitlabToken").orNull
+val sdkUser = providers.gradleProperty("githubUser")
+    .orElse(providers.environmentVariable("GITHUB_ACTOR")).orNull
+val sdkToken = providers.gradleProperty("githubPackagesToken")
+    .orElse(providers.environmentVariable("GITHUB_TOKEN")).orNull
 
 dependencyResolutionManagement {
     repositories {
@@ -30,11 +30,10 @@ dependencyResolutionManagement {
                 maven {
                     name = "mostSdk"
                     url = uri(mostSdkUrl)
-                    credentials(HttpHeaderCredentials::class) {
-                        name = if (ciJobToken != null) "Job-Token" else "Private-Token"
-                        value = ciJobToken ?: personalToken ?: ""
+                    credentials {
+                        username = sdkUser ?: ""
+                        password = sdkToken ?: ""
                     }
-                    authentication { create<HttpHeaderAuthentication>("header") }
                 }
             }
             filter { includeGroup("nl.lamia.most.exchange") }

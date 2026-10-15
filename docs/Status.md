@@ -3,15 +3,16 @@
 Where the adapter stands, what is open, and what to do next. **This is the session entry point** —
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
-Last updated 2026-10-09. **Nothing is implemented. Design.md is now a design, §1–§10, not a
-template.** This session changed documents only. Nothing was built or run (Handover §2c).
+Last updated 2026-10-15. **Nothing is implemented. Design.md is now a design, §1–§10, not a
+template.** 2026-10-15: the build reads the SDK from GitHub Packages (§3, item 1). The
+2026-10-09 session before it changed documents only (Handover §2c).
 
 Decided 2026-10-09 (Design.md, Rationale §3–§7, CLAUDE.md non-negotiable 1 extended, 7–8 new):
 - **Goals:** low latency, stateful, guaranteed delivery of execution reports, the minimum that
   supports every exchange feature. Client fields such as Account (1) wait until the exchange can
   carry them in its `ColdField` (Design §5.5).
-- **The SDK comes from most-exchange's public GitHub** (GitHub Packages). The build still reads
-  GitLab until it is switched (§3, item 1).
+- **The SDK comes from most-exchange's public GitHub** (GitHub Packages). The build reads it since
+  2026-10-15 (§3, item 1).
 - **Order store: RocksDB plus in-memory maps**, WAL not fsynced (Design §6.1).
 - **The exchange `clOrdId` is derived:** `(sequenceIndex << 32) | MsgSeqNum` (Design §3.2).
 - **A `reportSeq` is consumed only once its 35=8 is fsynced in Artio's archive.** This is a lagging
@@ -57,13 +58,13 @@ There is no remote yet.
 | Branch | `master`, no commits (the user commits) |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 3 — `fix-session`, `order-entry`, `market-data`; packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | 4, dependency alignment and SDK wiring only. Last run 2026-10-04, passing with `-PmostExchange.local=true`. Not run 2026-10-09 (docs only) |
-| Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT from the GitLab registry (project 50), Artio 0.182 |
+| Tests | 4, dependency alignment and SDK wiring only. Last run 2026-10-15, passing against the SDK from GitHub Packages |
+| Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261004.105958-1`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
 
 ```sh
-./gradlew build                              # SDK from the GitLab registry, until §3 item 1 switches it
+./gradlew build                              # SDK from GitHub Packages (githubUser + githubPackagesToken)
 ```
 
 ## 2. Decisions to take before code
@@ -97,8 +98,10 @@ In order. The SDK changes and the spikes come before code, because they decide w
 `order-entry`'s persistence design stands. `fix-session` does not depend on them, so it may run in
 parallel with item 2.
 
-1. **Switch the build to GitHub Packages** (`mostSdk.url`, a GitHub username plus a `read:packages`
-   token in `~/.gradle/gradle.properties`), and verify the pull. Drop the GitLab CA step.
+1. ~~**Switch the build to GitHub Packages**~~ **Done 2026-10-15.** `mostSdk.url` points at
+   `maven.pkg.github.com/pmvrolijk/most-exchange`; `githubUser` + `githubPackagesToken` (classic,
+   `read:packages`) in `~/.gradle/gradle.properties`, `GITHUB_ACTOR`/`GITHUB_TOKEN` in CI. Verified:
+   `--refresh-dependencies` fetched the metadata from GitHub, 4 tests pass. The GitLab CA step is gone.
 2. **Three changes to most-exchange's `client`**, made there by its own procedure and published.
    Nothing is changed there yet:
    - `onReport` may abort, with a controlled poll (Design §6.2, §8.9);

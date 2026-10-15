@@ -65,7 +65,8 @@ the same: the registry is still the default, and the sibling build is still opt-
   even to read a public package;
 - the CA trust step, which only the private GitLab needed.
 
-Until the build is switched (Status §3), it still reads GitLab.
+The build was switched on 2026-10-15. Locally the token is `githubPackagesToken` in
+`~/.gradle/gradle.properties`, not `GITHUB_TOKEN` in the shell, which `gh` would take over its own login.
 
 ## 4. A report is consumed only behind the fsynced archive
 

@@ -15,7 +15,7 @@ The exchange-side contract is `most-exchange/docs/Adapters.md`.
 | `market-data` | L1/L2 books from `DepthFeedAssembler` and the directory, out as FIX market data |
 
 ```sh
-./gradlew build                              # SDK from the GitLab registry (docs/Status.md §1)
+./gradlew build                              # SDK from most-exchange's GitHub Packages
 ./gradlew build -PmostExchange.local=true    # SDK built from ../most-exchange
 ```
 

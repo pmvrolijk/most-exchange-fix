@@ -22,14 +22,13 @@ modules — `fix-session`, `order-entry`, `market-data` — scaffolded, nothing 
 ## Commands
 
 ```sh
-./gradlew build                              # the SDK from most-exchange's GitLab registry
+./gradlew build                              # the SDK from most-exchange's GitHub Packages
 ./gradlew build -PmostExchange.local=true    # the SDK built from ../most-exchange instead
 ./gradlew :fix-session:test                  # one module
-tools/trust-gitlab-ca.sh                     # once per machine: trust the registry's private CA
 ```
 
-- **The SDK comes from the registry by default.** That needs `gitlabToken` and the trust store in
-  `~/.gradle/gradle.properties`, never in this repo. Use `-PmostExchange.local=true` only while
+- **The SDK comes from the registry by default.** That needs `githubUser` and a `read:packages`
+  token as `githubPackagesToken` in `~/.gradle/gradle.properties`, never in this repo or the shell. Use `-PmostExchange.local=true` only while
   changing the SDK, and publish it before relying on the change here. → R§3
 
 ## The non-negotiables
