@@ -54,7 +54,7 @@ modules — `fix-session`, `order-entry`, `market-data` — scaffolded, nothing 
    Aeron 1.53.0. Bump Artio only together with most-exchange's `aeron`. `DependencyAlignmentTest`
    fails if Gradle resolves any other Aeron. → R§2
 7. **A `reportSeq` is consumed only behind the fsynced archive.** The durable first-missing
-   `reportSeq` advances only past reports whose 35=8 (or offline `SessionWriter` write) is at or
+   `reportSeq` advances only past reports whose 35=8 (online or offline `Session.trySend`) is at or
    below the archive's recorded position, at `fileSyncLevel=1`. Never store what the SDK's `save()`
    hands over as is: it is a ceiling. A back-pressured 35=8 aborts the report, never queues it.
    RocksDB stays in point-in-time WAL recovery: its unfsynced WAL is safe only because a crash

@@ -115,11 +115,18 @@ that tolerates holes, a surviving `reportSeq` could cover a lost terminal update
 then look open, be missing from the next mass status, and be wrongly declared ambiguous, although
 its 35=8 had reached the client.
 
-**Why `SessionWriter` for an offline session.** The alternatives keep the report in the exchange's
-ring (do not consume it, ask again at logon) or in the adapter's memory. Both are bounded by the
-ring's retention if the adapter crashes meanwhile. Past it, the resend comes back `TRUNCATED`, the
-mass status recovers open orders only, and fills are lost until the exchange has a drop copy.
-Writing to the offline session puts the 35=8 in the same fsynced archive as every other.
+**Why send to the offline session.** The alternatives keep the report in the exchange's ring (do
+not consume it, ask again at logon) or in the adapter's memory. Both are bounded by the ring's
+retention if the adapter crashes meanwhile. Past it, the resend comes back `TRUNCATED`, the mass
+status recovers open orders only, and fills are lost until the exchange has a drop copy. Sending to
+the offline session puts the 35=8 in the same fsynced archive as every other.
+
+**Why through Artio's `Session`, not a `SessionWriter`** (2026-10-15). MsgSeqNum belongs to the FIX
+session and Artio keeps it (Design §2). An offline `Session` is numbered by Artio from its persisted
+state, also after a restart. A `SessionWriter` takes the number from its caller and writes no
+header, which would make the adapter a second keeper of the sequence. The spikes showed the writer
+works, and what it costs: a hand-written header with a real-clock SendingTime, and a sequence the
+adapter would have to persist itself.
 
 ## 5. The exchange's `clOrdId` is derived from Artio's sequence
 

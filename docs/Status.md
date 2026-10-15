@@ -19,7 +19,8 @@ Decided 2026-10-09 (Design.md, Rationale §3–§7, CLAUDE.md non-negotiable 1 e
   `SessionStore` in the adapter (Design §6.2). The archive runs at `fileSyncLevel=1` (§6.4).
 - **A back-pressured 35=8 aborts the report.** `onReport` gains a result: a change to most-exchange's
   `client` (Design §8.9).
-- **Reports for a logged-out session** go through Artio's `SessionWriter` (Design §6.3).
+- **Reports for a logged-out session** go through Artio's `Session`, offline (Design §6.3; revised
+  2026-10-15 from `SessionWriter`: MsgSeqNum is Artio's alone, §2).
 - **35=G is rejected** (Design §3.3).
 - **An `AMBIGUOUS` order is restated unchanged, with OrdStatusUnknown=Y.** Never a reject or another
   terminal state (Design §3.4).
@@ -59,7 +60,7 @@ There is no remote yet.
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 3 — `fix-session`, `order-entry`, `market-data`; packages `nl.lamia.most.exchange.fixadapter.*` |
 | Tests | 4, dependency alignment and SDK wiring only. Last run 2026-10-15, passing against the SDK from GitHub Packages |
-| Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261004.105958-1`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182 |
+| Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
 
@@ -84,13 +85,14 @@ Each changes what gets built (`decision-fork`):
    - the media driver topology (§8.6);
    - the `OrdStatusUnknown` tag number and the exact 2964 code set (§8.1, §8.10). Small; settled
      with the dictionary.
-   - **Unverified assumptions the design rests on**, each for a spike (§8.13):
-     - Aeron Archive's `RecordingPos` means fsynced at `fileSyncLevel=1`;
-     - Artio re-indexes after a crash;
-     - `SessionWriter` and a live `Session` agree on MsgSeqNum;
-     - one engine routes sessions to two libraries.
-
-     If (a) or (c) fails, §6.2–§6.3 need a new mechanism, not a tweak.
+   - ~~Unverified assumptions the design rests on~~ **All four hold** (spikes, 2026-10-15, §8.13).
+     They left three decisions, all made:
+     - ~~how the adapter finds its library's `RecordingPos`~~ **from Aeron's public counters**, by
+       the library's Aeron client id, at every library connect (decided 2026-10-15, Design §6.2);
+     - ~~the first offline MsgSeqNum after a restart~~ **Artio's** (decided 2026-10-15: MsgSeqNum
+       is the FIX session's, persisted; a Logon matches or gets a resend; reset only on 141=Y);
+     - ~~what a client that logs on with 141=Y is owed~~ **nothing: it sends 35=AF** (decided
+       2026-10-15, Design §2).
 
 ## 3. To do next
 
@@ -102,14 +104,26 @@ parallel with item 2.
    `maven.pkg.github.com/pmvrolijk/most-exchange`; `githubUser` + `githubPackagesToken` (classic,
    `read:packages`) in `~/.gradle/gradle.properties`, `GITHUB_ACTOR`/`GITHUB_TOKEN` in CI. Verified:
    `--refresh-dependencies` fetched the metadata from GitHub, 4 tests pass. The GitLab CA step is gone.
-2. **Three changes to most-exchange's `client`**, made there by its own procedure and published.
-   Nothing is changed there yet:
-   - `onReport` may abort, with a controlled poll (Design §6.2, §8.9);
-   - `restoreInFlight(participantId, clOrdId)` before start (§3.4, §8.9);
-   - an allocation-free `PriceCodec` from and to `DecimalFloat` (§8.11).
-3. **Artio spikes** (Design §8.13), against 0.182 with a real initiator: `RecordingPos` after the
-   fsync, the replay index after a crash, `SessionWriter`'s MsgSeqNum, sessions routed to two
-   libraries by role. They decide whether §6.2–§6.4 stand as written.
+2. ~~**Three changes to most-exchange's `client`**~~ **Done 2026-10-15**: most-exchange `1ac8017`,
+   published to GitHub Packages as `0.1.0-SNAPSHOT` `20261015.110512` and pulled here
+   (Design §8.9, §8.11; most-exchange Adapters.md §2, §5):
+   - `onReport` returns `ReportAction`; `ABORT` leaves the report on its stream (controlled poll);
+   - `restoreInFlight(participantId, clOrdId)` before the first `doWork`, which also owes a fence;
+   - `PriceCodec.fromDecimal(mantissa, scale)`, allocation-free, `INVALID` when not exact.
+
+   Verified there: the client suite with seven new spec-first tests, two mutations each caught,
+   `./gradlew build` and `run-e2e.sh` green.
+3. ~~**Artio spikes**~~ **Done 2026-10-15**, uncommitted: the `spikes` module, 13 tests against a
+   real Artio engine, library and initiator, with SIGKILLed child JVMs for the crashes
+   (`./gradlew :spikes:test`, ~2 min, kept out of `build`). §6.2–§6.4 stand. What they found is in
+   Design §2, §6.2–§6.4 and §8.13. What changes the build:
+   - a library's claim **must replay from the Logon + 1**, or a 35=D sent before the claim is lost
+     with no gap to show it;
+   - `SessionPersistenceStrategy.alwaysPersistent()`, because Artio resets sequences by default;
+   - `catalogFileSyncLevel=1` beside `fileSyncLevel=1`;
+   - reports for a logged-out client go through the offline `Session`, never a `SessionWriter`;
+   - the library's `RecordingPos` is found from Aeron's public counters at every library connect,
+     by its Aeron client id; a restart can hand a library another library's old recording.
 4. **`fix-session`:** an Artio FIX 4.4 acceptor that accepts a Logon only from a configured session
    (CompIDs plus 553/554), with the engine's archive and logs on durable paths. Then the
    dictionary's code generation. Tested spec-first against a real Artio initiator.

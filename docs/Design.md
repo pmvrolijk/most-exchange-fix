@@ -71,6 +71,15 @@ sessions, and each one names:
 - **A Logon is accepted only if its CompIDs and credentials match a configured session.** Anything
   else is refused at logon. This is the authentication Adapters.md §1 leaves to the adapter: the
   gateway enforces which participants it may act for, not who may use its endpoint.
+- **A session reaches the library of its role** (spike §8.13(d), 2026-10-15). Accepted sessions
+  start engine-owned, Artio's default. Every library hears of every session (`onSessionExists`)
+  and claims those of its role with `requestSession`.
+  - **The claim replays from the Logon's MsgSeqNum + 1.** A message the client sends between its
+    Logon and the claim is otherwise never delivered, and nothing notices: the session comes over
+    with its last received MsgSeqNum already past it, so there is no gap. The client is simply
+    never answered.
+  - A replay can bring back a message already processed before a restart. The order store drops
+    it (a row already present, §6.1).
 - **The participant comes from the session, never from the message.** Every order and cancel on a
   session carries that session's `participantId`. A party identifier on the FIX message is not
   trusted for it. A client cannot act for another participant, because its session cannot name
@@ -81,8 +90,17 @@ sessions, and each one names:
 - **The exchange side must agree.** Every configured `participantId` must be listed for the
   gateway the adapter connects through, in the exchange's participant registry. If it is not, its
   orders are refused `UNAUTHORIZED_PARTICIPANT`.
-- **Sequence numbers persist** across logons and adapter restarts (Artio's archive, §6). They reset
-  only by the session schedule or the control API (§9).
+- **MsgSeqNum is the FIX session's, owned by Artio and persisted** (decided 2026-10-15), across
+  logons and adapter restarts (Artio's archive, §6). The adapter never numbers a message itself.
+  - Artio's default resets sequence numbers at every logon, so the engine runs
+    `SessionPersistenceStrategy.alwaysPersistent()`.
+  - **A Logon must match.** A MsgSeqNum above the expected one is accepted, and the acceptor asks
+    for a resend. One below is refused. The client knows its sequence numbers and is expected to.
+  - **No reset at logon, unless the client asks** with ResetSeqNumFlag (141=Y). Otherwise they reset
+    only by the session schedule or the control API (§9).
+  - **A client that resets recovers by itself** (decided 2026-10-15). 141=Y discards the resend of
+    every report it had not yet received, offline ones included. It then sends an order mass status
+    request (35=AF) and is answered from the store (§3.3). The adapter owes it nothing more.
 - *To specify* (§8.2):
   - the configuration format: a properties file, as the exchange's processes use (proposed);
   - the password kept in a file of its own, not in the configuration (proposed, as the exchange
@@ -371,7 +389,7 @@ Artio's archive.** That is the guarantee of delivery. After a crash, the stored 
 - **The SDK keeps counting on receipt. The adapter's `SessionStore` lags.** The SDK's
   `SessionStore.save(participant, firstMissing)` is taken as a ceiling, not as the value to store.
   For every report it delivers (`reportSeq` > 0), the adapter records the Artio position its 35=8
-  was written at: `Session.trySend`, or `SessionWriter.send` for an offline session. The durable
+  was written at: `Session.trySend`, the session online or offline (§6.3). The durable
   value advances to the highest `k` that meets all three conditions:
   - `k` ≤ the SDK's ceiling;
   - every report below `k` has a recorded position;
@@ -379,6 +397,26 @@ Artio's archive.** That is the guarantee of delivery. After a crash, the stored 
     stream (Aeron Archive's `RecordingPos` counter, read from the shared CnC).
 
   No SDK change is needed for this.
+- **Which counter** (spike §8.13(a)): the `RecordingPos` of the order-entry library's own outbound
+  publication, found by that publication's Aeron session id (`RecordingPos.findCounterIdBySession`).
+  The spike confirmed it counts the stream `trySend` positions are in: the counter stopped exactly
+  at the last 35=8's position, and every 35=8 below it was in the segment file.
+- **Finding it, from Aeron's public counters** (decided 2026-10-15; Artio 0.182 keeps the
+  publication private, and reflection on it was rejected). Artio connects the library's Aeron client
+  with `LibraryConfiguration.aeronContext()`, so after the connect that context's `clientId()` is
+  the client's. The driver's `pub-lmt` counters (type `DRIVER_PUBLISHER_LIMIT_TYPE_ID`) carry their
+  owner's client id, and the publication's session and stream id in their key (`StreamCounter`).
+  The library's publication is the one owned by that client, on `outboundLibraryStream()`, that
+  has a `RecordingPos`; more than one is an error. It rests on Aeron's counter layout, which the
+  Aeron pin (CLAUDE.md non-negotiable 6) fixes, and fails at the lookup, not silently. Verified
+  against Artio's own value, with two libraries on the stream and after a restart
+  (`LibraryRecordingSpikeTest`). The proper fix is an accessor in Artio, worth proposing upstream.
+- **Once per library connection.** When a library connects to an engine that has a stopped
+  recording, the engine has it replace its publication with one that extends that recording, and
+  the libraries need not get their own back: in one of two runs, the spike's order-entry library
+  extended market-data's old recording after the restart. So the lookup runs at every library connect, a position
+  is compared only with the counter of the connection it was written on, and positions written
+  before a reconnect never advance the durable value.
 - **Off the send path.** The 35=8 goes to the client as soon as Artio's framer writes it. Only the
   stored sequence waits for the archive. A crash before the archive catches up costs a resend from
   the exchange, and the deterministic ExecID (§5.3) lets the client drop the duplicate.
@@ -392,14 +430,27 @@ Artio's archive.** That is the guarantee of delivery. After a crash, the stored 
 
 ### 6.3 Reports for a logged-out session
 
-Decided 2026-10-09: **written to the offline session with Artio's `SessionWriter`**
-(`FixLibrary.sessionWriter`). The 35=8 takes the session's next MsgSeqNum and goes into the archive
-like any other. At the next logon, Artio's own resend delivers it, and §6.2 advances past it as
-soon as it is archived. Delivery then does not depend on how long the exchange's report ring
-retains it.
+Decided 2026-10-09, mechanism revised 2026-10-15: **sent on the session while it is offline.** The
+35=8 goes into the archive like any other, numbered by Artio. At the next logon, Artio's own resend
+delivers it, and §6.2 advances past it as soon as it is archived. Delivery then does not depend on
+how long the exchange's report ring retains it.
 
-- *Spike first* (§8.13): who owns the outbound MsgSeqNum between the library's `Session` and a
-  `SessionWriter` in 0.182, and how a session hands from one to the other at logon and logout.
+- **Through Artio's own `Session`, offline** (decided 2026-10-15, with §2: MsgSeqNum is Artio's).
+  After a logout the library keeps the `Session`, `DISCONNECTED`. After an adapter restart,
+  `FixEngine.lookupSessionId` finds it by its CompIDs, and `FixLibrary.requestSession` returns it
+  offline, with its persisted sequence numbers. `trySend` on it archives the message without
+  sending it. The adapter never numbers a message and never writes a header.
+- **Confirmed** (spikes, 2026-10-15). Offline reports were numbered on from the last one sent, and
+  sent nowhere. At the next Logon they came back with PossDup=Y, then a gap fill, and the live
+  session carried on with no MsgSeqNum reused. After a restart, and after a crash, the offline
+  `Session` came back at the MsgSeqNum the client had last received.
+- **Not `SessionWriter`.** It also delivers (spike §8.13(c)), but it owns no sequence and writes no
+  header. The adapter would number every message, write CompIDs and a real-clock SendingTime itself
+  (a stale one is rejected, 373=10), and keep the sequence across restarts. That would be a second
+  owner of MsgSeqNum, which §2 rules out.
+- *Still open:* the hand-over when the client logs on while reports are being sent offline. Artio
+  keeps the offline session's numbering at the reconnect (`LibraryPoller`, "offline reconnect"); a
+  spike under load to confirm.
 
 ### 6.4 Durability of Artio's archive
 
@@ -410,9 +461,32 @@ The archive's recorded position (§6.2) then means durable.
   the IPC publication it records, and so back-pressures the library. The sustained rate at which
   that happens is measured, not assumed (`perf-claim`).
 - The level is a property, so a test rig can run without fsync. Production runs fsynced.
-- *Spike first* (§8.13): that `RecordingPos` advances only after the write is synced at level 1, and
-  that Artio's replay index re-catches up from the archive after a crash, so a 35=8 that is archived
-  but not yet indexed is still resent.
+- **Confirmed** (spikes §8.13(a)–(b), 2026-10-15):
+  - **`RecordingPos` passes no unsynced byte.** In Aeron 1.53.0, `RecordingWriter.onBlock` writes,
+    then calls `force(false)` at level ≥ 1, before it returns. `RecordingSession` sets the counter
+    only after that. Segment files are pre-sized (`setLength`), and their directory is synced when
+    a segment is created, so a data-only sync is enough. This is from the source: a test cannot
+    watch an fsync.
+  - **Archived reports are resent after a crash:** a SIGKILL; a SIGKILL with Artio's index files
+    put back as they were before the reports (a host crash); the same for a library whose first
+    messages they were; and a crash seconds after a restart. In each case the Logon followed the
+    reports and every report came back.
+- **Configuration:** Aeron 1.53 refuses `fileSyncLevel` 1 with a catalog synced less, so
+  `catalogFileSyncLevel=1` too.
+- **A restart after a crash waits ~10 s.** The archive's mark file carries a liveness timestamp, as
+  on the exchange's nodes.
+- **Artio's indexes lag the archive, and are rebuilt at start.** One SIGKILL left the sequence index
+  at 256 against an archive at 1728. Artio's sequence index is written down and fsynced at its
+  first record, every `indexFileStateFlushTimeoutInMs` (10 s), at a term roll, and at a clean close.
+  At start, `Indexer.catchIndexUp` replays each recording **the written index names**, from its
+  indexed position to the recording's stop position. A restarted library extends its predecessor's
+  recording, so that recording is already named.
+  - **Residual risk, not reproduced:** a recording new to the index, opened in an engine that has
+    already flushed once, then a crash within 10 s. With the adapter's fixed two libraries, a new
+    recording appears only on a first start, where the first record is flushed at once.
+- **Durability is claimed for Linux.** On macOS, `fsync` does not flush the drive's cache without
+  `F_FULLFSYNC`. Whether the JDK's `force` uses it was not checked; this laptop proves ordering,
+  not power-loss durability.
 
 ## 7. Deployment and performance
 
@@ -450,23 +524,39 @@ The archive's recorded position (§6.2) then means durable.
 7. ~~Market data subscription model~~ **The minimum model of §4** (2026-10-09).
 8. Trade capture (35=AE) and historical market data wait on the exchange (drop copy, TimescaleDB).
 9. ~~The store lags the ledger~~ **Decided (§6.2):** a lagging `SessionStore` in the adapter, with no
-   SDK change for the lag. **Two SDK changes remain**, both decided 2026-10-09, to be made in
-   most-exchange's `client`:
-   - `onReport` may abort, so a back-pressured 35=8 leaves the report unconsumed (§6.2);
-   - `restoreInFlight(participantId, clOrdId)` before start, so requests unanswered at a restart
-     are settled by the SDK's rules (§3.4).
+   SDK change for the lag. ~~Two SDK changes~~ **Made in most-exchange's `client` 2026-10-15**
+   (its Adapters.md §2, §5), published:
+   - `onReport` returns a `ReportAction`; `ABORT` leaves the report unconsumed, uncounted, and ahead
+     of everything behind it on its stream (§6.2);
+   - `restoreInFlight(participantId, clOrdId)` before the first `doWork`. It also owes a fence for
+     the participant whatever the stored sequence says, so the opening mass status cannot skip the
+     request's report (§3.4). The adapter must store a row's report before a first-missing past it.
 10. ~~The FIX representation of `AMBIGUOUS`~~ **The last status restated, with OrdStatusUnknown=Y**
     (2026-10-09, §3.4). Still open: the tag's number.
-11. **`PriceCodec` without allocation:** from Artio's `DecimalFloat` (value, scale) to `int64`, and
-    back into a FIX encoder, with no `String`. An addition to most-exchange's `client`.
+11. ~~`PriceCodec` without allocation~~ **Made and published 2026-10-15:**
+    `PriceCodec.fromDecimal(mantissa, scale)` → `int64`, or `PriceCodec.INVALID` when not exact at 8
+    decimals or out of range; for prices and quantities alike. Back to FIX needs nothing:
+    `DecimalFloat.set(value, 8)`.
 12. ~~The current trading date~~ **The adapter's own calendar** (2026-10-09, §3.6). It
     knowingly accepts the silent "ahead" case. Revisit if the exchange can resolve a day sentinel
     at entry (R§7).
-13. **Artio spikes**, against 0.182 and a real initiator (`verify-for-real`):
-    - (a) `RecordingPos` advances only after the fsync at `fileSyncLevel=1`;
-    - (b) the replay index catches up after a crash;
-    - (c) `SessionWriter` and the online `Session` share the MsgSeqNum correctly;
-    - (d) one engine routes sessions to two libraries by role.
+13. ~~**Artio spikes**~~ **Done 2026-10-15**, against 0.182 and a real Artio initiator, in the
+    `spikes` module (`./gradlew :spikes:test`, ~2 min, not part of `build`). §6.2–§6.4 stand.
+    - (a) `RecordingPos` counts the `trySend` stream, and passes no unsynced byte (§6.2, §6.4);
+    - (b) archived reports are resent after a process crash and after a simulated host crash (§6.4);
+    - (c) reports for a logged-out client are resent, and the next Logon follows them: through
+      the offline `Session`, also after a restart and a crash (§6.3). Logons above the expected
+      MsgSeqNum get a resend request, below are refused, 141=Y resets (§2);
+    - (d) one engine routes sessions to two libraries by role, and the claim must replay (§2).
+
+    **Left open by them:**
+    - ~~Finding the library's `RecordingPos`~~ **From Aeron's public counters**, by the library's
+      Aeron client id, once per library connection (§6.2, decided 2026-10-15). Not reflection;
+      not matching by stream or position, which two libraries on one stream make ambiguous.
+    - ~~The first offline MsgSeqNum after a restart~~ **Artio's**, from its persisted session
+      (§2, §6.3, decided 2026-10-15).
+    - ~~A Logon with 141=Y discards the resend~~ **The client's to recover, with 35=AF** (§2,
+      decided 2026-10-15).
 14. ~~Unsolicited status after a restart~~ **Only when it changes what the client was told**
     (2026-10-09, §3.3).
 
