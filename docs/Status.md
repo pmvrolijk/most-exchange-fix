@@ -113,9 +113,9 @@ parallel with item 2.
 
    Verified there: the client suite with seven new spec-first tests, two mutations each caught,
    `./gradlew build` and `run-e2e.sh` green.
-3. ~~**Artio spikes**~~ **Done 2026-10-15**, uncommitted: the `spikes` module, 13 tests against a
+3. ~~**Artio spikes**~~ **Done 2026-10-15**, uncommitted: the `spikes` module, 15 tests against a
    real Artio engine, library and initiator, with SIGKILLed child JVMs for the crashes
-   (`./gradlew :spikes:test`, ~2 min, kept out of `build`). §6.2–§6.4 stand. What they found is in
+   (`./gradlew :spikes:test`, ~5 min, kept out of `build`). §6.2–§6.4 stand. What they found is in
    Design §2, §6.2–§6.4 and §8.13. What changes the build:
    - a library's claim **must replay from the Logon + 1**, or a 35=D sent before the claim is lost
      with no gap to show it;
@@ -123,7 +123,10 @@ parallel with item 2.
    - `catalogFileSyncLevel=1` beside `fileSyncLevel=1`;
    - reports for a logged-out client go through the offline `Session`, never a `SessionWriter`;
    - the library's `RecordingPos` is found from Aeron's public counters at every library connect,
-     by its Aeron client id; a restart can hand a library another library's old recording.
+     by its Aeron client id; a restart can hand a library another library's old recording;
+   - **after a disconnect, reports are held (ABORT) until `requestSession` has the session back
+     offline**: sent on the session the disconnect took, they reused MsgSeqNums and were lost
+     under load (Design §6.3, spike `OfflineHandoverSpikeTest`).
 4. **`fix-session`:** an Artio FIX 4.4 acceptor that accepts a Logon only from a configured session
    (CompIDs plus 553/554), with the engine's archive and logs on durable paths. Then the
    dictionary's code generation. Tested spec-first against a real Artio initiator.

@@ -128,6 +128,17 @@ header, which would make the adapter a second keeper of the sequence. The spikes
 works, and what it costs: a hand-written header with a real-clock SendingTime, and a sequence the
 adapter would have to persist itself.
 
+**Why reports wait for `requestSession` after a disconnect** (2026-10-15, spike). With engine-owned
+acceptance, a disconnect gives the session back to the engine. The library closes its `Session` and
+keeps it only in a cache, yet `trySend` on it still succeeds: the 35=8 is numbered and archived.
+When the client logs on again, Artio keeps the library's numbering only for a session the library
+holds. For a cached one it numbers the Logon from the engine's index, which lags the library's
+stream. The Logon and the live reports after it then take MsgSeqNums the offline reports already
+had. The client never asks for those reports, because it sees no gap. Under load that happened in
+most handovers, to reports that were archived, so §6.2 would have consumed them: the loss this
+section exists to rule out. Holding them costs one `requestSession` round trip per disconnect,
+about 15 ms in the spike, through the same ABORT as back-pressure.
+
 ## 5. The exchange's `clOrdId` is derived from Artio's sequence
 
 Decided with the user on 2026-10-09 (Design.md §3.2).

@@ -55,7 +55,9 @@ modules — `fix-session`, `order-entry`, `market-data` — scaffolded, nothing 
    fails if Gradle resolves any other Aeron. → R§2
 7. **A `reportSeq` is consumed only behind the fsynced archive.** The durable first-missing
    `reportSeq` advances only past reports whose 35=8 (online or offline `Session.trySend`) is at or
-   below the archive's recorded position, at `fileSyncLevel=1`. Never store what the SDK's `save()`
+   below the archive's recorded position, at `fileSyncLevel=1`. After a disconnect, a 35=8 waits (ABORT) until
+   `requestSession` has the session back offline: sent on the `Session` the disconnect took, it can
+   reuse a MsgSeqNum and never reach the client. Never store what the SDK's `save()`
    hands over as is: it is a ceiling. A back-pressured 35=8 aborts the report, never queues it.
    RocksDB stays in point-in-time WAL recovery: its unfsynced WAL is safe only because a crash
    leaves a prefix. (Design.md §6.1–§6.2) → R§4

@@ -436,10 +436,30 @@ delivers it, and §6.2 advances past it as soon as it is archived. Delivery then
 how long the exchange's report ring retains it.
 
 - **Through Artio's own `Session`, offline** (decided 2026-10-15, with §2: MsgSeqNum is Artio's).
-  After a logout the library keeps the `Session`, `DISCONNECTED`. After an adapter restart,
-  `FixEngine.lookupSessionId` finds it by its CompIDs, and `FixLibrary.requestSession` returns it
-  offline, with its persisted sequence numbers. `trySend` on it archives the message without
-  sending it. The adapter never numbers a message and never writes a header.
+  `FixLibrary.requestSession(sessionId, NO_MESSAGE_REPLAY, …)` returns the session offline, with
+  its persisted sequence numbers: after a logout, by the session id the library had; after an
+  adapter restart, found by its CompIDs (`FixEngine.lookupSessionId`). `trySend` on it archives the
+  message without sending it. The adapter never numbers a message and never writes a header.
+- **After a disconnect, nothing is sent on the session until `requestSession` has it back**
+  (spike, 2026-10-15). With engine-owned acceptance (§2) a disconnect returns the session to the
+  engine: the library closes its `Session` and only caches it. `trySend` on that object is still
+  accepted, numbered by the library and archived. But when the client logs on again, the
+  reconnect of a cached session skips the library's guard (`setupAcceptorSentSequenceNumber`).
+  The engine numbers the Logon from its index, and the index lags what the library has written.
+  Under load, 6–8 of 10 handovers reused MsgSeqNums, and 5–8 reports that were accepted and
+  archived never reached the client, with no gap to show it. §6.2 would have consumed them. So:
+  - from `onDisconnect` until `requestSession` replies `OK`, a report for that participant is
+    refused with `ReportAction.ABORT`, the back-pressure path of §6.2. In the spike that took
+    about 15 ms per disconnect. The SDK's controlled poll holds the whole report stream for
+    that time, as for any back-pressure;
+  - a reply other than `OK` keeps the reports held. If the client logged on meanwhile, the
+    session reaches the library by the claim of §2 instead.
+- **Confirmed under load** (spike `OfflineHandoverSpikeTest`, 2026-10-15). 35=8s were sent without
+  pause at 5,000 a second through 10 logouts and logons, some logons immediately after the
+  logout, racing the `requestSession`. That came to about 124,000 reports, most of them offline.
+  Three runs: no MsgSeqNum reused, every report at the client at the MsgSeqNum Artio gave it,
+  live or as a PossDup resend. A Logon arriving while the library writes offline is numbered
+  after the library's last report: the guard holds for a session the library owns.
 - **Confirmed** (spikes, 2026-10-15). Offline reports were numbered on from the last one sent, and
   sent nowhere. At the next Logon they came back with PossDup=Y, then a gap fill, and the live
   session carried on with no MsgSeqNum reused. After a restart, and after a crash, the offline
@@ -448,9 +468,6 @@ how long the exchange's report ring retains it.
   header. The adapter would number every message, write CompIDs and a real-clock SendingTime itself
   (a stale one is rejected, 373=10), and keep the sequence across restarts. That would be a second
   owner of MsgSeqNum, which §2 rules out.
-- *Still open:* the hand-over when the client logs on while reports are being sent offline. Artio
-  keeps the offline session's numbering at the reconnect (`LibraryPoller`, "offline reconnect"); a
-  spike under load to confirm.
 
 ### 6.4 Durability of Artio's archive
 
@@ -541,13 +558,17 @@ The archive's recorded position (§6.2) then means durable.
     knowingly accepts the silent "ahead" case. Revisit if the exchange can resolve a day sentinel
     at entry (R§7).
 13. ~~**Artio spikes**~~ **Done 2026-10-15**, against 0.182 and a real Artio initiator, in the
-    `spikes` module (`./gradlew :spikes:test`, ~2 min, not part of `build`). §6.2–§6.4 stand.
+    `spikes` module (`./gradlew :spikes:test`, ~5 min, not part of `build`). §6.2–§6.4 stand.
     - (a) `RecordingPos` counts the `trySend` stream, and passes no unsynced byte (§6.2, §6.4);
     - (b) archived reports are resent after a process crash and after a simulated host crash (§6.4);
     - (c) reports for a logged-out client are resent, and the next Logon follows them: through
       the offline `Session`, also after a restart and a crash (§6.3). Logons above the expected
       MsgSeqNum get a resend request, below are refused, 141=Y resets (§2);
     - (d) one engine routes sessions to two libraries by role, and the claim must replay (§2).
+    - (e) a client logging on while reports go to its offline session gets every one, at its
+      MsgSeqNum, under load, provided the library has requested the session back after the
+      disconnect; sending on the session the disconnect took reuses MsgSeqNums and loses reports
+      (§6.3).
 
     **Left open by them:**
     - ~~Finding the library's `RecordingPos`~~ **From Aeron's public counters**, by the library's
