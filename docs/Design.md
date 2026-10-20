@@ -80,6 +80,10 @@ sessions, and each one names:
     never answered.
   - A replay can bring back a message already processed before a restart. The order store drops
     it (a row already present, §6.1).
+  - **A claim is taken on `OK` or `SEQUENCE_NUMBER_TOO_HIGH`.** The second is the usual answer:
+    the client had sent nothing after its Logon, so there is nothing to replay, and the session is
+    acquired all the same (`FixLibrary.requestSession`). Any other answer goes to the backend.
+    `MISSING_MESSAGES`, for one, acquires the session without its replay.
 - **The participant comes from the session, never from the message.** Every order and cancel on a
   session carries that session's `participantId`. A party identifier on the FIX message is not
   trusted for it. A client cannot act for another participant, because its session cannot name
@@ -101,12 +105,50 @@ sessions, and each one names:
   - **A client that resets recovers by itself** (decided 2026-10-15). 141=Y discards the resend of
     every report it had not yet received, offline ones included. It then sends an order mass status
     request (35=AF) and is answered from the store (§3.3). The adapter owes it nothing more.
-- *To specify* (§8.2):
-  - the configuration format: a properties file, as the exchange's processes use (proposed);
-  - the password kept in a file of its own, not in the configuration (proposed, as the exchange
-    CLI's `--secret-file` does);
-  - the session schedule;
-  - where Artio's archive and logs live (they must be durable, §6.4).
+### Configuration and logon
+
+Decided 2026-10-15. Properties files, as the exchange's processes use.
+
+- **The node file** has `fix.*` keys, and any `fix.*` system property overrides its key:
+
+  | Key | Meaning |
+  | --- | --- |
+  | `fix.bindAddress`, `fix.port` | Where the acceptor listens. `bindAddress` defaults to `0.0.0.0` |
+  | `fix.logDir`, `fix.archiveDir` | Artio's logs and Aeron Archive's recordings. Required, durable (§6.4), and never deleted at start |
+  | `fix.aeronDir` | The embedded media driver's directory. Defaults to Aeron's own, plus `-most-fix` |
+  | `fix.fileSyncLevel` | The archive's fsync level, default 1 (§6.4). A test rig may set 0 |
+  | `fix.sessionsFile` | The sessions file, below |
+
+- **The sessions file** has one block of `session.<name>.*` keys per session. The name is only a
+  label:
+
+  | Key | Meaning |
+  | --- | --- |
+  | `senderCompId`, `targetCompId` | The adapter's CompID and the client's, as the adapter sends them |
+  | `username` | The Logon's 553 |
+  | `passwordSha256` | The SHA-256 of the Logon's 554, 64 hex digits |
+  | `role` | `order-entry` or `market-data` |
+  | `participantId` | The exchange participant, a number. Required for `order-entry`, refused for `market-data` |
+
+  The adapter refuses to start if a key is missing or malformed, if two sessions share their
+  CompIDs, or if two order-entry sessions share a `participantId` (reports route back one to one).
+- **Passwords: only a digest is kept** (decided 2026-10-15). The operator issues each client a
+  generated, high-entropy secret. The adapter stores its SHA-256 and nothing else, as the exchange
+  keeps its gateways' secrets. A lost secret is reissued, never recovered. Without a slow hash,
+  this is safe only for generated secrets, not for passwords a person chose.
+- **A Logon is accepted when one configured session matches all of it:** its SenderCompID is
+  the session's `targetCompId`, its TargetCompID is the session's `senderCompId`, its 553 is the
+  `username`, and the SHA-256 of its 554 is the `passwordSha256`, compared in constant time.
+  Credentials belong to their session: another session's username and password do not open it.
+- **A refused Logon gets a Logout,** 58=`Logon refused`, and the connection is closed. The Logout
+  does not say what failed. It is Artio's reject reply, at MsgSeqNum 1, outside the session's
+  sequence. The session never reaches a library.
+- **The acceptor** runs an embedded archiving media driver and Artio's engine on it. The archive is
+  synced at `fileSyncLevel`, with `catalogFileSyncLevel` the same (§6.4). Sequence numbers are
+  `alwaysPersistent`, and sessions are accepted engine-owned. FIX is not encrypted by Artio: the
+  554 crosses the network as sent. TLS, if needed, is terminated in front of the adapter.
+- *To specify* (§8.2): the session schedule. Until then a configured session may log on at any
+  time.
 
 ## 3. Order entry backend (`order-entry`)
 
@@ -529,9 +571,10 @@ The archive's recorded position (§6.2) then means durable.
 1. ~~FIX version~~ **FIX 4.4** (2026-10-04). ~~Custom tags~~ **2362 and 2964** (2026-10-09, §5.4).
    Still open: the exact 2964 code set, to check against FIX Latest.
 2. ~~Logon authentication and the logon → participant mapping~~ **One session, one participant**
-   (2026-10-04, §2). ~~Session roles~~ **order-entry or market-data** (2026-10-09). Still open:
-   the configuration format and where the password lives (both proposed in §2); the session
-   schedule, and whether it follows the exchange's calendar.
+   (2026-10-04, §2). ~~Session roles~~ **order-entry or market-data** (2026-10-09).
+   ~~Configuration format; where the password lives~~ **Properties files; a SHA-256 digest only**
+   (2026-10-15, §2). Still open: the session schedule, and whether it follows the exchange's
+   calendar.
 3. ~~ClOrdID ↔ `clOrdId` mapping and its store~~ **Derived `clOrdId` (§3.2); RocksDB plus in-memory
    (§6.1)** (2026-10-09).
 4. ~~35=G~~ **Rejected** (2026-10-09, §3.3).

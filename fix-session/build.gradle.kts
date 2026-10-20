@@ -4,4 +4,6 @@
 dependencies {
     api(libs.artio.core)
     api(libs.artio.codecs)
+    // Artio's own FIX 4.4 session dictionary, until the adapter's (Design.md §5.4) replaces it.
+    api(libs.artio.session.codecs)
 }
