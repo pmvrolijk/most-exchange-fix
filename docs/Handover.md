@@ -286,3 +286,53 @@ did not compile had been counted as caught. It was rewritten, then caught.
 **Not real yet:** there is no `main`. Reports go to a listener that slice 3 writes, and the
 `SessionStore` is the SDK's in-memory one until slice 4. The SDK allocates on every directory
 cycle and for every order (Design §8.16).
+
+### 2g. Order entry's outbound path (slice 3), 2026-10-25
+
+**The problem.** The exchange's reports, the SDK's fates and the completion of a mass status must
+reach the client as 35=8 and 35=9, and the store, without ever presenting an ambiguous order as
+rejected (CLAUDE.md non-negotiable 1). Before writing, the engine's own rules were read in
+most-exchange's `MatchingEngineService`. A participant's cancel is answered with the **cancel's**
+`clOrdId`, an unsolicited cancel (self-match prevention, a halt, a bulk cancel) with the
+**order's**. TRADE's `price` is the fill price, and ORDER_STATUS carries `reportSeq` 0.
+
+**Decided with the user** (each the recommendation; Design §5.3, §8.17; Rationale §10):
+- **A report for a row the store lost** is logged, counted and consumed until recovery from the
+  archive is built, its own slice after delivery;
+- **fills a mass status reveals** are an ExecType I with the new CumQty, AvgPx over the fills known,
+  and a Text saying what is missing.
+
+**Taken without asking**, written into Design §5.3 for review:
+- OrdRejReason and CxlRejReason: UNKNOWN_SECURITY or UNKNOWN_ORDER → 1, MARKET_CLOSED → 2, the rest
+  99, Text the reason's name;
+- a cancel rejected UNKNOWN_ORDER for an order the store already holds terminal is CxlRejReason 0,
+  too late;
+- 55 is the directory's Symbol, with 48 and 22=8;
+- AvgPx is rounded half up at 8 decimals;
+- a resent report is sent again and not applied twice.
+
+**Built:** `...orderentry.outbound`: `OutboundReports`, `Notional`, `ClientReports` with
+`OutgoingExecution` and `OutgoingCancelReject`. `artio.ArtioReports`. In the backend: a listener
+per shard, `restoreInFlight` at a shard session's creation, and participants online from acquire
+to disconnect. `DirectoryIndex.symbolOf` and `ShardVenue.shardOf`. The row gained `statedAt`, in
+memory. The gateway model in the tests now sends reports, numbered per participant, and its resend
+and mass status answers state that numbering's `nextSeq`.
+
+**The check.** 25 tests of the outbound path against reports encoded as the gateway sends them, a
+recording client that can be offline or refuse, and a venue model for parked cancels. 5 for the
+arithmetic, against `BigInteger`. 5 new end-to-end tests through a real initiator. One failure on
+the first run, in the code: Agrona's `Long2LongHashMap` refuses to store its own missing value, and
+0 had been both. The end-to-end test of a held report was then made to check the 35=8 is no PossDup
+resend: sent on the session a logout took, it would still have reached the client at the next
+logon, as Artio's resend, which is the path §6.3 rules out.
+
+`./gradlew build` green, 121 tests in order-entry. 25 mutations, 24 caught; the other is equivalent
+(a disconnected `Session` is not active, so it is not written to with or without the disconnect
+hook). Two needed a test fixed first. The shard filter of the mass status rule went unseen, because
+the other shard's order was also excluded by the `nextSeq` rule. And the backend's per-shard
+listener had no test, since no end-to-end test ran a mass status after startup. The gateway model
+now states its open orders and can lose a report and truncate a resend, so one test drives a gap on
+shard 1 through the SDK's fence, truncation and mass status.
+
+**Not real yet:** a client logged out holds its gateway's report stream until slice 4. A host
+crash's lost rows stay lost (§8.17).

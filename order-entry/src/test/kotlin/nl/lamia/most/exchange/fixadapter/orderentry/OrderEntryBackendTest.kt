@@ -25,6 +25,7 @@ import nl.lamia.most.exchange.fixadapter.session.TestSessions.SECRET2
 import nl.lamia.most.exchange.fixadapter.session.fixMessage
 import nl.lamia.most.exchange.fixadapter.session.pollFor
 import nl.lamia.most.exchange.fixadapter.session.pollUntil
+import nl.lamia.most.exchange.sbe.ExecType
 import nl.lamia.most.exchange.sbe.Side
 import org.agrona.concurrent.UnsafeBuffer
 import org.junit.jupiter.api.io.TempDir
@@ -110,7 +111,7 @@ class OrderEntryBackendTest {
 
     /** Until every shard's SDK session has finished its opening mass status (most-exchange Adapters.md §1). */
     private fun Adapter.awaitExchange(shards: Int = 2) =
-        pollUntil(*all(), what = "the SDK's sessions ready") { rig.listener.ready == shards }
+        pollUntil(*all(), what = "the SDK's sessions ready") { rig.backend.readyShards == shards }
 
     private fun <T> Adapter.await(reply: Reply<T>, what: String): T {
         pollUntil(*all(), what = what) { !reply.isExecuting }
@@ -360,6 +361,169 @@ class OrderEntryBackendTest {
         assertTrue(session.messages().none { it.msgType == "j" || it.msgType == "3" }, "${session.messages()}")
     }
 
+    // ================================================================ reports, §5.3
+
+    private fun decimal(text: String?) = assertNotNull(text).toBigDecimal()
+
+    private fun assertDecimal(expected: String, actual: String?, what: String) =
+        assertEquals(0, expected.toBigDecimal().compareTo(decimal(actual)), "$what: $actual")
+
+    private fun Adapter.reports(session: Session, after: Int = 0) = session.messages().filter { it.msgType == "8" && it.seqNum > after }
+
+    @Test
+    fun `an order's acknowledgement and fills reach the client as 35=8s, ExecID the reportSeq`() {
+        val adapter = start()
+        adapter.awaitExchange()
+        val session = adapter.logon()
+        adapter.send(session, order("ORD-1"))
+        pollUntil(*adapter.all(), what = "the order at the gateway") { adapter.gateway(0).orders.size == 1 }
+        val o = adapter.gateway(0).orders.single()
+        val g = adapter.gateway(0)
+        g.report(1001L, o.clOrdId, ExecType.NEW, 5001L, price = o.price, leavesQty = o.qty, origQty = o.qty)
+        g.report(1001L, o.clOrdId, ExecType.TRADE, 5001L, price = 100_20000000L, lastQty = 4_00000000L, leavesQty = 6_00000000L, cumQty = 4_00000000L, origQty = o.qty)
+        g.report(1001L, o.clOrdId, ExecType.TRADE, 5001L, price = 100_30000000L, lastQty = 6_00000000L, leavesQty = 0L, cumQty = 10_00000000L, origQty = o.qty)
+        pollUntil(*adapter.all(), what = "three 35=8s") { adapter.reports(session).size == 3 }
+        val (ack, partial, full) = adapter.reports(session)
+        assertEquals(listOf("1", "2", "3"), listOf(ack, partial, full).map { it[17] }, "ExecID: the reportSeq (§5.3)")
+        assertEquals(listOf("0", "F", "F"), listOf(ack, partial, full).map { it[150] })
+        assertEquals(listOf("0", "1", "2"), listOf(ack, partial, full).map { it[39] })
+        for (r in listOf(ack, partial, full)) {
+            assertEquals("ORD-1", r[11])
+            assertEquals("5001", r[37])
+            assertEquals("1", r[54])
+            assertEquals("ACME", r[55])
+            assertEquals("42", r[48])
+            assertEquals("8", r[22])
+            assertDecimal("10", r[38], "OrderQty")
+            assertDecimal("100.25", r[44], "Price")
+            assertNotNull(r[60])
+        }
+        assertDecimal("100.3", full[31], "LastPx")
+        assertDecimal("6", full[32], "LastQty")
+        assertDecimal("10", full[14], "CumQty")
+        assertDecimal("0", full[151], "LeavesQty")
+        assertDecimal("100.26", full[6], "AvgPx: (4 × 100.2 + 6 × 100.3) / 10")
+        assertEquals(null, ack[31], "no LastPx on an acknowledgement")
+    }
+
+    @Test
+    fun `a cancel goes to the exchange with the order's ids, and its CANCELED comes back naming both`() {
+        val adapter = start()
+        adapter.awaitExchange()
+        val session = adapter.logon()
+        adapter.send(session, order("ORD-1"))
+        pollUntil(*adapter.all(), what = "the order at the gateway") { adapter.gateway(0).orders.size == 1 }
+        val o = adapter.gateway(0).orders.single()
+        adapter.gateway(0).report(1001L, o.clOrdId, ExecType.NEW, 5001L, price = o.price, leavesQty = o.qty, origQty = o.qty)
+        pollUntil(*adapter.all(), what = "the acknowledgement") { adapter.reports(session).size == 1 }
+        adapter.send(session, cancelOf("ORD-1", "CXL-1"))
+        pollUntil(*adapter.all(), what = "the cancel at the gateway") { adapter.gateway(0).cancels.size == 1 }
+        val c = adapter.gateway(0).cancels.single()
+        assertEquals(o.clOrdId, c.origClOrdId)
+        assertEquals(5001L, c.exchangeOrderId)
+        assertEquals(session.lastSentMsgSeqNum().toLong(), c.clOrdId and 0xffffffffL, "the 35=F's own derived id")
+        adapter.gateway(0).report(1001L, c.clOrdId, ExecType.CANCELED, 5001L, price = o.price, leavesQty = 0L, cumQty = 0L, origQty = o.qty)
+        pollUntil(*adapter.all(), what = "the cancel's 35=8") { adapter.reports(session).size == 2 }
+        val done = adapter.reports(session).last()
+        assertEquals("4" to "4", done[150] to done[39])
+        assertEquals("CXL-1" to "ORD-1", done[11] to done[41])
+    }
+
+    @Test
+    fun `a cancel sent before the acknowledgement is parked, then sent once it comes`() {
+        val adapter = start()
+        adapter.awaitExchange()
+        val session = adapter.logon()
+        adapter.send(session, order("ORD-1"))
+        pollUntil(*adapter.all(), what = "the order at the gateway") { adapter.gateway(0).orders.size == 1 }
+        adapter.send(session, cancelOf("ORD-1", "CXL-1"))
+        pollFor(200, *adapter.all())
+        assertTrue(adapter.gateway(0).cancels.isEmpty(), "parked (§3.3)")
+        val o = adapter.gateway(0).orders.single()
+        adapter.gateway(0).report(1001L, o.clOrdId, ExecType.NEW, 5001L, price = o.price, leavesQty = o.qty, origQty = o.qty)
+        pollUntil(*adapter.all(), what = "the parked cancel sent") { adapter.gateway(0).cancels.size == 1 }
+        assertEquals(5001L, adapter.gateway(0).cancels.single().exchangeOrderId)
+    }
+
+    @Test
+    fun `an order unanswered at a restart is restored, fenced, and rejected not sequenced`() {
+        var (sent, received) = start().use { adapter ->
+            adapter.awaitExchange()
+            val session = adapter.logon()
+            adapter.send(session, order("ORD-1"))
+            pollUntil(*adapter.all(), what = "the order at the gateway") { adapter.gateway(0).orders.size == 1 }
+            pollUntil(*adapter.all(), what = "logout sent") { session.startLogout() > 0 }
+            pollUntil(*adapter.all(), what = "logged out") { !session.isConnected }
+            session.lastSentMsgSeqNum() to session.lastReceivedMsgSeqNum()
+        }
+        // The gateway never answered it. After the restart the SDK fences, the resend completes with
+        // nothing for it: never sequenced (most-exchange Adapters.md §5).
+        start().use { adapter ->
+            adapter.awaitExchange()
+            val session = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
+            val reject = adapter.awaitReply(session, "the reject") { it.msgType == "8" && it.seqNum > received }
+            assertEquals("ORD-1", reject[11])
+            assertEquals("8" to "8", reject[150] to reject[39])
+            assertEquals("99", reject[103])
+            assertEquals(Texts.NOT_SEQUENCED_ORDER, reject[58])
+            assertTrue(assertNotNull(reject[17]).startsWith("A"), "the adapter's own ExecID")
+            assertTrue(adapter.rig.log.any { "1 requests restored in flight" in it }, "${adapter.rig.log}")
+        }
+    }
+
+    @Test
+    fun `a report for a client logged out is held, and sent when it logs back on`() {
+        val adapter = start()
+        adapter.awaitExchange()
+        val session = adapter.logon()
+        adapter.send(session, order("ORD-1"))
+        pollUntil(*adapter.all(), what = "the order at the gateway") { adapter.gateway(0).orders.size == 1 }
+        pollUntil(*adapter.all(), what = "logout sent") { session.startLogout() > 0 }
+        pollUntil(*adapter.all(), what = "logged out") { !session.isConnected }
+        val received = session.lastReceivedMsgSeqNum()
+        val o = adapter.gateway(0).orders.single()
+        adapter.gateway(0).report(1001L, o.clOrdId, ExecType.NEW, 5001L, price = o.price, leavesQty = o.qty, origQty = o.qty)
+        pollFor(300, *adapter.all())
+        val again = adapter.logon(initialSent = session.lastSentMsgSeqNum() + 1, initialReceived = received + 1)
+        val ack = adapter.awaitReply(again, "the held acknowledgement") { it.msgType == "8" && it.seqNum > received }
+        assertEquals("1", ack[17])
+        assertEquals("0", ack[150])
+        // Live on the session acquired again, not written to the one the logout took and resent (§6.3).
+        assertEquals(null, ack[43], "not a PossDup resend")
+    }
+
+    @Test
+    fun `a mass status after a truncated resend on one shard settles only that shard's orders`() {
+        val adapter = start()
+        adapter.awaitExchange()
+        val session = adapter.logon()
+        adapter.send(session, order("ORD-A", "ACME"))
+        adapter.send(session, order("ORD-B", "BETA"))
+        pollUntil(*adapter.all(), what = "both orders at their gateways") { adapter.gateway(0).orders.size == 1 && adapter.gateway(1).orders.size == 1 }
+        val a = adapter.gateway(0).orders.single()
+        val b = adapter.gateway(1).orders.single()
+        adapter.gateway(0).report(1001L, a.clOrdId, ExecType.NEW, 5001L, price = a.price, leavesQty = a.qty, origQty = a.qty, securityId = 42)
+        // Shard 1 loses a report: the SDK sees the gap, fences, the resend is truncated, and a mass
+        // status of shard 1 follows (most-exchange Adapters.md §4). It states B, the one order open there.
+        val statusesBefore = adapter.gateway(1).statusesAnswered
+        adapter.gateway(1).lose(1001L)
+        adapter.gateway(1).truncateNextResend = true
+        adapter.gateway(1).report(1001L, b.clOrdId, ExecType.NEW, 6001L, price = b.price, leavesQty = b.qty, origQty = b.qty, securityId = 43)
+        pollUntil(*adapter.all(), what = "shard 1's mass status") { adapter.gateway(1).statusesAnswered > statusesBefore }
+        pollFor(300, *adapter.all())
+        val reports = adapter.reports(session)
+        assertEquals(2, reports.size, "the two acknowledgements, and nothing else: $reports")
+        assertTrue(reports.none { it[5001] == "Y" }, "shard 0's open order is not shard 1's status's to settle")
+    }
+
+    private fun cancelOf(origClOrdId: String, clOrdId: String) = OrderCancelRequestEncoder().apply {
+        origClOrdID(origClOrdId)
+        clOrdID(clOrdId)
+        side('1')
+        transactTime(timestamp.buffer(), timestamp.encode(System.currentTimeMillis()))
+        instrument().symbol("ACME")
+    }
+
     // ================================================================ gateways, §3.5
 
     @Test
@@ -398,7 +562,7 @@ class OrderEntryBackendTest {
         val config = AcceptorRig.nodeConfig(adapterDir, port)
         FixAcceptor(config, bindAtStartup = false).use { acceptor ->
             val refusal = assertFailsWith<IllegalStateException> {
-                OrderEntryBackend(acceptor, OrderEntryConfig(OrderEntryRig.storeDir(adapterDir), "aeron:ipc", 9100), RecordingListener(), { OrderEntryRig.TODAY })
+                OrderEntryBackend(acceptor, OrderEntryConfig(OrderEntryRig.storeDir(adapterDir), "aeron:ipc", 9100), { OrderEntryRig.TODAY })
             }
             assertTrue("1001" in refusal.message.orEmpty() && "Artio does not know" in refusal.message.orEmpty(), refusal.message)
             assertFailsWith<ConnectException>("nothing listens") { Socket().use { it.connect(InetSocketAddress("localhost", port), 1_000) } }

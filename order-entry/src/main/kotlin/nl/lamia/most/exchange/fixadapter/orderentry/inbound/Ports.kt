@@ -98,4 +98,7 @@ object Texts {
     const val STATUS_UNKNOWN = "STATUS UNKNOWN"
     const val REPLACE_NOT_SUPPORTED = "replace not supported"
     const val UNSUPPORTED_MESSAGE_TYPE = "unsupported message type"
+    const val NOT_SEQUENCED_ORDER = "not sequenced (gateway failover)"
+    const val NOT_SEQUENCED_CANCEL = "not sequenced"
+    const val CANCEL_STATUS_UNKNOWN = "cancel status unknown"
 }

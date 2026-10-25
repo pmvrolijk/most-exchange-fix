@@ -284,3 +284,33 @@ the gateway.
 `CharSequence` setter on the same field copies into whatever the field points at, which may be the
 inbound message's buffer, Artio's own. `reset()` points every field back at the encoder's buffer.
 So every reply resets its encoder first, and the inbound buffer is never written.
+
+## 10. Reports: a lost row is deferred, lost fills are said, and state follows the 35=8
+
+Decided 2026-10-25 (slice 3), each the recommendation; Design §5.3, §8.17.
+
+**A report for a row the store lost is consumed, for now.** The row can be missing only after a
+host crash took RocksDB's unfsynced tail (§6.1, R§4); the 35=D that made it is in Artio's fsynced
+archive. Holding the report with `ABORT` until recovery exists would lose nothing for that client
+and stall the gateway's report stream for every other participant, until an operator stepped in.
+Building the recovery now means reading Artio's archive, which no spike has explored yet. So
+recovery is its own slice, after delivery, and until it exists a host crash can cost one client
+the reports of the orders whose rows it lost. Counted, so it is seen.
+
+**Fills the client was not told are said, not invented.** After a truncated resend, a mass status
+can state a CumQty above the one the client last saw. The fills between happened at prices the
+exchange no longer has for the adapter. A 35=8 ExecType F with the order's limit price would keep a
+fill-driven client's position right, at the cost of a price that may be wrong and that the client
+cannot tell from a real one. Restating the old status as unknown would throw away the one thing
+the exchange did state exactly. So the client gets the new CumQty and LeavesQty in an ExecType I,
+with AvgPx over the fills known and a Text that says what is missing, and the prices are reconciled
+from trade records, as for an ambiguous order (R§6).
+
+**A report changes the store only once its 35=8 was taken.** Applying first and sending second
+would leave a refused 35=8 with its report already counted, and the redelivered report would
+then be either applied twice or not sent. Sending first makes the redelivery the same report as
+the first try. A report the row has already seen, a resend after a restart, is sent again with the
+same ExecID, so a 35=8 that was taken but not archived before a crash still reaches the client,
+and the client drops the duplicate. Anything that follows from a report but needs its own send (a
+parked cancel, a fate's answer) is owed on its row and worked off in the duty cycle, so one refusal
+never undoes a report the SDK has already counted.

@@ -287,6 +287,8 @@ would invite.
 - **Operators:** a counter by participant (§9.2), and the list of ambiguous orders in `/status`
   (§9.1). Reconciling fills is manual until the exchange has a drop copy (§8.8).
 - A report that does arrive for it later is processed normally, and clears the flag.
+- **For an order never acknowledged**, the status last told is `A`, pending new: OrdStatus A,
+  CumQty and LeavesQty as the order was entered (0 and OrderQty).
 
 **Two routes lead here**, and the SDK covers only the first:
 - **An unanswered request.** The SDK settles it `AMBIGUOUS` when a truncated resend is followed by a
@@ -446,7 +448,7 @@ not `validate()`'s.
 | 31 LastPx / 32 LastQty | `price` / `lastQty`, on TRADE |
 | 14 CumQty / 151 LeavesQty | `cumQty` / `leavesQty`, stated by the engine, never derived |
 | 6 AvgPx | The adapter's own: cumulative notional (128-bit) over `cumQty`, kept in the store. 0 when no fill is known |
-| 103 OrdRejReason, 58 Text | From `RejectReason`: UNKNOWN_SECURITY → 1, MARKET_CLOSED → 2, BOOK_CAPACITY → 99… Text is always the enum name |
+| 103 OrdRejReason, 58 Text | From `RejectReason`: UNKNOWN_SECURITY → 1, MARKET_CLOSED → 2, every other → 99 (2026-10-25). Text is always the enum name |
 | 60 TransactTime | Adapter time at the report's arrival. The report carries no timestamp |
 | OrdStatusUnknown | Y only on an ambiguous order (§3.4). Absent otherwise |
 
@@ -454,6 +456,47 @@ not `validate()`'s.
   from `RejectReason`: UNKNOWN_ORDER → 1, MARKET_CLOSED → 2.
 - `enrichment = UNKNOWN` means `origQty` and `cumQty` cannot be believed. The report is sent with
   the quantities the store holds, and counted.
+
+**How each report is applied** (2026-10-25, slice 3; the engine's own rules read in most-exchange's
+`MatchingEngineService`):
+- **The row is the report's (`participantId`, `clOrdId`).** A participant's cancel is answered with
+  the **cancel's** `clOrdId`; an unsolicited cancel (self-match prevention, a volatility halt, a
+  bulk cancel), an expiry, a trade and an order's own reject carry the **order's**.
+  - **A cancel's row:** CANCELED → a 35=8 ExecType 4 of the order, 11 the cancel's ClOrdID and 41
+    the order's. REJECTED → a 35=9, CxlRejResponseTo 1, CxlRejReason from the reject below, except
+    that UNKNOWN_ORDER for an order the store already holds terminal is 0, *too late*: the cancel
+    lost a race with a fill or an unsolicited cancel. Either way the cancel is answered and no
+    longer the order's pending one.
+  - **An order's row:** its 35=8, 11 its ClOrdID and no 41. An unsolicited CANCELED carries the
+    RejectReason's name as Text when it is not NONE.
+  - **No row** (decided 2026-10-25): its row was lost in a host crash (§6.1). Logged, counted, and
+    consumed, until recovery from Artio's archive is built (§8.17). The client misses that order's
+    reports until then.
+- **Each report's 35=8** has the fields of the table above. 55 is the security's Symbol from the
+  directory, with 48 its `securityId` and 22=8; 2362 and 2964 are echoed as sent. LastPx and LastQty
+  on a TRADE only. **AvgPx** is the stored notional over CumQty, rounded half up at 8 decimals.
+- **The state follows the 35=8.** The row changes only once Artio has taken the 35=8. A refused one
+  aborts the report (§6.2), and nothing changed. A sequenced report at or below the row's last
+  `reportSeq` was applied before (a resend after a restart): its 35=8 is sent again with the same
+  ExecID, and the row is not changed again.
+- **OrdStatusUnknown is cleared** by any report for an ambiguous order, an `ORDER_STATUS` included
+  (§3.4).
+- **A parked cancel** (§3.3) is acted on once its order's first report has been applied: sent, or,
+  if that report was terminal, answered 35=9 CxlRejReason 0 *too late*. From the duty cycle, after
+  the order's 35=8, so a refused send never undoes a report already taken.
+- **Fates** (§3.3, §3.4) are owed on the row (§6.2) and their 35=8 or 35=9 is sent from the duty
+  cycle. So are the restatements the mass status rule makes.
+- **An `ORDER_STATUS`** updates the row and is sent, as a 35=8 ExecType I, only when it changes what
+  the client was last told: OrdStatus, CumQty, LeavesQty, or the order found acknowledged.
+  **A CumQty above the one told** means fills in a window no resend reached, at prices unknown
+  (decided 2026-10-25): the 35=8 states the new CumQty, LeavesQty and OrdStatus, AvgPx stays that of
+  the fills the adapter knows, and Text is "fills not reported individually: CumQty <a> to <b>,
+  prices unknown". Counted, alertable.
+- **The mass status rule** (§3.4) runs per shard: each shard's `OrderEntrySession` runs its own
+  status, so a completion settles only orders on that shard's securities.
+- **A participant whose session is not logged on** has its report refused with `ABORT`, and its owed
+  35=8s wait, **until slice 4** delivers to the offline session (§6.3). Until then a client logged
+  out holds its gateway's report stream, every participant's.
 
 ### 5.4 The dictionary
 
@@ -582,7 +625,7 @@ Decided 2026-10-09: **RocksDB, with the working set in memory.**
   Not handed back: a parked cancel, which was never sent, and a request the SDK already settled
   (a fate's 35=8 owed, or sent: an order rejected or ambiguous). Restored, it could be settled
   again, an `AMBIGUOUS` order as `NEVER_SEQUENCED` by a startup resend that completes. Then the SDK's resend and mass status
-  reconcile them. If a report names a `clOrdId` the store does not have (its row was lost in a
+  reconcile them. **Not yet built** (§8.17): if a report names a `clOrdId` the store does not have (its row was lost in a
   host crash), its 35=D is read back from Artio's archive by (`sequenceIndex`, MsgSeqNum).
 
 ### 6.2 Execution report delivery: consume a report only behind the archive
@@ -805,6 +848,13 @@ The archive's recorded position (§6.2) then means durable.
       cancel. The inbound path's 0 bytes per order (slice 2a) was measured against a model of the
       SDK, so the whole path is not allocation-free until `client` pools them. The same change, in
       most-exchange.
+17. **Rows lost in a host crash are not yet recovered** (decided 2026-10-25 to defer, slice 3). §6.1
+    reads a lost row's 35=D back from Artio's archive. Until that is built, a report for a
+    `clOrdId` with no row is logged, counted and consumed (§5.3), so the client misses that order's
+    reports. The intended shape, its own slice after delivery: at startup, before the SDK starts,
+    the archive's inbound 35=D and 35=F past the store's last row are run through the inbound path
+    without sending, so the rows are rebuilt and restored in flight. It needs a look at Artio's
+    archive scanning first.
 
 ## 9. Control and metrics
 

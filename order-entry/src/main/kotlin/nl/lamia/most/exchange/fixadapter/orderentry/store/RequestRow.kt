@@ -93,6 +93,9 @@ class RequestRow internal constructor() {
     /** An order's cancel parked or sent, and not yet answered (§3.3). Rebuilt by [OrderStore.load]. */
     var pendingCancel: RequestRow? = null
 
+    /** When an `ORDER_STATUS` last stated this order, on the outbound path's clock; 0 never (§3.4). */
+    var statedAt = 0L
+
     // The store's bookkeeping.
     internal var hash = 0L
     internal var nextSameHash: RequestRow? = null
@@ -177,6 +180,7 @@ class RequestRow internal constructor() {
         fixClOrdIdLength = 0
         sendPending = false
         pendingCancel = null
+        statedAt = 0L
         hash = 0L
         nextSameHash = null
         stored = false

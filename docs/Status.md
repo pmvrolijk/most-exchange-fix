@@ -4,10 +4,11 @@ Where the adapter stands, what is open, and what to do next. **This is the sessi
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
 Last updated 2026-10-25. **`fix-session` is implemented: the acceptor (2026-10-15) and the FIX
-dictionary (2026-10-20). `order-entry` has its order store, its inbound logic, and their wiring to
-Artio and the SDK (2026-10-25, slices 1, 2a and 2b of §3 item 5): a client's 35=D reaches its
-shard's gateway over Aeron. Reports, delivery and 35=H/AF (slices 3–5) and `market-data` are still
-to build, and there is no runnable adapter yet (no `main`).** 2026-10-20: the dictionary is FIX 4.4's own,
+dictionary (2026-10-20). `order-entry` has its order store, its inbound path, and its outbound path
+(2026-10-25, slices 1–3 of §3 item 5): a client's 35=D reaches its shard's gateway over Aeron, and
+the exchange's reports and fates come back as 35=8 and 35=9. Durable delivery (slice 4), recovery
+of lost rows, 35=H/AF (slice 5) and `market-data` are still to build, and there is no runnable
+adapter yet (no `main`).** 2026-10-20: the dictionary is FIX 4.4's own,
 cut to the handled message types, and Artio was found not to validate application messages, so the
 backend must (CLAUDE.md non-negotiable 9, Design §5.4, Rationale §8).
 
@@ -27,6 +28,10 @@ Decided 2026-10-25 (Design §3.2, §6.1), each the recommendation:
   shard needs. An endpoint that moves later is logged, not followed (Design §3.5).
 - **The collision's block** is stored, the Logon accepted and then logged out by the library, and
   lifted by any reset that raises the `sequenceIndex`, the client's 141=Y included (Design §3.3).
+- **A report for a row the store lost** (a host crash) is logged, counted and consumed until
+  recovery from Artio's archive is built (Design §8.17, Rationale §10).
+- **Fills a mass status reveals** are a 35=8 ExecType I with the new CumQty, AvgPx over the fills
+  known, and a Text saying what is missing (Design §5.3).
 
 Decided 2026-10-09 (Design.md, Rationale §3–§7, CLAUDE.md non-negotiable 1 extended, 7–8 new):
 - **Goals:** low latency, stateful, guaranteed delivery of execution reports, the minimum that
@@ -80,7 +85,7 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 3 — `fix-session`, `order-entry`, `market-data`; packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 85 (the store 20, the inbound path 36, the directory index 7, the config 5, the backend end to end 16, SDK wiring 1); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15 |
+| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 121 (the store 20, the inbound path 36, the outbound path 25, AvgPx 5, the directory index 7, the config 5, the backend end to end 22, SDK wiring 1); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -208,7 +213,7 @@ parallel with item 2.
           does not reset a decoder, so the path resets before each one.
         - **Not right yet:** 35=H and 35=AF get a 35=j "unsupported message type" until slice 5
           answers them from the store. Design §3.3 says they are answered.
-      - ~~**2b, the wiring**~~ **Done 2026-10-25**, uncommitted (Design §2, §3.2, §3.3, §3.5;
+      - ~~**2b, the wiring**~~ **Done 2026-10-25** (`02b29a0`; Design §2, §3.2, §3.3, §3.5;
         Rationale §9). `OrderEntryBackend`, one duty cycle: the order-entry library, `RoleClaims`,
         the directory's subscription, and an `OrderEntrySession` per shard (`ShardVenue`), all on
         the embedded driver. `ArtioReplies`, the 35=3/j/8/9 on Artio's `Session`. `DirectoryIndex`,
@@ -245,12 +250,41 @@ parallel with item 2.
           node file and runs the backend on a thread. The SDK allocates per directory cycle and per
           order (Design §8.16): a change to most-exchange's `client`. The replies' allocation was not
           measured.
-   3. **Outbound:** `onReport` → 35=8/35=9 (§5.3), and the fates per CLAUDE.md non-negotiable 1.
-      Also AvgPx from the 128-bit notional, the "missing from a completed mass status" rule
-      (§3.4), and `restoreInFlight` from `OrderStore.forEachInFlight`.
+   3. ~~**Outbound**~~ **Done 2026-10-25**, uncommitted (Design §3.3, §3.4, §5.3; Rationale §10).
+      `...orderentry.outbound`: `OutboundReports` (a report, a fate or a mass status's completion,
+      to the client and the store), `Notional` (128 bits, AvgPx half up), and the port
+      `ClientReports` with its two reused messages. `artio.ArtioReports` writes them on each
+      participant's `Session`. The backend gives each shard's SDK session its own listener, so a
+      mass status settles only that shard, and calls `restoreInFlight` as it creates one. A
+      report changes the store only once its 35=8 was taken; fates, the mass status rule's
+      restatements and parked cancels are owed on their rows and worked off in the duty cycle.
+      25 tests against encoded reports, 5 for the arithmetic, 6 end to end. Among them:
+      - every ExecType's 35=8, a cancel's CANCELED naming both ClOrdIDs, a lost race answered too
+        late;
+      - an ambiguous order restated as last told, never rejected or terminal (non-negotiable 1);
+      - a refused 35=8 changes nothing, a resent report is not applied twice;
+      - the mass status rule's four exclusions;
+      - an unanswered order restored after a restart, fenced, and rejected not sequenced;
+      - a report held while the client is logged out arrives live, not as a resend;
+      - a truncated resend on one shard, and its mass status settling nothing on the other.
+
+      One window of 2,000 reports applied and sent (to a recorder) allocates 0 bytes. 25 mutations,
+      24 caught. The one not caught is equivalent: without the disconnect hook, a disconnected
+      `Session` is still not written to, because it is no longer active. Two were caught only
+      after a fix. A shard filter removed went unseen, because the other shard's order was
+      sequenced after the status and excluded by the `nextSeq` rule first. And no test ran a mass
+      status after startup, so one now drives a gap through fence, truncation and status.
+      - **Read in the engine** (`MatchingEngineService`) before writing: a participant's cancel is
+        answered with the cancel's `clOrdId`, an unsolicited cancel with the order's.
+      - **Not done here:** a client logged out still holds its gateway's whole report stream
+        (`ABORT`) until slice 4. A row lost in a host crash is not recovered (§8.17). The 35=8's
+        own allocation through Artio was not measured.
    4. **Delivery** (§6.2–§6.3): the lagging `SessionStore` over `OrderStore.saveFirstMissing`,
       the `RecordingPos` lookup at each library connect, and reports held from a disconnect until
       `requestSession` is back.
+   - **Then recovery of lost rows** (Design §8.17): at startup, the archive's inbound 35=D/F past
+     the store's last row run through the inbound path without sending. A look at Artio's archive
+     scanning first.
    5. **35=H and 35=AF** from the store (until then they get a 35=j, "unsupported message type",
       against Design §3.3). Then this repo's **e2e**, against most-exchange's real
       processes. That is the first test of `OrderEntrySession` through a real failover

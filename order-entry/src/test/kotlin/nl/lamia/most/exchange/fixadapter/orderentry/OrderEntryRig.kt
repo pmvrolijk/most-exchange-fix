@@ -7,16 +7,12 @@ import io.aeron.archive.ArchiveThreadingMode
 import io.aeron.driver.ThreadingMode
 import io.aeron.logbuffer.FragmentHandler
 import nl.lamia.most.exchange.client.GatewayEndpoint
-import nl.lamia.most.exchange.client.OrderEntryListener
-import nl.lamia.most.exchange.client.OrderFate
-import nl.lamia.most.exchange.client.ReportAction
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.DirectoryBroadcast
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.TestSecurity
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.TestShard
 import nl.lamia.most.exchange.fixadapter.session.AcceptorRig
 import nl.lamia.most.exchange.fixadapter.session.FixAcceptor
 import nl.lamia.most.exchange.fixadapter.session.Polled
-import nl.lamia.most.exchange.sbe.ClientExecutionReportDecoder
 import nl.lamia.most.exchange.sbe.MessageHeaderDecoder
 import nl.lamia.most.exchange.sbe.MessageHeaderEncoder
 import nl.lamia.most.exchange.sbe.NewOrderSingleDecoder
@@ -47,11 +43,10 @@ class OrderEntryRig(
         driver.threadingMode(ThreadingMode.SHARED).dirDeleteOnShutdown(true)
         archive.threadingMode(ArchiveThreadingMode.SHARED)
     }
-    val listener = RecordingListener()
     val log = mutableListOf<String>()
     val backend: OrderEntryBackend = try {
         OrderEntryBackend(
-            acceptor, OrderEntryConfig(storeDir(dir), "aeron:ipc", DIRECTORY_STREAM, gateways), listener, { TODAY },
+            acceptor, OrderEntryConfig(storeDir(dir), "aeron:ipc", DIRECTORY_STREAM, gateways), { TODAY },
             log = { synchronized(log) { log += it } },
         )
     } catch (e: Throwable) {
@@ -81,8 +76,8 @@ class OrderEntryRig(
 /**
  * The exchange as the adapter's order entry meets it (most-exchange Adapters.md §1–§2), over real
  * Aeron on the adapter's driver: the directory, broadcast on a cycle as discovery does, and a gateway
- * per endpoint that records what it is sent and answers the SDK's mass status and resend requests,
- * empty and `COMPLETE`. It sends no execution reports: those are slice 3's.
+ * per endpoint that records what it is sent, sends the reports a test asks for, and answers the
+ * SDK's mass status and resend requests `COMPLETE`, stating no order and replaying nothing.
  */
 class ExchangeModel(aeronDir: String, var broadcast: DirectoryBroadcast?) : Polled, AutoCloseable {
     private val aeron = Aeron.connect(Aeron.Context().aeronDirectoryName(aeronDir))
@@ -143,6 +138,45 @@ class GatewayModel(aeron: Aeron, val endpoint: GatewayEndpoint) : Polled, AutoCl
     private val owed = ArrayDeque<Pair<Int, Boolean>>() // (length of a reply staged in a buffer of its own, is status)
     private val staged = ArrayDeque<ByteArray>()
 
+    /** Per participant, the next `reportSeq` this gateway's exchange gives (most-exchange Design.md §5). */
+    private val nextSeq = HashMap<Long, Long>()
+
+    fun nextSeq(participantId: Long): Long = nextSeq[participantId] ?: 1L
+
+    /** Orders this gateway's exchange holds open, per participant: what a mass status states. */
+    private val open = HashMap<Long, LinkedHashMap<Long, Pair<Long, Long>>>() // clOrdId -> (exchangeOrderId, leavesQty)
+
+    /** The next resend is answered TRUNCATED, as when the ring no longer holds its start. */
+    var truncateNextResend = false
+
+    /** A reportSeq given and never sent, as a report lost on the way: the client sees a gap. */
+    fun lose(participantId: Long) {
+        nextSeq[participantId] = nextSeq(participantId) + 1
+    }
+
+    /** Sends a ClientExecutionReport, sequenced unless it is an ORDER_STATUS. Returns its reportSeq. */
+    @Suppress("LongParameterList")
+    fun report(
+        participantId: Long, clOrdId: Long, execType: nl.lamia.most.exchange.sbe.ExecType, exchangeOrderId: Long,
+        price: Long = 0L, lastQty: Long = 0L, leavesQty: Long = 0L, cumQty: Long = 0L, origQty: Long = 0L, securityId: Int = 42,
+        reason: nl.lamia.most.exchange.sbe.RejectReason = nl.lamia.most.exchange.sbe.RejectReason.NONE, side: Side = Side.BUY,
+    ): Long {
+        val seq = if (execType == nl.lamia.most.exchange.sbe.ExecType.ORDER_STATUS) 0L else nextSeq(participantId).also { nextSeq[participantId] = it + 1 }
+        val e = nl.lamia.most.exchange.sbe.ClientExecutionReportEncoder().wrapAndApplyHeader(out, 0, outHeader)
+            .participantId(participantId).clOrdId(clOrdId).exchangeOrderId(exchangeOrderId).price(price).lastQty(lastQty)
+            .leavesQty(leavesQty).cumQty(cumQty).origQty(origQty).securityId(securityId).rejectReason(reason)
+            .execType(execType).side(side).enrichment(nl.lamia.most.exchange.sbe.Enrichment.KNOWN).reportSeq(seq)
+        stage(MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength(), isStatus = false)
+        val orders = open.getOrPut(participantId) { LinkedHashMap() }
+        when (execType) {
+            nl.lamia.most.exchange.sbe.ExecType.NEW, nl.lamia.most.exchange.sbe.ExecType.TRADE ->
+                if (leavesQty > 0L) orders[clOrdId] = exchangeOrderId to leavesQty else orders.remove(clOrdId)
+            nl.lamia.most.exchange.sbe.ExecType.ORDER_STATUS, nl.lamia.most.exchange.sbe.ExecType.REJECTED -> Unit
+            else -> orders.remove(clOrdId)
+        }
+        return seq
+    }
+
     private val handler = FragmentHandler { buffer, offset, _, _ ->
         header.wrap(buffer, offset)
         val body = offset + MessageHeaderDecoder.ENCODED_LENGTH
@@ -160,16 +194,25 @@ class GatewayModel(aeron: Aeron, val endpoint: GatewayEndpoint) : Polled, AutoCl
             }
             OrderMassStatusRequestDecoder.TEMPLATE_ID -> {
                 status.wrap(buffer, body, header.blockLength(), header.version())
+                val participant = status.participantId()
+                val requestId = status.requestId()
+                val securityId = status.securityId()
+                val stated = open[participant].orEmpty().entries.toList()
+                for ((clOrdId, held) in stated) {
+                    report(participant, clOrdId, nl.lamia.most.exchange.sbe.ExecType.ORDER_STATUS, held.first, leavesQty = held.second, origQty = held.second)
+                }
                 val e = OrderMassStatusCompleteEncoder().wrapAndApplyHeader(out, 0, outHeader)
-                    .participantId(status.participantId()).requestId(status.requestId()).nextSeq(1L).orderCount(0)
-                    .securityId(status.securityId()).status(RequestStatus.COMPLETE)
+                    .participantId(participant).requestId(requestId).nextSeq(nextSeq(participant)).orderCount(stated.size)
+                    .securityId(securityId).status(RequestStatus.COMPLETE)
                 stage(MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength(), isStatus = true)
             }
             ReportResendRequestDecoder.TEMPLATE_ID -> {
                 resend.wrap(buffer, body, header.blockLength(), header.version())
                 val e = ReportResendCompleteEncoder().wrapAndApplyHeader(out, 0, outHeader)
                     .participantId(resend.participantId()).requestId(resend.requestId()).fromSeq(resend.fromSeq())
-                    .nextSeq(resend.fromSeq()).oldestRetainedSeq(1L).replayedCount(0).status(RequestStatus.COMPLETE)
+                    .nextSeq(nextSeq(resend.participantId())).oldestRetainedSeq(1L).replayedCount(0)
+                    .status(if (truncateNextResend) RequestStatus.TRUNCATED else RequestStatus.COMPLETE)
+                truncateNextResend = false
                 stage(MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength(), isStatus = false)
             }
         }
@@ -191,26 +234,4 @@ class GatewayModel(aeron: Aeron, val endpoint: GatewayEndpoint) : Polled, AutoCl
     }
 
     override fun close() = CloseHelper.closeAll(requests, reports)
-}
-
-/** What the SDK told the adapter. Slice 3 handles reports; here they are only counted. */
-class RecordingListener : OrderEntryListener {
-    var ready = 0
-        private set
-    val settled = mutableListOf<Pair<Long, OrderFate>>()
-    var reports = 0
-        private set
-
-    override fun onReport(report: ClientExecutionReportDecoder): ReportAction {
-        reports++
-        return ReportAction.CONSUMED
-    }
-
-    override fun onSettled(participantId: Long, clOrdId: Long, fate: OrderFate) {
-        settled += clOrdId to fate
-    }
-
-    override fun onReady() {
-        ready++
-    }
 }

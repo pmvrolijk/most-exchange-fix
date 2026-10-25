@@ -9,10 +9,17 @@ import nl.lamia.most.exchange.client.DirectoryClient
 import nl.lamia.most.exchange.client.GatewayEndpoint
 import nl.lamia.most.exchange.client.GatewayLink
 import nl.lamia.most.exchange.client.OrderEntryListener
+import nl.lamia.most.exchange.client.OrderFate
+import nl.lamia.most.exchange.client.ReportAction
 import nl.lamia.most.exchange.client.OrderEntrySession
 import nl.lamia.most.exchange.client.SessionStore
 import nl.lamia.most.exchange.fixadapter.codecs.Constants
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReplies
+import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReports
+import nl.lamia.most.exchange.fixadapter.orderentry.outbound.OutboundReports
+import nl.lamia.most.exchange.fixadapter.orderentry.store.RowKind
+import nl.lamia.most.exchange.sbe.ClientExecutionReportDecoder
+import nl.lamia.most.exchange.sbe.RequestStatus
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.DirectoryIndex
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.ShardVenue
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.InboundOrders
@@ -41,13 +48,13 @@ import java.util.function.IntSupplier
  * the startup guards run (§3.2), and construction fails if they refuse. The SDK's links run on the
  * acceptor's embedded media driver (§3.5).
  *
- * Reports, fates and the durable `reportSeq` are [listener]'s and [sessionStore]'s: slices 3 and 4.
- * [links] makes a gateway's link; tests may stand a model of the exchange in for Aeron's.
+ * Reports and fates go to the client through the outbound path (§5.3). The durable `reportSeq` is
+ * [sessionStore]'s: the SDK's in-memory one until slice 4. [links] makes a gateway's link; tests
+ * may stand a model of the exchange in for Aeron's.
  */
 class OrderEntryBackend(
     private val acceptor: FixAcceptor,
     config: OrderEntryConfig,
-    private val listener: OrderEntryListener,
     tradingDate: IntSupplier,
     private val sessionStore: SessionStore = SessionStore.InMemory(),
     private val sessionConfig: OrderEntrySession.Config = OrderEntrySession.Config(),
@@ -67,8 +74,14 @@ class OrderEntryBackend(
     private val index = DirectoryIndex()
     private val venue = ShardVenue()
     private val replies = ArtioReplies()
+    private val reports = ArtioReports(index)
     private val directory = DirectoryClient()
     val inbound: InboundOrders
+    val outbound: OutboundReports
+
+    /** Shards whose SDK session has finished its opening mass status (most-exchange Adapters.md §1). */
+    var readyShards = 0
+        private set
 
     private val aeron: Aeron
     private val directorySubscription: Subscription
@@ -87,6 +100,8 @@ class OrderEntryBackend(
             inbound = InboundOrders(store, venue, index, tradingDate) { participantId ->
                 log("participant $participantId: id collision, session blocked until its sequence is reset (Design.md §3.3)")
             }
+            outbound = OutboundReports(store, reports, venue, { venue.shardOf(it) }, log)
+            outbound.recover()
             aeron = owned(Aeron.connect(Aeron.Context().aeronDirectoryName(acceptor.config.aeronDir)))
             directorySubscription = owned(aeron.addSubscription(config.directoryChannel, config.directoryStreamId))
             claims = RoleClaims(acceptor.sessions, Role.ORDER_ENTRY) { session, reply ->
@@ -117,6 +132,7 @@ class OrderEntryBackend(
             work++
         }
         work += venue.doWork()
+        work += outbound.doWork()
         return work
     }
 
@@ -129,7 +145,9 @@ class OrderEntryBackend(
             if (listed == null) {
                 val endpoints = config.gatewaysFor(route)
                 val shardLinks = endpoints.map { endpoint -> links(aeron, endpoint).also { if (it is AutoCloseable) owned(it) } }
-                venue.add(route.shardId, OrderEntrySession(shardLinks, participantIds, listener, sessionConfig, sessionStore), endpoints)
+                val session = OrderEntrySession(shardLinks, participantIds, ShardListener(route.shardId), sessionConfig, sessionStore)
+                restoreInFlight(route.shardId, session)
+                venue.add(route.shardId, session, endpoints)
                 log("order entry: shard ${route.shardId} through ${endpoints.joinToString()}")
             } else if (config.gateways[route.shardId] == null && listed.single() != GatewayEndpoint.of(route)) {
                 if (movedLogged.add(route.shardId)) {
@@ -139,6 +157,39 @@ class OrderEntryBackend(
             } else {
                 movedLogged.remove(route.shardId)
             }
+        }
+    }
+
+    /**
+     * The store's requests in flight on [shardId]'s securities, handed back before the session's first
+     * `doWork` (Design.md §3.4, §6.1). A cancel is on its order's security.
+     */
+    private fun restoreInFlight(shardId: Int, session: OrderEntrySession) {
+        var restored = 0
+        store.forEachInFlight { row ->
+            val securityId = if (row.kind == RowKind.ORDER) row.securityId else store.find(row.participantId, row.origClOrdId)?.securityId
+            if (securityId != null && venue.shardOf(securityId) == shardId) {
+                session.restoreInFlight(row.participantId, row.clOrdId)
+                restored++
+            }
+        }
+        if (restored > 0) log("order entry: shard $shardId: $restored requests restored in flight")
+    }
+
+    /** The SDK session of one shard, to the outbound path: a mass status settles that shard's orders only (§5.3). */
+    private inner class ShardListener(private val shardId: Int) : OrderEntryListener {
+        override fun onReport(report: ClientExecutionReportDecoder): ReportAction = outbound.onReport(report)
+
+        override fun onSettled(participantId: Long, clOrdId: Long, fate: OrderFate) = outbound.onSettled(participantId, clOrdId, fate)
+
+        override fun onMassStatusComplete(participantId: Long, status: RequestStatus, orderCount: Int, nextSeq: Long) =
+            outbound.onMassStatusComplete(shardId, participantId, status, nextSeq)
+
+        override fun onRequestRefused(participantId: Long, status: RequestStatus) =
+            log("order entry: shard $shardId refused participant $participantId's request: $status")
+
+        override fun onReady() {
+            readyShards++
         }
     }
 
@@ -167,6 +218,8 @@ class OrderEntryBackend(
         if (store.isBlocked(participantId)) {
             replies.session = session
             replies.logout(Texts.SEQUENCE_RESET_REQUIRED)
+        } else {
+            reports.online(participantId, session)
         }
         return Handler(participantId)
     }
@@ -185,7 +238,11 @@ class OrderEntryBackend(
 
         override fun onTimeout(libraryId: Int, session: Session) = Unit
         override fun onSlowStatus(libraryId: Int, session: Session, hasBecomeSlow: Boolean) = Unit
-        override fun onDisconnect(libraryId: Int, session: Session, reason: DisconnectReason): Action = Action.CONTINUE
+        override fun onDisconnect(libraryId: Int, session: Session, reason: DisconnectReason): Action {
+            reports.offline(participantId, session)
+            return Action.CONTINUE
+        }
+
         override fun onSessionStart(session: Session) = Unit
     }
 

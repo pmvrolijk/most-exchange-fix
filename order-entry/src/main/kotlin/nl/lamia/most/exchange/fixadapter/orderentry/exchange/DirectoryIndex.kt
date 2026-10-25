@@ -5,6 +5,7 @@ import nl.lamia.most.exchange.client.RoutedSecurity
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.SecurityLookup
 import org.agrona.DirectBuffer
 import org.agrona.collections.Int2IntHashMap
+import org.agrona.collections.Int2ObjectHashMap
 
 /**
  * The directory as order entry reads it (Design.md §3.5, §5.1): a security by its id, ISIN or
@@ -22,6 +23,9 @@ class DirectoryIndex : SecurityLookup {
         private set
 
     private var shardBySecurity = Int2IntHashMap(NO_SHARD)
+
+    /** Every Symbol ever listed, by `securityId`: a report echoes it after the security has left. */
+    private val symbols = Int2ObjectHashMap<ByteArray>()
     private var bySymbol = BytesTable.EMPTY
     private var byIsin = BytesTable.EMPTY
 
@@ -39,6 +43,9 @@ class DirectoryIndex : SecurityLookup {
     /** The shard hosting [securityId], or [NO_SHARD]. */
     fun shardOf(securityId: Int): Int = shardBySecurity.get(securityId)
 
+    /** [securityId]'s Symbol as ASCII bytes, or null if no directory listed it. */
+    fun symbolOf(securityId: Int): ByteArray? = symbols.get(securityId)
+
     override fun isKnown(securityId: Int): Boolean = shardBySecurity.get(securityId) != NO_SHARD
 
     override fun byIsin(buffer: DirectBuffer, offset: Int, length: Int): Int = byIsin.get(buffer, offset, length)
@@ -47,7 +54,10 @@ class DirectoryIndex : SecurityLookup {
 
     private fun rebuild(securities: Collection<RoutedSecurity>) {
         val shards = Int2IntHashMap(securities.size * 2, org.agrona.collections.Hashing.DEFAULT_LOAD_FACTOR, NO_SHARD)
-        for (s in securities) shards.put(s.securityId, s.shardId)
+        for (s in securities) {
+            shards.put(s.securityId, s.shardId)
+            symbols.put(s.securityId, s.symbol.toByteArray(Charsets.US_ASCII))
+        }
         shardBySecurity = shards
         bySymbol = BytesTable.of(securities.map { it.symbol to it.securityId })
         byIsin = BytesTable.of(securities.filter { it.isin.isNotEmpty() }.map { it.isin to it.securityId })
