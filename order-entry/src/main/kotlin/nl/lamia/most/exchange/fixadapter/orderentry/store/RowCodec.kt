@@ -40,7 +40,8 @@ internal object RowCodec {
     private const val NOTIONAL_LO_AT = 80
     private const val SMP_ID_AT = 88
     private const val ORIG_CLORDID_AT = 96
-    const val FIXED_LENGTH = 104 // the ClOrdID's bytes follow
+    private const val SHARD_ID_AT = 104 // i32
+    const val FIXED_LENGTH = 108 // the ClOrdID's bytes follow
 
     private const val FLAG_ACKNOWLEDGED = 1
     private const val FLAG_AMBIGUOUS = 2
@@ -86,6 +87,7 @@ internal object RowCodec {
         buffer.putLong(NOTIONAL_LO_AT, row.notionalLo, LE)
         buffer.putLong(SMP_ID_AT, row.smpId, LE)
         buffer.putLong(ORIG_CLORDID_AT, row.origClOrdId, LE)
+        buffer.putInt(SHARD_ID_AT, row.shardId, LE)
         val length = row.getFixClOrdId(buffer, FIXED_LENGTH)
         return FIXED_LENGTH + length
     }
@@ -141,6 +143,7 @@ internal object RowCodec {
         row.notionalLo = buffer.getLong(NOTIONAL_LO_AT, LE)
         row.smpId = buffer.getLong(SMP_ID_AT, LE)
         row.origClOrdId = buffer.getLong(ORIG_CLORDID_AT, LE)
+        row.shardId = buffer.getInt(SHARD_ID_AT, LE)
         row.fixClOrdId(buffer, FIXED_LENGTH, idLength)
     }
 

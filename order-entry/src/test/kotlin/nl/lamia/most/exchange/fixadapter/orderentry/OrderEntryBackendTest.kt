@@ -467,12 +467,15 @@ class OrderEntryBackendTest {
             assertEquals("99", reject[103])
             assertEquals(Texts.NOT_SEQUENCED_ORDER, reject[58])
             assertTrue(assertNotNull(reject[17]).startsWith("A"), "the adapter's own ExecID")
-            assertTrue(adapter.rig.log.any { "1 requests restored in flight" in it }, "${adapter.rig.log}")
+            assertEquals(1, adapter.rig.log.count { "requests restored in flight" in it }, "on its own shard only: ${adapter.rig.log}")
+            pollFor(300, *adapter.all())
+            assertEquals(1, session.messages().count { it.seqNum > received && it[11] == "ORD-1" && it[150] == "8" }, "settled once")
         }
     }
 
     @Test
-    fun `a report for a client logged out is held, and sent when it logs back on`() {
+    fun `a report for a client logged out goes to its offline session, is consumed once archived, and is resent at its Logon`() {
+        // Design.md §6.3: delivery does not wait for the client, nor depend on the exchange's ring.
         val adapter = start()
         adapter.awaitExchange()
         val session = adapter.logon()
@@ -481,15 +484,67 @@ class OrderEntryBackendTest {
         pollUntil(*adapter.all(), what = "logout sent") { session.startLogout() > 0 }
         pollUntil(*adapter.all(), what = "logged out") { !session.isConnected }
         val received = session.lastReceivedMsgSeqNum()
+        pollUntil(*adapter.all(), what = "the session back offline") { adapter.rig.backend.sessions.session(1001L) != null }
         val o = adapter.gateway(0).orders.single()
         adapter.gateway(0).report(1001L, o.clOrdId, ExecType.NEW, 5001L, price = o.price, leavesQty = o.qty, origQty = o.qty)
-        pollFor(300, *adapter.all())
+        pollUntil(*adapter.all(), what = "reportSeq 1 consumed behind the archive (${adapter.rig.log})") {
+            adapter.rig.backend.store.firstMissing(1001L, 0) == 2L
+        }
+        assertTrue(!session.isConnected, "while the client is still away")
         val again = adapter.logon(initialSent = session.lastSentMsgSeqNum() + 1, initialReceived = received + 1)
-        val ack = adapter.awaitReply(again, "the held acknowledgement") { it.msgType == "8" && it.seqNum > received }
+        val ack = adapter.awaitReply(again, "the acknowledgement resent") { it.msgType == "8" && it.seqNum > received }
+        assertEquals(received + 1, ack.seqNum, "numbered by Artio, on from the last sent")
         assertEquals("1", ack[17])
         assertEquals("0", ack[150])
-        // Live on the session acquired again, not written to the one the logout took and resent (§6.3).
-        assertEquals(null, ack[43], "not a PossDup resend")
+        assertEquals("Y", ack[43], "Artio's resend of what was archived offline")
+    }
+
+    @Test
+    fun `after a restart a session is held offline before its client logs on, so an answer owed then reaches it at its Logon`() {
+        val (sent, received) = start().use { adapter ->
+            adapter.awaitExchange()
+            val session = adapter.logon()
+            adapter.send(session, order("ORD-1"))
+            pollUntil(*adapter.all(), what = "the order at the gateway") { adapter.gateway(0).orders.size == 1 }
+            pollUntil(*adapter.all(), what = "logout sent") { session.startLogout() > 0 }
+            pollUntil(*adapter.all(), what = "logged out") { !session.isConnected }
+            session.lastSentMsgSeqNum() to session.lastReceivedMsgSeqNum()
+        }
+        start().use { adapter ->
+            // Requested offline before the bind (§6.3): held, though the client is not back.
+            val offline = assertNotNull(adapter.rig.backend.sessions.session(1001L), "held at startup: requests ${adapter.rig.backend.sessions.requests}, engine ${adapter.rig.acceptor.engine.allSessions().map { it.sessionId() to it.sessionKey() }}, log ${adapter.rig.log}")
+            assertTrue(!offline.isConnected)
+            adapter.awaitExchange()
+            // The SDK fences the restored order, the resend completes without it: never sequenced,
+            // answered on the offline session while the client is away.
+            pollUntil(*adapter.all(), what = "the reject written offline") { offline.lastSentMsgSeqNum() > received }
+            val again = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
+            val reject = adapter.awaitReply(again, "the reject resent") { it.msgType == "8" && it.seqNum > received }
+            assertEquals(received + 1, reject.seqNum)
+            assertEquals("Y", reject[43], "resent by Artio from the archive")
+            assertEquals(Texts.NOT_SEQUENCED_ORDER, reject[58])
+        }
+    }
+
+    @Test
+    fun `a client that logs back on before the library has its session again loses no 35=D`() {
+        // Design.md §6.3: the request after a disconnect replays from the last message received + 1.
+        // A client back first is handed over online with that replay; with none, its 35=D is skipped.
+        val adapter = start()
+        adapter.awaitExchange()
+        val session = adapter.logon()
+        // The connection dropped, no Logout: the adapter is not polled from here, so its library has
+        // not seen the disconnect. Artio's engine, on its own threads, owns the session from it,
+        // accepts the Logon and the 35=D, and announces the session to that library.
+        pollUntil(adapter.exchange, client, what = "disconnect requested") { session.requestDisconnect() > 0 }
+        pollUntil(adapter.exchange, client, what = "disconnected") { !session.isConnected }
+        val reply = client.logon(port, CLIENT1, "client1", SECRET1, session.lastSentMsgSeqNum() + 1, session.lastReceivedMsgSeqNum() + 1, false)
+        pollUntil(adapter.exchange, client, what = "logged on again, engine-owned") { !reply.isExecuting }
+        val again = reply.resultIfPresent().also { sessions += it }
+        pollUntil(adapter.exchange, client, what = "a 35=D sent") { again.trySend(order("ORD-2")) > 0 }
+        pollFor(200, adapter.exchange, client)
+        pollUntil(*adapter.all(), what = "the 35=D at the gateway (${adapter.rig.log})") { adapter.gateway(0).orders.size == 1 }
+        assertEquals(again.lastSentMsgSeqNum().toLong(), adapter.gateway(0).orders.single().clOrdId and 0xffffffffL)
     }
 
     @Test
@@ -514,6 +569,10 @@ class OrderEntryBackendTest {
         val reports = adapter.reports(session)
         assertEquals(2, reports.size, "the two acknowledgements, and nothing else: $reports")
         assertTrue(reports.none { it[5001] == "Y" }, "shard 0's open order is not shard 1's status's to settle")
+        // Each shard's sequence stored on its own (§6.1): shard 0 consumed 1, shard 1 resumed past the status.
+        pollUntil(*adapter.all(), what = "each shard's reportSeq stored") {
+            adapter.rig.backend.store.firstMissing(1001L, 0) == 2L && adapter.rig.backend.store.firstMissing(1001L, 1) == adapter.gateway(1).nextSeq(1001L)
+        }
     }
 
     private fun cancelOf(origClOrdId: String, clOrdId: String) = OrderCancelRequestEncoder().apply {

@@ -39,6 +39,12 @@ class RequestRow internal constructor() {
     /** The exchange's id, derived (Design.md §3.2). */
     var clOrdId = 0L
     var entryTradingDate = 0
+
+    /**
+     * The shard the request went to, [NO_SHARD] if none: an order's security's at entry, a cancel's
+     * order's. Its reports carry that shard's `reportSeq` (Design.md §6.1), which retention compares.
+     */
+    var shardId = NO_SHARD
     var lastReportSeq = 0L
 
     /** A fate whose 35=8 (or 35=9) is still to be sent (Design.md §6.2). */
@@ -157,6 +163,7 @@ class RequestRow internal constructor() {
         participantId = 0L
         clOrdId = 0L
         entryTradingDate = 0
+        shardId = NO_SHARD
         lastReportSeq = 0L
         owed = null
         acknowledged = false
@@ -189,6 +196,9 @@ class RequestRow internal constructor() {
     companion object {
         /** The row stores the length in 16 bits. What a client may send is the backend's to bound. */
         const val MAX_FIX_CLORDID_LENGTH = 0xffff
+
+        /** A request that reached no shard: refused before it was sent. */
+        const val NO_SHARD = -1
         private const val INITIAL_CLORDID_CAPACITY = 32
 
         /** OrdStatus filled, canceled, expired, rejected. */

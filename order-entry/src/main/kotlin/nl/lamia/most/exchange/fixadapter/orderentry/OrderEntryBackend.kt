@@ -12,12 +12,14 @@ import nl.lamia.most.exchange.client.OrderEntryListener
 import nl.lamia.most.exchange.client.OrderFate
 import nl.lamia.most.exchange.client.ReportAction
 import nl.lamia.most.exchange.client.OrderEntrySession
-import nl.lamia.most.exchange.client.SessionStore
 import nl.lamia.most.exchange.fixadapter.codecs.Constants
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReplies
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReports
+import nl.lamia.most.exchange.fixadapter.orderentry.artio.LibraryRecording
+import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioSessions
+import nl.lamia.most.exchange.fixadapter.orderentry.artio.ReportSessions
+import nl.lamia.most.exchange.fixadapter.orderentry.delivery.ReportDelivery
 import nl.lamia.most.exchange.fixadapter.orderentry.outbound.OutboundReports
-import nl.lamia.most.exchange.fixadapter.orderentry.store.RowKind
 import nl.lamia.most.exchange.sbe.ClientExecutionReportDecoder
 import nl.lamia.most.exchange.sbe.RequestStatus
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.DirectoryIndex
@@ -32,10 +34,12 @@ import org.agrona.CloseHelper
 import org.agrona.DirectBuffer
 import org.agrona.concurrent.Agent
 import uk.co.real_logic.artio.library.FixLibrary
+import uk.co.real_logic.artio.library.LibraryConnectHandler
 import uk.co.real_logic.artio.library.OnMessageInfo
 import uk.co.real_logic.artio.library.SessionAcquireHandler
 import uk.co.real_logic.artio.library.SessionHandler
 import uk.co.real_logic.artio.messages.DisconnectReason
+import uk.co.real_logic.artio.messages.SessionReplyStatus
 import uk.co.real_logic.artio.session.Session
 import java.util.function.IntSupplier
 
@@ -48,15 +52,16 @@ import java.util.function.IntSupplier
  * the startup guards run (§3.2), and construction fails if they refuse. The SDK's links run on the
  * acceptor's embedded media driver (§3.5).
  *
- * Reports and fates go to the client through the outbound path (§5.3). The durable `reportSeq` is
- * [sessionStore]'s: the SDK's in-memory one until slice 4. [links] makes a gateway's link; tests
- * may stand a model of the exchange in for Aeron's.
+ * Reports and fates go to the client through the outbound path (§5.3), on each participant's session
+ * online or offline (§6.3). Every session Artio knows is requested offline during construction, so it
+ * must come before the acceptor binds. The durable `reportSeq` of each shard's SDK session advances
+ * only behind the archive ([delivery], §6.2). [links] makes a gateway's link; tests may stand a model
+ * of the exchange in for Aeron's.
  */
 class OrderEntryBackend(
     private val acceptor: FixAcceptor,
     config: OrderEntryConfig,
     tradingDate: IntSupplier,
-    private val sessionStore: SessionStore = SessionStore.InMemory(),
     private val sessionConfig: OrderEntrySession.Config = OrderEntrySession.Config(),
     private val links: (Aeron, GatewayEndpoint) -> GatewayLink = ::AeronGatewayLink,
     private val log: (String) -> Unit = System.err::println,
@@ -74,10 +79,13 @@ class OrderEntryBackend(
     private val index = DirectoryIndex()
     private val venue = ShardVenue()
     private val replies = ArtioReplies()
-    private val reports = ArtioReports(index)
+    val sessions = ReportSessions(ArtioSessions, log)
+    private val reports = ArtioReports(index, sessions)
     private val directory = DirectoryClient()
     val inbound: InboundOrders
     val outbound: OutboundReports
+    val delivery: ReportDelivery
+    private val recording: LibraryRecording
 
     /** Shards whose SDK session has finished its opening mass status (most-exchange Adapters.md §1). */
     var readyShards = 0
@@ -86,7 +94,7 @@ class OrderEntryBackend(
     private val aeron: Aeron
     private val directorySubscription: Subscription
     private val directoryAssembler = FragmentAssembler { buffer, offset, length, _ -> directory.onDirectoryMessage(buffer, offset, length) }
-    private val claims: RoleClaims
+    private lateinit var claims: RoleClaims
     val library: FixLibrary
 
     /** Shards whose directory endpoint has moved from the one their session was created with, as last logged. */
@@ -100,21 +108,20 @@ class OrderEntryBackend(
             inbound = InboundOrders(store, venue, index, tradingDate) { participantId ->
                 log("participant $participantId: id collision, session blocked until its sequence is reset (Design.md §3.3)")
             }
-            outbound = OutboundReports(store, reports, venue, { venue.shardOf(it) }, log)
-            outbound.recover()
             aeron = owned(Aeron.connect(Aeron.Context().aeronDirectoryName(acceptor.config.aeronDir)))
-            directorySubscription = owned(aeron.addSubscription(config.directoryChannel, config.directoryStreamId))
-            claims = RoleClaims(acceptor.sessions, Role.ORDER_ENTRY) { session, reply ->
-                log("order entry: claim of $session failed: ${reply.state()} ${reply.error() ?: reply.resultIfPresent()}")
+            val libraryConfiguration = acceptor.libraryConfiguration(claims()).apply {
+                libraryName("order-entry")
+                sessionAcquireHandler(SessionAcquireHandler { session, _ -> onAcquired(session) })
+                libraryConnectHandler(Connection())
             }
-            library = owned(
-                FixLibrary.connect(
-                    acceptor.libraryConfiguration(claims).apply {
-                        libraryName("order-entry")
-                        sessionAcquireHandler(SessionAcquireHandler { session, _ -> onAcquired(session) })
-                    },
-                ),
-            )
+            recording = LibraryRecording(aeron.countersReader(), libraryConfiguration)
+            delivery = ReportDelivery(store, recording)
+            outbound = OutboundReports(store, reports, venue, delivery, log)
+            outbound.recover()
+            directorySubscription = owned(aeron.addSubscription(config.directoryChannel, config.directoryStreamId))
+            library = owned(FixLibrary.connect(libraryConfiguration))
+            sessions.library = ArtioSessions.handover(library)
+            acquireOffline()
         } catch (e: Throwable) {
             close()
             throw e
@@ -126,6 +133,7 @@ class OrderEntryBackend(
     override fun doWork(): Int {
         var work = library.poll(FRAGMENT_LIMIT)
         work += claims.poll()
+        work += sessions.doWork()
         work += directorySubscription.poll(directoryAssembler, FRAGMENT_LIMIT)
         if (index.update(directory)) {
             onDirectory()
@@ -133,7 +141,56 @@ class OrderEntryBackend(
         }
         work += venue.doWork()
         work += outbound.doWork()
+        work += delivery.doWork()
         return work
+    }
+
+    private fun claims(): RoleClaims = RoleClaims(acceptor.sessions, Role.ORDER_ENTRY) { session, reply ->
+        // Already the library's, offline: the engine announced its Logon all the same.
+        val participantId = session.participantId
+        if (reply.resultIfPresent() == SessionReplyStatus.OTHER_SESSION_OWNER && participantId != null && sessions.session(participantId) != null) {
+            return@RoleClaims
+        }
+        log("order entry: claim of $session failed: ${reply.state()} ${reply.error() ?: reply.resultIfPresent()}")
+    }.also { claims = it }
+
+    /**
+     * Every configured order-entry session Artio knows, requested offline before the acceptor binds,
+     * so a report for a client not logged on is written to its session and resent at its Logon
+     * (Design.md §6.3). Waits for the replies: until the bind no client can log on, which is why
+     * nothing need be replayed.
+     */
+    private fun acquireOffline() {
+        val deadline = System.nanoTime() + STARTUP_TIMEOUT_NS
+        while (!library.isConnected) {
+            check(System.nanoTime() < deadline) { "order entry: the library did not connect within ${STARTUP_TIMEOUT_NS / 1_000_000_000L} s" }
+            library.poll(FRAGMENT_LIMIT)
+        }
+        for (info in acceptor.engine.allSessions()) {
+            val key = info.sessionKey() ?: continue
+            val configured = acceptor.sessions.find(senderCompId = key.localCompId(), targetCompId = key.remoteCompId()) ?: continue
+            if (configured.role != Role.ORDER_ENTRY) continue
+            sessions.requestAtStartup(checkNotNull(configured.participantId), info.sessionId())
+        }
+        while (sessions.isRequesting) {
+            check(System.nanoTime() < deadline) { "order entry: the offline sessions were not handed over within ${STARTUP_TIMEOUT_NS / 1_000_000_000L} s" }
+            library.poll(FRAGMENT_LIMIT)
+            sessions.doWork()
+        }
+    }
+
+    /** The library's connection to the engine (§6.2): positions are compared only on the connection they were taken on. */
+    private inner class Connection : LibraryConnectHandler {
+        override fun onConnect(library: FixLibrary) {
+            recording.onLibraryConnect()
+            delivery.onLibraryConnect()
+            sessions.onLibraryConnect()
+        }
+
+        override fun onDisconnect(library: FixLibrary) {
+            log("order entry: the library lost the engine; reports wait until it is back (Design.md §6.2)")
+            sessions.onLibraryDisconnect()
+        }
     }
 
     // ------------------------------------------------------------------ the directory, §3.5
@@ -145,7 +202,7 @@ class OrderEntryBackend(
             if (listed == null) {
                 val endpoints = config.gatewaysFor(route)
                 val shardLinks = endpoints.map { endpoint -> links(aeron, endpoint).also { if (it is AutoCloseable) owned(it) } }
-                val session = OrderEntrySession(shardLinks, participantIds, ShardListener(route.shardId), sessionConfig, sessionStore)
+                val session = OrderEntrySession(shardLinks, participantIds, ShardListener(route.shardId), sessionConfig, delivery.sessionStore(route.shardId))
                 restoreInFlight(route.shardId, session)
                 venue.add(route.shardId, session, endpoints)
                 log("order entry: shard ${route.shardId} through ${endpoints.joinToString()}")
@@ -161,14 +218,13 @@ class OrderEntryBackend(
     }
 
     /**
-     * The store's requests in flight on [shardId]'s securities, handed back before the session's first
-     * `doWork` (Design.md §3.4, §6.1). A cancel is on its order's security.
+     * The store's requests in flight to [shardId], handed back before the session's first `doWork`
+     * (Design.md §3.4, §6.1).
      */
     private fun restoreInFlight(shardId: Int, session: OrderEntrySession) {
         var restored = 0
         store.forEachInFlight { row ->
-            val securityId = if (row.kind == RowKind.ORDER) row.securityId else store.find(row.participantId, row.origClOrdId)?.securityId
-            if (securityId != null && venue.shardOf(securityId) == shardId) {
+            if (row.shardId == shardId) {
                 session.restoreInFlight(row.participantId, row.clOrdId)
                 restored++
             }
@@ -178,7 +234,7 @@ class OrderEntryBackend(
 
     /** The SDK session of one shard, to the outbound path: a mass status settles that shard's orders only (§5.3). */
     private inner class ShardListener(private val shardId: Int) : OrderEntryListener {
-        override fun onReport(report: ClientExecutionReportDecoder): ReportAction = outbound.onReport(report)
+        override fun onReport(report: ClientExecutionReportDecoder): ReportAction = outbound.onReport(shardId, report)
 
         override fun onSettled(participantId: Long, clOrdId: Long, fate: OrderFate) = outbound.onSettled(participantId, clOrdId, fate)
 
@@ -204,6 +260,14 @@ class OrderEntryBackend(
             session.logoutAndDisconnect()
             return Ignored
         }
+        sessions.acquired(participantId, session)
+        // Offline (requested at startup or after a disconnect), its Logon comes later: onSessionStart.
+        if (session.isActive) loggedOn(participantId, session)
+        return Handler(participantId)
+    }
+
+    /** The participant's client is logged on (§3.2, §3.3): its `sequenceIndex` guarded, a blocked session logged out. */
+    private fun loggedOn(participantId: Long, session: Session) {
         val sequenceIndex = session.sequenceIndex()
         if (sequenceIndex < store.highestSequenceIndex(participantId)) {
             // Artio's state lost while running: the derived ids would repeat (§3.2).
@@ -218,10 +282,7 @@ class OrderEntryBackend(
         if (store.isBlocked(participantId)) {
             replies.session = session
             replies.logout(Texts.SEQUENCE_RESET_REQUIRED)
-        } else {
-            reports.online(participantId, session)
         }
-        return Handler(participantId)
     }
 
     /** One order-entry session's messages, to the inbound path (§3.3, "What reaches the inbound path"). */
@@ -239,11 +300,13 @@ class OrderEntryBackend(
         override fun onTimeout(libraryId: Int, session: Session) = Unit
         override fun onSlowStatus(libraryId: Int, session: Session, hasBecomeSlow: Boolean) = Unit
         override fun onDisconnect(libraryId: Int, session: Session, reason: DisconnectReason): Action {
-            reports.offline(participantId, session)
+            // Requested here, inside the poll: ahead of a claim the engine announces in the same poll.
+            sessions.disconnected(participantId, session)
             return Action.CONTINUE
         }
 
-        override fun onSessionStart(session: Session) = Unit
+        /** A Logon on a session the library already held offline. */
+        override fun onSessionStart(session: Session) = loggedOn(participantId, session)
     }
 
     private object Ignored : SessionHandler {
@@ -267,6 +330,7 @@ class OrderEntryBackend(
 
     private companion object {
         const val FRAGMENT_LIMIT = 10
+        val STARTUP_TIMEOUT_NS = java.util.concurrent.TimeUnit.SECONDS.toNanos(10)
 
         fun isSessionMessage(messageType: Long): Boolean = when (messageType) {
             Constants.HEARTBEAT_MESSAGE, Constants.TEST_REQUEST_MESSAGE, Constants.RESEND_REQUEST_MESSAGE,

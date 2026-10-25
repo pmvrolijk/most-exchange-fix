@@ -1,6 +1,7 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.store
 
 import org.agrona.DirectBuffer
+import org.agrona.collections.Long2LongHashMap
 import org.agrona.collections.Long2ObjectHashMap
 import org.agrona.concurrent.UnsafeBuffer
 import org.rocksdb.ColumnFamilyDescriptor
@@ -17,7 +18,7 @@ import java.nio.ByteOrder
 
 /**
  * The order store (Design.md §6.1): a row per request in RocksDB, every read served from memory,
- * and per participant the durable first-missing `reportSeq` (§6.2), the highest `sequenceIndex`
+ * per participant and shard the durable first-missing `reportSeq` (§6.2), and per participant the highest `sequenceIndex`
  * (§3.2) and an id collision's block (§3.3). Keyed by `participantId`, never Artio's session id, which a wipe of Artio's state changes.
  *
  * Single-threaded: the order-entry library's thread owns it (§3.5). After [open], call [load] once,
@@ -49,7 +50,7 @@ class OrderStore private constructor(
     private val key = UnsafeBuffer(keyBytes)
     private var valueBytes = ByteBuffer.allocateDirect(INITIAL_VALUE_CAPACITY)
     private var value = UnsafeBuffer(valueBytes)
-    private val metaKeyBytes = ByteBuffer.allocateDirect(META_KEY_LENGTH)
+    private val metaKeyBytes = ByteBuffer.allocateDirect(META_SHARD_KEY_LENGTH)
     private val metaKey = UnsafeBuffer(metaKeyBytes)
     private val metaValueBytes = ByteBuffer.allocateDirect(Long.SIZE_BYTES)
     private val metaValue = UnsafeBuffer(metaValueBytes)
@@ -67,7 +68,9 @@ class OrderStore private constructor(
 
         /** Hash of the FIX ClOrdID → the first row of its chain ([RequestRow.nextSameHash]). */
         val byFixHash = Long2ObjectHashMap<RequestRow>()
-        var firstMissing = 1L
+
+        /** Per shard: each shard's engine numbers the participant's reports on its own. */
+        val firstMissing = Long2LongHashMap(1L)
         var highestSequenceIndex = 0
 
         /** The `sequenceIndex` an id collision was found at, or [NOT_BLOCKED] (§3.3). */
@@ -121,7 +124,7 @@ class OrderStore private constructor(
         row.entryTradingDate < tradingDate &&
             row.isFinished &&
             row.owed == null &&
-            row.lastReportSeq < rowsOf(row.participantId).firstMissing
+            row.lastReportSeq < rowsOf(row.participantId).firstMissing.get(row.shardId.toLong())
 
     private fun loadMeta() {
         db.newIterator(meta).use { entries ->
@@ -131,7 +134,10 @@ class OrderStore private constructor(
                 val v = UnsafeBuffer(entries.value())
                 val p = rowsOf(k.getLong(1, ByteOrder.BIG_ENDIAN))
                 when (val type = k.getByte(0)) {
-                    META_FIRST_MISSING -> p.firstMissing = v.getLong(0, ByteOrder.LITTLE_ENDIAN)
+                    META_FIRST_MISSING -> {
+                        check(k.capacity() == META_SHARD_KEY_LENGTH) { "order store first-missing key of ${k.capacity()} bytes" }
+                        p.firstMissing.put(k.getInt(META_KEY_LENGTH, ByteOrder.BIG_ENDIAN).toLong(), v.getLong(0, ByteOrder.LITTLE_ENDIAN))
+                    }
                     META_SEQUENCE_INDEX -> p.highestSequenceIndex = v.getInt(0, ByteOrder.LITTLE_ENDIAN)
                     META_BLOCKED -> p.blockedAt = v.getInt(0, ByteOrder.LITTLE_ENDIAN)
                     else -> error("order store meta entry of type $type")
@@ -238,17 +244,21 @@ class OrderStore private constructor(
 
     // ------------------------------------------------------------------ meta
 
-    /** The durable first-missing `reportSeq` (§6.2): 1 until saved. */
-    fun firstMissing(participantId: Long): Long = participants.get(participantId)?.firstMissing ?: 1L
+    /** The durable first-missing `reportSeq` of [participantId] on [shardId] (§6.2): 1 until saved. */
+    fun firstMissing(participantId: Long, shardId: Int): Long = participants.get(participantId)?.firstMissing?.get(shardId.toLong()) ?: 1L
 
     /**
-     * Stores the durable first-missing `reportSeq`. The caller writes it only after the row updates
-     * of the reports it passes (§6.1, most-exchange Adapters.md §5): the WAL's prefix then keeps them.
+     * Stores the durable first-missing `reportSeq` of [participantId] on [shardId]. The caller writes
+     * it only after the row updates of the reports it passes (§6.1, most-exchange Adapters.md §5): the
+     * WAL's prefix then keeps them.
      */
-    fun saveFirstMissing(participantId: Long, firstMissing: Long) {
+    fun saveFirstMissing(participantId: Long, shardId: Int, firstMissing: Long) {
         metaValue.putLong(0, firstMissing, ByteOrder.LITTLE_ENDIAN)
-        putMeta(META_FIRST_MISSING, participantId, Long.SIZE_BYTES)
-        rowsOf(participantId).firstMissing = firstMissing
+        metaKey.putByte(0, META_FIRST_MISSING)
+        metaKey.putLong(1, participantId, ByteOrder.BIG_ENDIAN)
+        metaKey.putInt(META_KEY_LENGTH, shardId, ByteOrder.BIG_ENDIAN)
+        put(meta, metaKeyBytes, META_SHARD_KEY_LENGTH, metaValueBytes, Long.SIZE_BYTES)
+        rowsOf(participantId).firstMissing.put(shardId.toLong(), firstMissing)
     }
 
     fun highestSequenceIndex(participantId: Long): Int = participants.get(participantId)?.highestSequenceIndex ?: 0
@@ -308,7 +318,8 @@ class OrderStore private constructor(
      */
     fun holdsState(participantId: Long): Boolean {
         val p = participants.get(participantId) ?: return false
-        return !p.byClOrdId.isEmpty() || p.highestSequenceIndex > 0 || p.firstMissing > 1L || p.blockedAt != NOT_BLOCKED
+        return !p.byClOrdId.isEmpty() || p.highestSequenceIndex > 0 || p.blockedAt != NOT_BLOCKED ||
+            p.firstMissing.values.any { it > 1L }
     }
 
     private fun putMeta(type: Byte, participantId: Long, valueLength: Int) {
@@ -338,6 +349,9 @@ class OrderStore private constructor(
     companion object {
         private const val ORDER_KEY_LENGTH = 2 * Long.SIZE_BYTES
         private const val META_KEY_LENGTH = 1 + Long.SIZE_BYTES
+
+        /** The first-missing key: the participant's, then its shard. */
+        private const val META_SHARD_KEY_LENGTH = META_KEY_LENGTH + Int.SIZE_BYTES
         private const val INITIAL_VALUE_CAPACITY = 512
         private const val META_FIRST_MISSING: Byte = 1
         private const val META_SEQUENCE_INDEX: Byte = 2

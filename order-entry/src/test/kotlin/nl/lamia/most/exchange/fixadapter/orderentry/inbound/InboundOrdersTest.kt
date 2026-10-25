@@ -416,6 +416,18 @@ class InboundOrdersTest {
     }
 
     @Test
+    fun `an order's row keeps the shard it was sent to, and a cancel's its order's`() {
+        // Design.md §6.1: its reports carry that shard's reportSeq, which retention compares.
+        order(1, extra = arrayOf(55 to "OTHER"))
+        assertEquals(5, assertNotNull(store.find(P, 1L)).shardId)
+        acknowledge("ORD-1")
+        cancel(2, "ORD-1", extra = arrayOf(55 to "OTHER"))
+        assertEquals(5, assertNotNull(store.find(P, 2L)).shardId)
+        restart()
+        assertEquals(5 to 5, store.find(P, 1L)?.shardId to store.find(P, 2L)?.shardId)
+    }
+
+    @Test
     fun `a cancel needs only 41 and 54 to match, 37, 55 and 48 are checked only when sent`() {
         order(1)
         acknowledge("ORD-1", exchangeOrderId = 9001L)
@@ -625,6 +637,13 @@ class InboundOrdersTest {
 
         fun next(result: SendResult) = results.addLast(result)
 
+        /** ACME on shard 2, OTHER on shard 5, as a directory might put them. */
+        override fun shardOf(securityId: Int) = when (securityId) {
+            ACME -> 2
+            OTHER -> 5
+            else -> RequestRow.NO_SHARD
+        }
+
         override fun newOrder(
             participantId: Long, clOrdId: Long, securityId: Int, side: Side, price: Long, qty: Long,
             expireDate: Int, smpId: Long, smpStrategy: SmpStrategy,
@@ -643,6 +662,7 @@ class InboundOrdersTest {
 
     private class QuietVenue : OrderVenue {
         var sent = 0
+        override fun shardOf(securityId: Int) = 0
         override fun newOrder(
             participantId: Long, clOrdId: Long, securityId: Int, side: Side, price: Long, qty: Long,
             expireDate: Int, smpId: Long, smpStrategy: SmpStrategy,

@@ -90,7 +90,8 @@ sessions, and each one names:
   one.
 - **Reports route back one to one:** `participantId` → session. A report for a participant whose
   session is logged out is written to the offline session (§6.3), and FIX's resend delivers it at
-  the next logon.
+  the next logon. The order-entry library holds every configured session Artio knows from startup,
+  online or offline (§6.3).
 - **The exchange side must agree.** Every configured `participantId` must be listed for the
   gateway the adapter connects through, in the exchange's participant registry. If it is not, its
   orders are refused `UNAUTHORIZED_PARTICIPANT`.
@@ -485,7 +486,8 @@ not `validate()`'s.
   if that report was terminal, answered 35=9 CxlRejReason 0 *too late*. From the duty cycle, after
   the order's 35=8, so a refused send never undoes a report already taken.
 - **Fates** (§3.3, §3.4) are owed on the row (§6.2) and their 35=8 or 35=9 is sent from the duty
-  cycle. So are the restatements the mass status rule makes.
+  cycle. So are the restatements the mass status rule makes. A row changed by an answer with no
+  `reportSeq` is written only once the archive has the answer (§6.2, decided 2026-10-25).
 - **An `ORDER_STATUS`** updates the row and is sent, as a 35=8 ExecType I, only when it changes what
   the client was last told: OrdStatus, CumQty, LeavesQty, or the order found acknowledged.
   **A CumQty above the one told** means fills in a window no resend reached, at prices unknown
@@ -494,9 +496,10 @@ not `validate()`'s.
   prices unknown". Counted, alertable.
 - **The mass status rule** (§3.4) runs per shard: each shard's `OrderEntrySession` runs its own
   status, so a completion settles only orders on that shard's securities.
-- **A participant whose session is not logged on** has its report refused with `ABORT`, and its owed
-  35=8s wait, **until slice 4** delivers to the offline session (§6.3). Until then a client logged
-  out holds its gateway's report stream, every participant's.
+- **A participant whose session the library does not hold** has its report refused with `ABORT`, and
+  its owed 35=8s wait (§6.3): from a logout under way or a disconnect until the session is back
+  offline, about one `requestSession` round trip. A client logged out is written to offline, and
+  holds nothing up (slice 4, 2026-10-25).
 
 ### 5.4 The dictionary
 
@@ -557,7 +560,7 @@ The order store's row is versioned so the fields can be added (§6.1).
 | --- | --- | --- |
 | FIX session sequence numbers, every message in and out | FIX resend on reconnect, offline delivery | Artio's archive and replay index, **fsynced** (§6.4) |
 | Per request (an order or a cancel): FIX ClOrdID ↔ `clOrdId` ↔ `exchangeOrderId`, and what the client was told | Answering, cancelling, uniqueness for the day, 35=H/AF, `restoreInFlight` | **RocksDB** plus an in-memory working set (§6.1, decided 2026-10-09) |
-| Per participant: first `reportSeq` not yet durably delivered | Resume with a resend after a restart | RocksDB, **advanced only behind the archive** (§6.2) |
+| Per participant and shard: first `reportSeq` not yet durably delivered | Resume with a resend after a restart | RocksDB, **advanced only behind the archive** (§6.2) |
 | Per participant (its one session): highest `sequenceIndex` | The derived-id guard (§3.2) | RocksDB |
 
 ### 6.1 The order store
@@ -600,14 +603,18 @@ Decided 2026-10-09: **RocksDB, with the working set in memory.**
     test must hold it.
   - **Column families**, in one database, so they share one WAL and one prefix:
     - `orders`: (`participantId`, `clOrdId`) → a versioned row. Every row: its kind, FIX ClOrdID,
-      the trading date it was entered on, the last `reportSeq`, and a fate's 35=8 owed (§6.2). An
+      the trading date it was entered on, the shard it was sent to (an order's security's, a
+      cancel's order's; added 2026-10-25), the last `reportSeq`, and a fate's 35=8 owed (§6.2). An
       order: `exchangeOrderId` once acknowledged, security, side, price, `origQty`, TimeInForce
       and `expireDate`, SMP as sent, the status last sent (OrdStatus, `cumQty`, `leavesQty`), the
       cumulative notional (128-bit), the ambiguous flag, and room for §5.5's fields. A cancel: its
       order's `clOrdId`, and its state, *parked*, *sent* or *answered*;
-    - `meta`: per participant, the durable first-missing `reportSeq`, the highest
-      `sequenceIndex`, and an id collision's block, as the `sequenceIndex` it was found at
-      (§3.3; deleted when the block lifts).
+    - `meta`: per participant and shard, the durable first-missing `reportSeq`; per participant,
+      the highest `sequenceIndex`, and an id collision's block, as the `sequenceIndex` it was
+      found at (§3.3; deleted when the block lifts). **Per shard** (found 2026-10-25, slice 4):
+      each shard's engine numbers a participant's reports on its own (most-exchange
+      `MatchingEngineService`), and each shard has its own `OrderEntrySession`. One value per
+      participant would have resumed one shard from another's sequence.
 
     A row of an unknown version is refused, and the adapter does not start.
   - **Retention** (decided 2026-10-25 for ambiguous orders). A row is dropped when all hold:
@@ -615,8 +622,8 @@ Decided 2026-10-09: **RocksDB, with the working set in memory.**
     - it is finished: an order in a terminal state (OrdStatus 2, 4, C or 8) and not ambiguous, or
       a cancel answered;
     - no fate's 35=8 is owed on it;
-    - its last `reportSeq` is below the participant's durable first-missing, so no resend can
-      bring a report for it again.
+    - its last `reportSeq` is below the durable first-missing of the participant on the row's
+      shard, so no resend can bring a report for it again.
 
     So open GTC and GTD orders are kept until terminal, across days, and an **ambiguous order is
     kept like an open one** until a report or an operator settles it (§3.4).
@@ -645,6 +652,26 @@ Artio's archive.** That is the guarantee of delivery. After a crash, the stored 
     stream (Aeron Archive's `RecordingPos` counter, read from the shared CnC).
 
   No SDK change is needed for this.
+- **As built** (slice 4, 2026-10-25; `delivery.ReportDelivery`). Per shard and participant: each
+  shard's `OrderEntrySession` gets its own `SessionStore` view, whose `save` sets the ceiling. Each
+  35=8 of a report with `reportSeq` > 0 is recorded with the position `trySend` returned, the end
+  of the message, a resent one included. The stored value is the lowest of the ceiling, the lowest
+  `reportSeq` whose position the archive has not reached, and the floor a library reconnect left
+  (below). That is the three conditions above: every report below the ceiling was either delivered,
+  and so recorded, or stood in for by a completed mass status, with nothing to wait for. A report
+  consumed with no 35=8 (a lost row, §8.17) has nothing to wait for either. It is stored when it
+  moves, after the row writes of the reports it passes.
+- **An answer with no `reportSeq` writes its row only once the archive has it** (decided
+  2026-10-25). A fate's 35=8 or 35=9, a restatement (an `ORDER_STATUS` that changes what the client
+  was told, or the mass status rule's), a parked cancel's answer, and a report the gateway made
+  itself (`reportSeq` 0): no resend from the exchange brings these back, so a row written answered
+  before its 35=8 was fsynced could, after a host crash, say the client was told what it never was.
+  The row changes in memory at once; RocksDB gets it once the archive's position passes the 35=8.
+  A crash before then leaves the row as it was: the fate is owed again, the cancel parked again, the
+  restatement made again by the next mass status, the gateway's reject settled by the SDK. The
+  client may get an answer twice, under another ExecID, never not at all. A sequenced report's row
+  is written at once, since the stored `reportSeq` passes it only later (most-exchange Adapters.md
+  §5).
 - **Which counter** (spike §8.13(a)): the `RecordingPos` of the order-entry library's own outbound
   publication, found by that publication's Aeron session id (`RecordingPos.findCounterIdBySession`).
   The spike confirmed it counts the stream `trySend` positions are in: the counter stopped exactly
@@ -665,6 +692,11 @@ Artio's archive.** That is the guarantee of delivery. After a crash, the stored 
   extended market-data's old recording after the restart. So the lookup runs at every library connect, a position
   is compared only with the counter of the connection it was written on, and positions written
   before a reconnect never advance the durable value.
+  - **So a library reconnect freezes it until a restart** (as built, 2026-10-25): the lowest
+    `reportSeq` still unconfirmed at the reconnect becomes a floor, and rows waiting for the archive
+    are not written, so their answers are given again after a restart. Safe, toward a resend; how
+    far it can lag is §8.18. The lookup (`artio.LibraryRecording`) is retried every millisecond
+    until the counter appears, and a stopped recording confirms nothing more.
 - **Off the send path.** The 35=8 goes to the client as soon as Artio's framer writes it. Only the
   stored sequence waits for the archive. A crash before the archive catches up costs a resend from
   the exchange, and the deterministic ExecID (§5.3) lets the client drop the duplicate.
@@ -684,10 +716,23 @@ delivers it, and §6.2 advances past it as soon as it is archived. Delivery then
 how long the exchange's report ring retains it.
 
 - **Through Artio's own `Session`, offline** (decided 2026-10-15, with §2: MsgSeqNum is Artio's).
-  `FixLibrary.requestSession(sessionId, NO_MESSAGE_REPLAY, …)` returns the session offline, with
-  its persisted sequence numbers: after a logout, by the session id the library had; after an
-  adapter restart, found by its CompIDs (`FixEngine.lookupSessionId`). `trySend` on it archives the
-  message without sending it. The adapter never numbers a message and never writes a header.
+  `FixLibrary.requestSession` returns the session offline, with its persisted sequence numbers.
+  `trySend` on it archives the message without sending it. The adapter never numbers a message
+  and never writes a header. As built (slice 4, 2026-10-25; `artio.ReportSessions`):
+  - **at startup**, every configured order-entry session Artio knows (`FixEngine.allSessions()`)
+    is requested offline while the backend is constructed, before the acceptor binds, with
+    `NO_MESSAGE_REPLAY`: no client can be logged on yet. The library then holds every session
+    from the start, and a report for a client not yet back is written offline at once. A Logon
+    on a session the library holds arrives as `onSessionStart`, not as a claim (§2); the
+    `sequenceIndex` guard and the collision's block (§3.2, §3.3) run there as at a claim;
+  - **after a disconnect**, by the session id the library had, **replaying from the last message
+    received + 1, at its `sequenceIndex`** (found 2026-10-25, Artio 0.182
+    `Framer.onRequestFixSession`). If the client has logged back on and the engine still owns the
+    session when the request arrives, the engine hands it over online with the request's replay,
+    and with `NO_MESSAGE_REPLAY` a 35=D sent before the handover would never reach the library,
+    with no gap to show it. Offline there is nothing to replay: Artio answers
+    `SEQUENCE_NUMBER_TOO_HIGH` and hands the session over all the same. Tested end to end: a client
+    back before the library has seen its disconnect, its 35=D at the gateway.
 - **After a disconnect, nothing is sent on the session until `requestSession` has it back**
   (spike, 2026-10-15). With engine-owned acceptance (§2) a disconnect returns the session to the
   engine: the library closes its `Session` and only caches it. `trySend` on that object is still
@@ -696,12 +741,28 @@ how long the exchange's report ring retains it.
   The engine numbers the Logon from its index, and the index lags what the library has written.
   Under load, 6–8 of 10 handovers reused MsgSeqNums, and 5–8 reports that were accepted and
   archived never reached the client, with no gap to show it. §6.2 would have consumed them. So:
-  - from `onDisconnect` until `requestSession` replies `OK`, a report for that participant is
-    refused with `ReportAction.ABORT`, the back-pressure path of §6.2. In the spike that took
+  - from `onDisconnect` until the library holds the session again, a report for that participant
+    is refused with `ReportAction.ABORT`, the back-pressure path of §6.2. In the spike that took
     about 15 ms per disconnect. The SDK's controlled poll holds the whole report stream for
     that time, as for any back-pressure;
-  - a reply other than `OK` keeps the reports held. If the client logged on meanwhile, the
-    session reaches the library by the claim of §2 instead.
+  - a reply other than `OK` or `SEQUENCE_NUMBER_TOO_HIGH` keeps the reports held, and the request
+    is made again after 100 ms, unless the session has reached the library by the claim of §2
+    meanwhile (the client logged on).
+  - **Also from the moment a logged-on session stops being active** (found 2026-10-25): its
+    logout under way, its disconnect not yet seen by the library. A report written then is
+    numbered by the library on the session the engine is taking back. In 2 of 5 runs of a test
+    that sent a report just after the client's Logout, it was archived and consumed, and the next
+    Logon reused its MsgSeqNum.
+  - **An offline session handed back numbered below what the library last wrote on it is not
+    used** (found 2026-10-25). The engine reads an offline session's last MsgSeqNum from its
+    sequence index, and before reading waits only for its own stream to be indexed, not the
+    library's (`HandoverOfflineFixSession.checkLoggerUpToDate`). A message the library wrote just
+    before the disconnect, even its Logout reply, can be missing from it; the next report would
+    take its MsgSeqNum and the client would never see the first. Seen in 1 of 6 runs, at the
+    Logout. Such a session is released to the engine and requested again after 100 ms, by when the
+    index has caught up. The spike `OfflineHandoverSpikeTest` saw no MsgSeqNum reused in its three
+    runs. Its holds began at `onDisconnect` and it did not check the numbering handed back, so it
+    guarded against neither; under its timing they may simply not have occurred.
 - **Confirmed under load** (spike `OfflineHandoverSpikeTest`, 2026-10-15). 35=8s were sent without
   pause at 5,000 a second through 10 logouts and logons, some logons immediately after the
   logout, racing the `requestSession`. That came to about 124,000 reports, most of them offline.
@@ -855,6 +916,22 @@ The archive's recorded position (§6.2) then means durable.
     the archive's inbound 35=D and 35=F past the store's last row are run through the inbound path
     without sending, so the rows are rebuilt and restored in flight. It needs a look at Artio's
     archive scanning first.
+18. **A library reconnect freezes the durable `reportSeq` until a restart** (as built 2026-10-25,
+    §6.2). Positions taken on the old connection are never confirmed, so its lowest unconfirmed
+    `reportSeq` stays a floor, and the rows waiting for the archive are answered again after the
+    restart. Safe, but a long-running process after a reconnect resends more at its next restart, and
+    keeps more rows. When the new connection extends the same recording, the old positions are in the
+    same position space and could be confirmed by the new counter; not verified, so not relied on.
+    Neither the reconnect nor the sessions requested back after it (`ReportSessions`) is tested end
+    to end: nothing in the rig makes the library lose the engine.
+19. **A client back within the engine's index lag after a dropped connection** (residual, §6.3).
+    If the client logs on again before the library's request reaches the engine, and before the
+    engine's sequence index has the library's last messages, the engine numbers the Logon from the
+    lagging index: a MsgSeqNum the library already used, and the report that had it is never
+    resent, although it was archived and consumed. The hold and the stale-handover check cannot see
+    it: the session comes back online. It is detected, logged and counted when the session reaches
+    the library (`ReportSessions.reusedSequence`), not prevented. Not reproduced; the window is the
+    indexer's lag after a disconnect, against a client's reconnect and Logon round trip.
 
 ## 9. Control and metrics
 

@@ -47,6 +47,7 @@ class OrderStoreTest {
         fixClOrdId(fixClOrdId)
         entryTradingDate = entered
         securityId = 42
+        shardId = 0
         side = Side.BUY
         price = 100_25000000L
         origQty = 10_00000000L
@@ -66,6 +67,7 @@ class OrderStoreTest {
         this.clOrdId = clOrdId
         fixClOrdId(fixClOrdId)
         entryTradingDate = entered
+        shardId = 0
         this.origClOrdId = origClOrdId
         cancelState = CancelState.SENT
         fill()
@@ -86,6 +88,7 @@ class OrderStoreTest {
             exchangeOrderId = 9_000_000_123L
             side = Side.SELL
             securityId = 77
+            shardId = 3
             price = 99_12345678L
             origQty = 5_00000000L
             cumQty = 2_00000000L
@@ -111,6 +114,7 @@ class OrderStoreTest {
         assertEquals(9_000_000_123L, back.exchangeOrderId)
         assertEquals(Side.SELL, back.side)
         assertEquals(77, back.securityId)
+        assertEquals(3, back.shardId)
         assertEquals(99_12345678L, back.price)
         assertEquals(5_00000000L, back.origQty)
         assertEquals(2_00000000L, back.cumQty)
@@ -241,7 +245,7 @@ class OrderStoreTest {
     @Test
     fun `retention drops only rows entered before today, finished, owing nothing, and past every resend`() {
         val s = open(tradingDate = YESTERDAY)
-        s.saveFirstMissing(P1, 100L)
+        s.saveFirstMissing(P1, 0, 100L)
         val kept = mutableListOf<String>()
         val dropped = mutableListOf<String>()
         var seq = 1L
@@ -287,8 +291,8 @@ class OrderStoreTest {
     @Test
     fun `retention reads each participant's own first-missing reportSeq`() {
         val s = open(tradingDate = YESTERDAY)
-        s.saveFirstMissing(P1, 100L)
-        s.saveFirstMissing(P2, 10L)
+        s.saveFirstMissing(P1, 0, 100L)
+        s.saveFirstMissing(P2, 0, 10L)
         for (p in longArrayOf(P1, P2)) {
             s.insert(s.order(p, 1L, "filled", entered = YESTERDAY) {
                 acknowledged = true; ordStatus = '2'.code.toByte(); lastReportSeq = 50L
@@ -297,6 +301,23 @@ class OrderStoreTest {
         val today = restart(TODAY)
         assertNull(today.findByFix(P1, "filled"), "50 < P1's 100")
         assertNotNull(today.findByFix(P2, "filled"), "50 ≥ P2's 10: a resend can still bring its report")
+    }
+
+    @Test
+    fun `retention compares a row with its own shard's first-missing reportSeq`() {
+        // Design.md §6.1: each shard's engine numbers the participant's reports on its own, so a
+        // report of a row on shard 1 can come again until shard 1's sequence has passed it.
+        val s = open(tradingDate = YESTERDAY)
+        s.saveFirstMissing(P1, 0, 100L)
+        s.saveFirstMissing(P1, 1, 10L)
+        for ((clOrdId, shard) in listOf(1L to 0, 2L to 1)) {
+            s.insert(s.order(P1, clOrdId, "filled-on-$shard", entered = YESTERDAY) {
+                shardId = shard; acknowledged = true; ordStatus = '2'.code.toByte(); lastReportSeq = 50L
+            })
+        }
+        val today = restart(TODAY)
+        assertNull(today.findByFix(P1, "filled-on-0"), "50 < shard 0's 100")
+        assertNotNull(today.findByFix(P1, "filled-on-1"), "50 ≥ shard 1's 10: a resend can still bring its report")
     }
 
     // ---------------------------------------------------------------- requests in flight at startup
@@ -349,13 +370,17 @@ class OrderStoreTest {
     // ---------------------------------------------------------------- meta: first missing, sequenceIndex
 
     @Test
-    fun `the durable first-missing reportSeq is 1 until saved, then survives a restart, per participant`() {
+    fun `the durable first-missing reportSeq is 1 until saved, then survives a restart, per participant and shard`() {
         val s = open()
-        assertEquals(1L, s.firstMissing(P1))
-        s.saveFirstMissing(P1, 42L)
+        assertEquals(1L, s.firstMissing(P1, 0))
+        s.saveFirstMissing(P1, 0, 42L)
+        s.saveFirstMissing(P1, 1, 7L)
+        s.saveFirstMissing(P1, 0, 43L)
         val again = restart()
-        assertEquals(42L, again.firstMissing(P1))
-        assertEquals(1L, again.firstMissing(P2))
+        assertEquals(43L, again.firstMissing(P1, 0))
+        assertEquals(7L, again.firstMissing(P1, 1), "shard 1's own sequence")
+        assertEquals(1L, again.firstMissing(P1, 2))
+        assertEquals(1L, again.firstMissing(P2, 0))
     }
 
     @Test
@@ -398,7 +423,7 @@ class OrderStoreTest {
         s.find(P1, 1L)
         assertFalse(s.holdsState(P1))
         s.recordSequenceIndex(P1, 1)
-        s.saveFirstMissing(P2, 5L)
+        s.saveFirstMissing(P2, 1, 5L)
         s.block(P3, 0)
         assertEquals(InsertResult.NEW, s.insert(s.order(P4, 7L, "ORD-7")))
         val again = restart()

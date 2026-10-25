@@ -15,6 +15,9 @@ import org.agrona.DirectBuffer
  * by the security's shard (Design.md §3.5). The results are the SDK's own.
  */
 interface OrderVenue {
+    /** The shard a request for [securityId] goes to, [RequestRow.NO_SHARD] if none: the row keeps it (Design.md §6.1). */
+    fun shardOf(securityId: Int): Int
+
     @Suppress("LongParameterList")
     fun newOrder(
         participantId: Long, clOrdId: Long, securityId: Int, side: Side, price: Long, qty: Long,

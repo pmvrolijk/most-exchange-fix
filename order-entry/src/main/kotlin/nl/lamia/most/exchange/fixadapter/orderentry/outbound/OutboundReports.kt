@@ -17,7 +17,6 @@ import nl.lamia.most.exchange.sbe.RejectReason
 import nl.lamia.most.exchange.sbe.RequestStatus
 import org.agrona.collections.Int2ObjectHashMap
 import org.agrona.collections.Long2LongHashMap
-import java.util.function.IntUnaryOperator
 
 /**
  * Order entry's outbound path (Design.md §3.3, §3.4, §5.3): what the SDK reports, to the client's
@@ -27,6 +26,10 @@ import java.util.function.IntUnaryOperator
  *   delivered again, with nothing changed (§6.2).
  * - **Fates, the mass status rule's restatements, and parked cancels** are owed on their rows and
  *   worked off in [doWork], so a refusal never undoes a report already taken.
+ * - **Behind the archive** (§6.2): a sequenced report's row is written at once, and [Delivery]
+ *   holds its `reportSeq` back until the archive has the 35=8. Anything with no `reportSeq` has its
+ *   row written only once the archive has it, since a crash before then could otherwise leave a
+ *   row that says the client was told, and nothing the exchange would resend.
  *
  * Single-threaded, the order-entry library's thread (§3.5). Allocation-free on the report path.
  */
@@ -34,8 +37,7 @@ class OutboundReports(
     private val store: OrderStore,
     private val clients: ClientReports,
     private val venue: OrderVenue,
-    /** A security's shard, or a negative number when it was never in the directory (§3.5). */
-    private val shardOf: IntUnaryOperator,
+    private val delivery: Delivery,
     private val log: (String) -> Unit = {},
 ) {
     private val execution = OutgoingExecution()
@@ -65,7 +67,12 @@ class OutboundReports(
 
     // ------------------------------------------------------------------ reports, §5.3
 
-    fun onReport(report: ClientExecutionReportDecoder): ReportAction {
+    /** The shard whose SDK session is delivering the report in hand: its `reportSeq` is that shard's. */
+    private var shardId = 0
+
+    /** A report from [shardId]'s SDK session. */
+    fun onReport(shardId: Int, report: ClientExecutionReportDecoder): ReportAction {
+        this.shardId = shardId
         val participantId = report.participantId()
         val row = store.find(participantId, report.clOrdId())
         if (row == null) {
@@ -73,7 +80,7 @@ class OutboundReports(
             log("participant $participantId: report for clOrdId ${report.clOrdId()}, which the store does not hold; consumed (Design.md §8.17)")
             return ReportAction.CONSUMED
         }
-        if (!clients.isOnline(participantId)) return ReportAction.ABORT
+        if (!clients.canSend(participantId)) return ReportAction.ABORT
         val reportSeq = report.reportSeq()
         val again = reportSeq != 0L && reportSeq <= row.lastReportSeq
         return when (row.kind) {
@@ -131,8 +138,12 @@ class OutboundReports(
         e.cumQty = cum
         e.leavesQty = leaves
         e.avgPx = notional.average(cum)
-        if (!clients.send(e)) return ReportAction.ABORT
-        if (again) return ReportAction.CONSUMED
+        val position = clients.send(e)
+        if (position <= 0L) return ReportAction.ABORT
+        if (again) {
+            delivered(report, position)
+            return ReportAction.CONSUMED
+        }
 
         val firstReport = !order.acknowledged && !RequestRow.isTerminal(order.ordStatus)
         order.ordStatus = e.ordStatus.code.toByte()
@@ -146,7 +157,8 @@ class OutboundReports(
         }
         order.lastReportSeq = maxOf(order.lastReportSeq, report.reportSeq())
         order.ambiguous = false
-        store.update(order)
+        write(order, report.reportSeq(), position)
+        delivered(report, position)
         if (firstReport) owePendingCancel(order)
         return ReportAction.CONSUMED
     }
@@ -178,7 +190,8 @@ class OutboundReports(
                 at += e.text.putAscii(at, LOST_FILLS_TAIL)
                 e.textLength = at
             }
-            if (!clients.send(e)) return ReportAction.ABORT
+            val position = clients.send(e)
+            if (position <= 0L) return ReportAction.ABORT
             if (cum > order.cumQty) lostFills++
             val firstReport = !order.acknowledged
             order.acknowledged = true
@@ -187,7 +200,7 @@ class OutboundReports(
             order.cumQty = cum
             order.leavesQty = leaves
             order.ambiguous = false
-            store.update(order)
+            delivery.writeWhenArchived(order, position) // an ORDER_STATUS is outside the sequence
             if (firstReport) owePendingCancel(order)
         }
         order.statedAt = ++statusClock
@@ -210,14 +223,20 @@ class OutboundReports(
                 e.leavesQty = 0L
                 notional.set(order.notionalHi, order.notionalLo)
                 e.avgPx = notional.average(e.cumQty)
-                if (!clients.send(e)) return ReportAction.ABORT
-                if (again) return ReportAction.CONSUMED
+                val position = clients.send(e)
+                if (position <= 0L) return ReportAction.ABORT
+                if (again) {
+                    delivered(report, position)
+                    return ReportAction.CONSUMED
+                }
                 order.ordStatus = '4'.code.toByte()
                 order.cumQty = e.cumQty
                 order.leavesQty = 0L
                 order.ambiguous = false
                 order.lastReportSeq = maxOf(order.lastReportSeq, report.reportSeq())
-                store.update(order)
+                write(order, report.reportSeq(), position)
+                answered(cancel, order, report.reportSeq(), position)
+                delivered(report, position)
             }
             ExecType.REJECTED -> {
                 val r = cancelReject
@@ -232,16 +251,28 @@ class OutboundReports(
                     r.ordStatus = '8'
                 }
                 r.text(reason.name)
-                if (!clients.send(r)) return ReportAction.ABORT
-                if (again) return ReportAction.CONSUMED
+                val position = clients.send(r)
+                if (position <= 0L) return ReportAction.ABORT
+                if (!again) answered(cancel, order, report.reportSeq(), position)
+                delivered(report, position)
             }
-            else -> {
-                log("participant ${cancel.participantId}: report of ExecType ${report.execType()} for cancel ${cancel.clOrdId}; consumed")
-                return ReportAction.CONSUMED
-            }
+            else -> log("participant ${cancel.participantId}: report of ExecType ${report.execType()} for cancel ${cancel.clOrdId}; consumed")
         }
-        answered(cancel, order, report.reportSeq())
         return ReportAction.CONSUMED
+    }
+
+    /** A sequenced report's 35=8 is on its way: its `reportSeq` waits for the archive (§6.2). */
+    private fun delivered(report: ClientExecutionReportDecoder, position: Long) {
+        val reportSeq = report.reportSeq()
+        if (reportSeq > 0L) delivery.sent(shardId, report.participantId(), reportSeq, position)
+    }
+
+    /**
+     * A row changed by a report: written now if the report is sequenced, since the stored `reportSeq`
+     * passes it only later (most-exchange Adapters.md §5); else only once the archive has its answer.
+     */
+    private fun write(row: RequestRow, reportSeq: Long, position: Long) {
+        if (reportSeq > 0L) store.update(row) else delivery.writeWhenArchived(row, position)
     }
 
     // ------------------------------------------------------------------ fates and the mass status, §3.3, §3.4
@@ -272,7 +303,7 @@ class OutboundReports(
         store.forEach { row ->
             if (row.participantId != participantId || row.kind != RowKind.ORDER) return@forEach
             if (!row.acknowledged || row.ambiguous || row.owed != null || RequestRow.isTerminal(row.ordStatus)) return@forEach
-            if (shardOf.applyAsInt(row.securityId) != shardId) return@forEach
+            if (row.shardId != shardId) return@forEach
             if (row.statedAt > since) return@forEach
             if (row.lastReportSeq >= nextSeq) return@forEach
             row.owed = OrderFate.AMBIGUOUS
@@ -305,13 +336,13 @@ class OutboundReports(
     private fun act(row: RequestRow): Boolean = when (row.kind) {
         RowKind.ORDER -> {
             val fate = row.owed
-            if (fate == null) true else if (!clients.isOnline(row.participantId)) false else answerOrderFate(row, fate)
+            if (fate == null) true else if (!clients.canSend(row.participantId)) false else answerOrderFate(row, fate)
         }
         RowKind.CANCEL -> {
             val order = store.find(row.participantId, row.origClOrdId) ?: error("cancel ${row.clOrdId} without its order")
             val fate = row.owed
             when {
-                fate != null -> clients.isOnline(row.participantId) && answerCancelFate(row, order, fate)
+                fate != null -> clients.canSend(row.participantId) && answerCancelFate(row, order, fate)
                 row.cancelState != CancelState.PARKED -> true
                 else -> actOnParked(row, order)
             }
@@ -332,7 +363,8 @@ class OutboundReports(
             }
             OrderFate.AMBIGUOUS -> restateUnknown(e, order)
         }
-        if (!clients.send(e)) return false
+        val position = clients.send(e)
+        if (position <= 0L) return false
         when (fate) {
             OrderFate.NEVER_SEQUENCED -> {
                 order.ordStatus = '8'.code.toByte()
@@ -341,7 +373,8 @@ class OutboundReports(
             OrderFate.AMBIGUOUS -> order.ambiguous = true
         }
         order.owed = null
-        store.update(order)
+        // Stored still owing until the archive has the answer: a crash before then gives it again.
+        delivery.writeWhenArchived(order, position)
         owePendingCancel(order)
         return true
     }
@@ -367,9 +400,10 @@ class OutboundReports(
                 r.text(Texts.CANCEL_STATUS_UNKNOWN)
             }
         }
-        if (!clients.send(r)) return false
+        val position = clients.send(r)
+        if (position <= 0L) return false
         cancel.owed = null
-        answered(cancel, order, 0L)
+        answered(cancel, order, 0L, position)
         return true
     }
 
@@ -378,14 +412,14 @@ class OutboundReports(
         val r = cancelReject
         when {
             order.ambiguous -> {
-                if (!clients.isOnline(cancel.participantId)) return false
+                if (!clients.canSend(cancel.participantId)) return false
                 r.reset(cancel, order)
                 r.cxlRejReason = OTHER
                 r.statusUnknown = true
                 r.textLength = StatusUnknownText.write(r.text, 0, order.cumQty)
             }
             RequestRow.isTerminal(order.ordStatus) -> {
-                if (!clients.isOnline(cancel.participantId)) return false
+                if (!clients.canSend(cancel.participantId)) return false
                 r.reset(cancel, order)
                 r.cxlRejReason = TOO_LATE
                 r.text(Texts.TOO_LATE)
@@ -399,25 +433,28 @@ class OutboundReports(
                 }
                 SendResult.BACK_PRESSURED -> false
                 SendResult.NOT_READY, SendResult.NO_GATEWAY, SendResult.UNKNOWN_PARTICIPANT -> {
-                    if (!clients.isOnline(cancel.participantId)) return false
+                    if (!clients.canSend(cancel.participantId)) return false
                     r.reset(cancel, order)
                     r.cxlRejReason = OTHER
                     r.text(Texts.EXCHANGE_UNAVAILABLE)
-                    if (!clients.send(r)) return false
-                    answered(cancel, order, 0L)
+                    val position = clients.send(r)
+                    if (position <= 0L) return false
+                    answered(cancel, order, 0L, position)
                     true
                 }
             }
         }
-        if (!clients.send(r)) return false
-        answered(cancel, order, 0L)
+        val position = clients.send(r)
+        if (position <= 0L) return false
+        answered(cancel, order, 0L, position)
         return true
     }
 
-    private fun answered(cancel: RequestRow, order: RequestRow, reportSeq: Long) {
+    /** The cancel's answer was taken at [position]; [reportSeq] 0 for one with no `reportSeq`. */
+    private fun answered(cancel: RequestRow, order: RequestRow, reportSeq: Long, position: Long) {
         cancel.cancelState = CancelState.ANSWERED
         cancel.lastReportSeq = maxOf(cancel.lastReportSeq, reportSeq)
-        store.update(cancel)
+        write(cancel, reportSeq, position)
         if (order.pendingCancel === cancel) order.pendingCancel = null
     }
 

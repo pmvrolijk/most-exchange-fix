@@ -55,13 +55,19 @@ modules: `fix-session` (the acceptor, logon and routing by role), and `order-ent
    Aeron 1.53.0. Bump Artio only together with most-exchange's `aeron`. `DependencyAlignmentTest`
    fails if Gradle resolves any other Aeron. → R§2
 7. **A `reportSeq` is consumed only behind the fsynced archive.** The durable first-missing
-   `reportSeq` advances only past reports whose 35=8 (online or offline `Session.trySend`) is at or
-   below the archive's recorded position, at `fileSyncLevel=1`. After a disconnect, a 35=8 waits (ABORT) until
-   `requestSession` has the session back offline: sent on the `Session` the disconnect took, it can
-   reuse a MsgSeqNum and never reach the client. Never store what the SDK's `save()`
-   hands over as is: it is a ceiling. A back-pressured 35=8 aborts the report, never queues it.
-   RocksDB stays in point-in-time WAL recovery: its unfsynced WAL is safe only because a crash
-   leaves a prefix. (Design.md §6.1–§6.2) → R§4
+   `reportSeq`, per participant and shard, advances only past reports whose 35=8 (online or offline
+   `Session.trySend`) is at or below the archive's recorded position, at `fileSyncLevel=1`. Never
+   store what the SDK's `save()` hands over as is: it is a ceiling. A 35=8 or 35=9 with no
+   `reportSeq` (a fate, a restatement, a gateway's own reject) writes its row only once the archive
+   has it. A back-pressured 35=8 aborts the report, never queues it. RocksDB stays in point-in-time
+   WAL recovery: its unfsynced WAL is safe only because a crash leaves a prefix.
+   (Design.md §6.1–§6.2) → R§4, R§11
+   - **Write only on a session the library holds and may use.** Not once a logged-on session stops
+     being active, and not after a disconnect until `requestSession` has it back: on the `Session`
+     the disconnect took, a 35=8 can reuse a MsgSeqNum and never reach the client. Request it back
+     replaying from its last received MsgSeqNum + 1, never `NO_MESSAGE_REPLAY`: a client back first
+     is handed over online with that replay. An offline session handed back below the library's
+     last MsgSeqNum is released and asked for again. (Design.md §6.3) → R§11
 8. **The exchange `clOrdId` is `(sequenceIndex << 32) | MsgSeqNum`** of the inbound 35=D/F, never an
    allocated counter. Refuse to start if Artio's `sequenceIndex` is below the stored one. → R§5
 9. **Artio does not validate an application message; the backend does.** Decode every inbound

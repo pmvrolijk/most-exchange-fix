@@ -314,3 +314,58 @@ same ExecID, so a 35=8 that was taken but not archived before a crash still reac
 and the client drops the duplicate. Anything that follows from a report but needs its own send (a
 parked cancel, a fate's answer) is owed on its row and worked off in the duty cycle, so one refusal
 never undoes a report the SDK has already counted.
+
+## 11. Delivery: the archive gates rows as well as the sequence, and every handover is checked
+
+Slice 4, 2026-10-25 (Design §6.1–§6.3, §8.18–§8.19). One decision with the user, the rest found.
+
+**Answers with no `reportSeq` write their rows behind the archive** (decided, the recommendation).
+§4's argument covers sequenced reports: if a 35=8 is lost before the archive has it, the stored
+`reportSeq` has not passed it and the exchange resends it. A fate, a restatement, a parked cancel's
+answer and a gateway's own reject have no `reportSeq`, so nothing resends them. Clearing the row's
+owed mark as soon as Artio took the 35=8 left a window of milliseconds in which a host crash could
+keep the mark cleared (RocksDB's WAL reaching the disk on the OS's schedule) and lose the 35=8 (the
+archive not yet fsynced). The client would never be told, and the store would say it was. Writing
+the row only once the archive has the answer turns that into an answer given twice. The cost is a
+second store write per such answer, off the send path, and the same tracker the sequence uses.
+Sequenced reports keep writing their rows at once, because the stored `reportSeq` must never pass
+a report whose row is not stored (most-exchange Adapters.md §5).
+
+**The sequence is per shard.** Each shard is its own engine, numbering each participant's reports
+from 1 (`MatchingEngineService`), and each has its own `OrderEntrySession`. The store had one value
+per participant, harmless while it was never written. Persisted, one shard would have resumed from
+another's number: a resend from too far on, or too far back. So the row records its shard too,
+since retention compares a row's last `reportSeq` with its own shard's sequence and the directory
+is not there at load to say which shard a security is on.
+
+**Every session is held from startup.** Holding a session only once a report needs it would make
+the first report after a restart wait a `requestSession` round trip, holding its shard's report
+stream for every participant, as any `ABORT` does. Requesting all of them before the acceptor binds
+costs nothing, and makes the request safe without a replay: no client can have logged on yet.
+
+**After a disconnect, the request replays.** Read in Artio's source while building the request: a
+session the engine owns and that is logged on is handed over online, with the replay the request
+names. The claim of §2 replays from the Logon + 1 for exactly this reason (spike §8.13(d)). A
+client that reconnects before the library's request arrives would otherwise have its first
+messages skipped, with no gap. Replaying from the last message received + 1 covers both outcomes:
+offline it replays nothing, and Artio still hands the session over.
+
+**Two checks on the handover, found by a flaky test.** A test that sent a report just after the
+client's Logout lost it in 2 runs of 5: consumed, archived, and its MsgSeqNum reused by the next
+Logon. Two things combine. The library still held the session after the Logout, so the report was
+written on it, numbered by the library. And the engine, handing the session back offline, read its
+last MsgSeqNum from its sequence index, which it brings up to date only with its own stream, not the
+library's. So a session that has stopped being active is not written to, and an offline session
+handed back below the library's own last MsgSeqNum is released and asked for again. Either alone
+would have fixed that test. The second guards the library's own Logout reply too, which the index
+also missed once in six runs, and which nothing on the adapter's side can hold back. They cannot
+see one case: a client that logs on again within the indexer's lag, before the library's request,
+gets its Logon numbered by the engine from the lagging index (§8.19). That is counted, since it
+cannot be undone from the library.
+
+**A library reconnect freezes the sequence, as §6.2 already said.** Positions are compared only with
+the counter of the connection they were written on, and the old connection's counter is gone. The
+alternative, comparing them with the new connection's counter when it extends the same recording,
+rests on Aeron's recording extension keeping one position space, which no spike checked. Frozen
+until a restart, the error is a longer resend and more rows retained, never a report consumed
+unarchived.

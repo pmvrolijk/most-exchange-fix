@@ -7,7 +7,6 @@ import nl.lamia.most.exchange.fixadapter.orderentry.outbound.ClientReports
 import nl.lamia.most.exchange.fixadapter.orderentry.outbound.OutgoingCancelReject
 import nl.lamia.most.exchange.fixadapter.orderentry.outbound.OutgoingExecution
 import nl.lamia.most.exchange.sbe.Side
-import org.agrona.collections.Long2ObjectHashMap
 import org.agrona.concurrent.EpochClock
 import org.agrona.concurrent.SystemEpochClock
 import org.agrona.concurrent.UnsafeBuffer
@@ -17,16 +16,16 @@ import uk.co.real_logic.artio.util.MutableAsciiBuffer
 
 /**
  * The outbound path's 35=8 and 35=9 (Design.md §5.3) on each participant's Artio [Session], numbered
- * by it. A participant is online from the library's acquiring its session until its disconnect
- * ([online], [offline]); slice 4 adds the offline session (§6.3).
+ * by it, online or offline ([ReportSessions], §6.3). Each send returns the position Artio wrote it
+ * at, in the library's outbound stream (§6.2).
  *
  * Encoders are reset before each use (CLAUDE.md non-negotiable 10). Allocation-free.
  */
 class ArtioReports(
     private val directory: DirectoryIndex,
+    private val sessions: ReportSessions<Session>,
     private val clock: EpochClock = SystemEpochClock.INSTANCE,
 ) : ClientReports {
-    private val sessions = Long2ObjectHashMap<Session>()
     private val execution = ExecutionReportEncoder()
     private val cancelReject = OrderCancelRejectEncoder()
 
@@ -38,18 +37,10 @@ class ArtioReports(
     private val symbol = UnsafeBuffer(ByteArray(0))
     private val transactTime = UtcTimestampEncoder()
 
-    fun online(participantId: Long, session: Session) {
-        sessions.put(participantId, session)
-    }
+    override fun canSend(participantId: Long): Boolean = sessions.session(participantId) != null
 
-    fun offline(participantId: Long, session: Session) {
-        if (sessions.get(participantId) === session) sessions.remove(participantId)
-    }
-
-    override fun isOnline(participantId: Long): Boolean = sessions.get(participantId)?.isActive == true
-
-    override fun send(report: OutgoingExecution): Boolean {
-        val session = sessions.get(report.order.participantId) ?: return false
+    override fun send(report: OutgoingExecution): Long {
+        val session = sessions.session(report.order.participantId) ?: return REFUSED
         val order = report.order
         val e = execution
         e.reset()
@@ -78,11 +69,11 @@ class ArtioReports(
         if (report.textLength > 0) e.text(report.text, 0, report.textLength)
         if (report.statusUnknown) e.ordStatusUnknown(true)
         e.transactTime(transactTime.buffer(), transactTime.encode(clock.time()))
-        return session.trySend(e) >= 0
+        return session.trySend(e)
     }
 
-    override fun send(reject: OutgoingCancelReject): Boolean {
-        val session = sessions.get(reject.order.participantId) ?: return false
+    override fun send(reject: OutgoingCancelReject): Long {
+        val session = sessions.session(reject.order.participantId) ?: return REFUSED
         val c = cancelReject
         c.reset()
         orderId(reject.exchangeOrderId).let { c.orderID(orderId, 0, it) }
@@ -91,7 +82,7 @@ class ArtioReports(
         c.ordStatus(reject.ordStatus).cxlRejResponseTo(CANCEL).cxlRejReason(reject.cxlRejReason)
         if (reject.textLength > 0) c.text(reject.text, 0, reject.textLength)
         if (reject.statusUnknown) c.ordStatusUnknown(true)
-        return session.trySend(c) >= 0
+        return session.trySend(c)
     }
 
     /** 55 the directory's Symbol, 48 the `securityId` with 22=8 (§5.3). */
@@ -121,6 +112,7 @@ class ArtioReports(
     }
 
     private companion object {
+        const val REFUSED = 0L
         const val SCALE = 8
         const val GTD = '6'
         const val FILL = 'F'

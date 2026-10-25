@@ -336,3 +336,70 @@ shard 1 through the SDK's fence, truncation and mass status.
 
 **Not real yet:** a client logged out holds its gateway's report stream until slice 4. A host
 crash's lost rows stay lost (§8.17).
+
+### 2h. Durable delivery (slice 4), 2026-10-25
+
+**The problem.** Design §6.2–§6.3: a `reportSeq` consumed only once the archive has its 35=8, and
+reports for a client not logged on written to its offline session instead of holding the gateway's
+stream. Until now the SDK's in-memory `SessionStore` stood in, and a logged-out client's reports
+were refused with `ABORT`.
+
+**Decided with the user** (the recommendation; Design §6.2, Rationale §11): an answer with no
+`reportSeq` (a fate, a restatement, a parked cancel's answer, a gateway's own reject) writes its row
+only once the archive has its 35=8 or 35=9, so a host crash can make the client get it twice, never
+not at all.
+
+**Found before building:**
+- **`reportSeq` is per shard.** Each shard's engine numbers a participant's reports on its own, and
+  the store had one first-missing per participant, which every shard's SDK session would have
+  shared. The store's first-missing is now keyed by (participant, shard), and each row records its
+  shard, so retention compares it with its own shard's (the directory is not there at load). The
+  row layout of version 1 changed rather than adding a version 2: no store exists outside tests.
+- **The request after a disconnect must replay** (Artio 0.182 `Framer.onRequestFixSession`). A
+  client back before the request arrives is handed over online with the request's replay, so
+  `NO_MESSAGE_REPLAY` would skip its first 35=D. It replays from the last received + 1.
+
+**Found by a flaky test, while building:** a report sent just after the client's Logout was lost
+in 2 runs of 5, consumed and archived, its MsgSeqNum reused by the next Logon. The library still
+held the session after the Logout and wrote on it; and the engine, handing the session back offline,
+read its last MsgSeqNum from an index that waits only for the engine's own stream. Now a session
+that stops being active is not written to, and an offline session handed back below the library's
+own last MsgSeqNum is released and requested again. The second fired once in six runs, on the
+library's Logout reply. What neither can see, a client back within the indexer's lag, is counted
+(Design §8.19).
+
+**Built:**
+- `delivery.ReportDelivery`: the lagging `SessionStore`, one view per shard, positions in a ring
+  per (shard, participant) with a rising ring of indices for the lowest pending, rows waiting for
+  the archive in a ring of their own. A library reconnect leaves a floor until restart.
+- `artio.LibraryRecording`: the spike's lookup of the library's `RecordingPos` from Aeron's public
+  counters, at every library connect.
+- `artio.ReportSessions`: each participant's session, held offline from startup (requested before
+  the bind), requested back after a disconnect with the replay, the two handover checks, retries.
+  Generic over a session view, so its rules are tested against a model of Artio's handover.
+- `ClientReports.send` returns Artio's position; `canSend` replaces `isOnline`; the port `Delivery`.
+  `OutboundReports` hands each sequenced 35=8 to it and defers the unsequenced rows. The backend: a
+  `LibraryConnectHandler`, the startup acquisition, `onSessionStart` running the logon guards for a
+  session held offline, and `restoreInFlight` by the row's shard.
+
+**The check.** 12 tests of the lagging store (against the store as reopened), 9 of the sessions
+against the model of Artio's handover, 4 new outbound tests, 2 store, 1 inbound, and 3 end-to-end
+through a real initiator: a report for a logged-out client archived and consumed while it is away
+and resent as PossDup at its Logon; after a restart, a fate written offline before the client is
+back; and a client that logs back on before the library has seen its disconnect, its 35=D at the
+gateway (the adapter is not polled while the engine accepts the Logon, so the race is forced).
+
+The slice-3 test that a held report arrives live and not as a PossDup resend is **reversed**: the
+offline delivery §6.3 decided means the 35=8 comes as Artio's resend. What §6.3 rules out is a
+35=8 written on a session the engine is taking back, which the two handover checks now guard.
+
+`./gradlew build` green, 152 tests in order-entry. 33 mutations, all caught. 24 at the first try,
+and the replay after a disconnect by hand against the race test. Five only after a change. The
+lowest pending `reportSeq` and the ring keeping it went unseen (D3, D8): in the gap test the oldest
+waiting report was also the lowest by the time anything was checked, so it now checks with the
+gap-filler waiting behind higher ones. One `SessionStore` for every shard (B5) and every row restored
+on every shard (B7) went unseen end to end: one test now checks the second shard's stored sequence,
+another one restore and one reject. And the backend's call marking a held session logged on (B6)
+closed a window no test could force: `ReportSessions` now notices a session become active itself,
+and that is tested (R7). Two were rewritten, one that did not compile and one whose text did not
+match. The 35=8's allocation through Artio was not measured.

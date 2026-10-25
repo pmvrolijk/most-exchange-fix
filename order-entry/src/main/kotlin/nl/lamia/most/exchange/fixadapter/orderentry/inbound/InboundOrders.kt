@@ -124,6 +124,7 @@ class InboundOrders(
         row.fixClOrdId(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)
         row.entryTradingDate = tradingDate.asInt
         row.securityId = securityId
+        row.shardId = venue.shardOf(securityId)
         row.side = side
         row.price = price
         row.origQty = qty
@@ -204,6 +205,7 @@ class InboundOrders(
         row.fixClOrdId(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)
         row.entryTradingDate = tradingDate.asInt
         row.origClOrdId = order.clOrdId
+        row.shardId = order.shardId
         // Before the order's first report there is no exchangeOrderId to cancel by: parked (§3.3).
         row.cancelState = if (order.acknowledged) CancelState.SENT else CancelState.PARKED
         row.sendPending = order.acknowledged

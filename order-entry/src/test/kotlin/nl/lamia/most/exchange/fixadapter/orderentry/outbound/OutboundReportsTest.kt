@@ -44,12 +44,14 @@ class OutboundReportsTest {
     private lateinit var store: OrderStore
     private val client = RecordingClient()
     private val venue = CancelVenue()
+    private lateinit var delivery: ArchiveModel
     private lateinit var outbound: OutboundReports
 
     @BeforeTest
     fun open() {
         store = OrderStore.open(dir).also { it.load(TODAY) }
-        outbound = OutboundReports(store, client, venue, { if (it == OTHER_SHARD_SECURITY) 1 else 0 })
+        delivery = ArchiveModel(store) // a new process: what waited for the archive is gone
+        outbound = OutboundReports(store, client, venue, delivery)
         outbound.recover()
     }
 
@@ -70,6 +72,7 @@ class OutboundReportsTest {
         fixClOrdId(fix)
         entryTradingDate = TODAY
         securityId = security
+        shardId = if (security == OTHER_SHARD_SECURITY) 1 else 0
         side = Side.BUY
         price = 100_00000000L
         origQty = 10_00000000L
@@ -85,6 +88,7 @@ class OutboundReportsTest {
             clOrdId = seq
             fixClOrdId(fix)
             entryTradingDate = TODAY
+            shardId = order.shardId
             origClOrdId = order.clOrdId
             cancelState = state
         }.also {
@@ -108,14 +112,14 @@ class OutboundReportsTest {
         clOrdId: Long, execType: ExecType, exchangeOrderId: Long = 9000L + clOrdId,
         price: Long = 100_00000000L, lastQty: Long = 0L, leavesQty: Long = 10_00000000L, cumQty: Long = 0L,
         reason: RejectReason = RejectReason.NONE, reportSeq: Long = if (execType == ExecType.ORDER_STATUS) 0L else nextSeq++,
-        enrichment: Enrichment = Enrichment.KNOWN, securityId: Int = ACME,
+        enrichment: Enrichment = Enrichment.KNOWN, securityId: Int = ACME, shard: Int = if (securityId == OTHER_SHARD_SECURITY) 1 else 0,
     ): ReportAction {
         encoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
             .participantId(P).clOrdId(clOrdId).exchangeOrderId(exchangeOrderId).price(price).lastQty(lastQty)
             .leavesQty(leavesQty).cumQty(cumQty).origQty(10_00000000L).securityId(securityId).rejectReason(reason)
             .execType(execType).side(Side.BUY).enrichment(enrichment).reportSeq(reportSeq)
         decoder.wrapAndApplyHeader(buffer, 0, headerDecoder)
-        return outbound.onReport(decoder)
+        return outbound.onReport(shard, decoder)
     }
 
     private fun sent8() = client.sent.filterIsInstance<Sent8>()
@@ -248,15 +252,83 @@ class OutboundReportsTest {
         val (first, again) = sent8().drop(1)
         assertEquals(first, again, "the same 35=8, ExecID 2: the client drops it")
         assertEquals(notionalBefore, row(1).notionalLo, "the fill counted once")
+        assertEquals(listOf(1L, 2L, 2L), delivery.sent.map { it.reportSeq }, "the resent 35=8 must reach the archive too: the first may not have")
     }
 
     @Test
-    fun `a participant not logged on has its report held, until slice 4's offline delivery`() {
+    fun `a participant whose session the library does not hold has its report held`() {
+        // Design.md §6.3: from a disconnect until the session is back offline.
         order(1)
-        client.online = false
+        client.held = false
         assertEquals(ReportAction.ABORT, report(1, ExecType.NEW))
         assertTrue(client.sent.isEmpty())
         assertTrue(!row(1).acknowledged)
+        assertTrue(delivery.sent.isEmpty())
+    }
+
+    // ================================================================ behind the archive, §6.2
+
+    @Test
+    fun `a sequenced report's 35=8 waits for the archive with its shard, reportSeq and position`() {
+        order(1)
+        order(2, security = OTHER_SHARD_SECURITY)
+        report(1, ExecType.NEW, reportSeq = 7)
+        report(2, ExecType.NEW, reportSeq = 3, securityId = OTHER_SHARD_SECURITY)
+        assertEquals(
+            listOf(Delivered(0, P, 7L, client.positions[0]), Delivered(1, P, 3L, client.positions[1])),
+            delivery.sent,
+        )
+        assertTrue(delivery.waiting.isEmpty(), "its row is written at once: the stored reportSeq passes it only later")
+        restart()
+        assertTrue(row(1).acknowledged)
+    }
+
+    @Test
+    fun `a refused 35=8 hands nothing to wait for`() {
+        order(1)
+        client.accepting = false
+        report(1, ExecType.NEW)
+        assertTrue(delivery.sent.isEmpty())
+    }
+
+    @Test
+    fun `a fate's answer is stored still owing until the archive has it, and a restart before then gives it again`() {
+        order(1)
+        delivery.keepingUp = false
+        outbound.onSettled(P, 1L, OrderFate.NEVER_SEQUENCED)
+        outbound.doWork()
+        assertEquals(1, sent8().size)
+        assertNull(row(1).owed, "answered, in memory")
+        restart() // the archive never had it: as after a host crash
+        outbound.doWork()
+        assertEquals(2, sent8().size, "given again: no resend from the exchange would bring it back")
+        assertEquals(Texts.NOT_SEQUENCED_ORDER, sent8().last().text)
+        delivery.archiveAll()
+        restart()
+        outbound.doWork()
+        assertEquals(2, sent8().size, "once archived, the row is written answered")
+        assertEquals('8'.code.toByte(), row(1).ordStatus)
+    }
+
+    @Test
+    fun `a status restatement, a gateway's own reject and a parked cancel's answer are written only once archived`() {
+        order(1)
+        report(1, ExecType.NEW)
+        order(2)
+        val o3 = order(3)
+        cancel(4, o3, CancelState.PARKED)
+        delivery.keepingUp = false
+        report(1, ExecType.ORDER_STATUS, leavesQty = 6_00000000L, cumQty = 4_00000000L) // fills the client was not told
+        report(2, ExecType.REJECTED, exchangeOrderId = 0L, leavesQty = 0L, reportSeq = 0L) // the gateway's, outside the sequence
+        report(3, ExecType.REJECTED, exchangeOrderId = 0L, leavesQty = 0L, reason = RejectReason.MARKET_CLOSED)
+        outbound.doWork() // the parked cancel: too late
+        assertEquals(CancelState.ANSWERED, row(4).cancelState)
+        restart()
+        assertEquals(0L, row(1).cumQty, "the restatement: told again by the next mass status")
+        assertEquals(0.toByte(), row(2).ordStatus, "the gateway's reject: in flight again, so the SDK settles it")
+        assertTrue(row(2).isInFlight)
+        assertEquals('8'.code.toByte(), row(3).ordStatus, "a sequenced reject is written at once")
+        assertEquals(CancelState.PARKED, row(4).cancelState, "the cancel: answered again")
     }
 
     @Test
@@ -347,14 +419,14 @@ class OutboundReportsTest {
     }
 
     @Test
-    fun `an owed fate survives a restart, and is sent once the client is back`() {
+    fun `an owed fate survives a restart, and is sent once the session is held again`() {
         order(1)
-        client.online = false
+        client.held = false
         outbound.onSettled(P, 1L, OrderFate.NEVER_SEQUENCED)
         outbound.doWork()
         assertTrue(client.sent.isEmpty())
         restart()
-        client.online = true
+        client.held = true
         outbound.doWork()
         assertEquals(Texts.NOT_SEQUENCED_ORDER, sent8().single().text)
     }
@@ -476,6 +548,7 @@ class OutboundReportsTest {
             }
         }
         client.keep = false
+        delivery.keep = false
         run(1, 6_001)
         val threads = ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
         // As InboundOrdersTest: an allocation per report shows in every window; one of five at 0 is the claim.
@@ -491,6 +564,7 @@ class OutboundReportsTest {
 
     private class CancelVenue : OrderVenue {
         var next = SendResult.SENT
+        override fun shardOf(securityId: Int) = if (securityId == OTHER_SHARD_SECURITY) 1 else 0
         val cancels = mutableListOf<SentCancel>()
 
         override fun newOrder(
@@ -526,20 +600,33 @@ data class Sent9(
     val text: String?, val statusUnknown: Boolean,
 )
 
-/** Records what it is sent; [online] false is a client logged out, [accepting] false a back-pressured Artio. */
+/**
+ * Records what it is sent; [held] false is a session the library does not hold (§6.3), [accepting]
+ * false a back-pressured Artio. Each message taken gets the next position, as Artio's stream would.
+ */
 class RecordingClient : ClientReports {
     val sent = mutableListOf<Any>()
-    var online = true
+    var held = true
     var accepting = true
+    private var position = 0L
+
+    /** Every position given out, in order, while [keep]. */
+    val positions = mutableListOf<Long>()
 
     /** False: accept and keep nothing, for measuring the path. */
     var keep = true
 
-    override fun isOnline(participantId: Long) = online
+    override fun canSend(participantId: Long) = held
 
-    override fun send(report: OutgoingExecution): Boolean {
-        if (!accepting) return false
-        if (!keep) return true
+    private fun next(): Long {
+        position += 160L
+        if (keep) positions += position
+        return position
+    }
+
+    override fun send(report: OutgoingExecution): Long {
+        if (!accepting) return -2L // Publication.BACK_PRESSURED
+        if (!keep) return next()
         sent += Sent8(
             report.order.fixClOrdIdAsString().let { o -> report.cancel?.fixClOrdIdAsString() ?: o },
             report.cancel?.let { report.order.fixClOrdIdAsString() },
@@ -549,17 +636,43 @@ class RecordingClient : ClientReports {
             if (report.textLength == 0) null else report.text.getStringWithoutLengthAscii(0, report.textLength),
             report.statusUnknown,
         )
-        return true
+        return next()
     }
 
-    override fun send(reject: OutgoingCancelReject): Boolean {
-        if (!accepting) return false
-        if (!keep) return true
+    override fun send(reject: OutgoingCancelReject): Long {
+        if (!accepting) return -2L
+        if (!keep) return next()
         sent += Sent9(
             reject.cancel.fixClOrdIdAsString(), reject.order.fixClOrdIdAsString(), reject.exchangeOrderId, reject.ordStatus,
             reject.cxlRejReason, if (reject.textLength == 0) null else reject.text.getStringWithoutLengthAscii(0, reject.textLength),
             reject.statusUnknown,
         )
-        return true
+        return next()
+    }
+}
+
+data class Delivered(val shardId: Int, val participantId: Long, val reportSeq: Long, val position: Long)
+
+/**
+ * The archive as the outbound path meets it (Design.md §6.2): with [keepingUp] it has every 35=8 at
+ * once, so a row waiting for it is written straight away; without, rows wait until [archiveAll].
+ */
+class ArchiveModel(private val store: OrderStore) : Delivery {
+    val sent = mutableListOf<Delivered>()
+    val waiting = mutableListOf<RequestRow>()
+    var keepingUp = true
+    var keep = true
+
+    override fun sent(shardId: Int, participantId: Long, reportSeq: Long, position: Long) {
+        if (keep) sent += Delivered(shardId, participantId, reportSeq, position)
+    }
+
+    override fun writeWhenArchived(row: RequestRow, position: Long) {
+        if (keepingUp) store.update(row) else waiting += row
+    }
+
+    fun archiveAll() {
+        waiting.forEach(store::update)
+        waiting.clear()
     }
 }

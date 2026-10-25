@@ -4,11 +4,11 @@ Where the adapter stands, what is open, and what to do next. **This is the sessi
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
 Last updated 2026-10-25. **`fix-session` is implemented: the acceptor (2026-10-15) and the FIX
-dictionary (2026-10-20). `order-entry` has its order store, its inbound path, and its outbound path
-(2026-10-25, slices 1–3 of §3 item 5): a client's 35=D reaches its shard's gateway over Aeron, and
-the exchange's reports and fates come back as 35=8 and 35=9. Durable delivery (slice 4), recovery
-of lost rows, 35=H/AF (slice 5) and `market-data` are still to build, and there is no runnable
-adapter yet (no `main`).** 2026-10-20: the dictionary is FIX 4.4's own,
+dictionary (2026-10-20). `order-entry` has its order store, its inbound path, its outbound path and
+durable delivery (2026-10-25, slices 1–4 of §3 item 5): a client's 35=D reaches its shard's gateway
+over Aeron, the exchange's reports and fates come back as 35=8 and 35=9, logged on or not, and a
+`reportSeq` is consumed only once the archive has its 35=8. Recovery of lost rows, 35=H/AF (slice
+5) and `market-data` are still to build, and there is no runnable adapter yet (no `main`).** 2026-10-20: the dictionary is FIX 4.4's own,
 cut to the handled message types, and Artio was found not to validate application messages, so the
 backend must (CLAUDE.md non-negotiable 9, Design §5.4, Rationale §8).
 
@@ -32,6 +32,9 @@ Decided 2026-10-25 (Design §3.2, §6.1), each the recommendation:
   recovery from Artio's archive is built (Design §8.17, Rationale §10).
 - **Fills a mass status reveals** are a 35=8 ExecType I with the new CumQty, AvgPx over the fills
   known, and a Text saying what is missing (Design §5.3).
+- **An answer with no `reportSeq`** (a fate, a restatement, a parked cancel's answer, a gateway's
+  own reject) writes its row only once the archive has its 35=8 or 35=9. A crash before then gives
+  it again; it is never lost (Design §6.2, Rationale §11).
 
 Decided 2026-10-09 (Design.md, Rationale §3–§7, CLAUDE.md non-negotiable 1 extended, 7–8 new):
 - **Goals:** low latency, stateful, guaranteed delivery of execution reports, the minimum that
@@ -85,7 +88,7 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 3 — `fix-session`, `order-entry`, `market-data`; packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 121 (the store 20, the inbound path 36, the outbound path 25, AvgPx 5, the directory index 7, the config 5, the backend end to end 22, SDK wiring 1); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15 |
+| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 152 (the store 21, the inbound path 37, the outbound path 29, AvgPx 5, delivery 12, the report sessions 11, the directory index 7, the config 5, the backend end to end 24, SDK wiring 1); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -250,7 +253,7 @@ parallel with item 2.
           node file and runs the backend on a thread. The SDK allocates per directory cycle and per
           order (Design §8.16): a change to most-exchange's `client`. The replies' allocation was not
           measured.
-   3. ~~**Outbound**~~ **Done 2026-10-25**, uncommitted (Design §3.3, §3.4, §5.3; Rationale §10).
+   3. ~~**Outbound**~~ **Done 2026-10-25** (`c83d486`; Design §3.3, §3.4, §5.3; Rationale §10).
       `...orderentry.outbound`: `OutboundReports` (a report, a fate or a mass status's completion,
       to the client and the store), `Notional` (128 bits, AvgPx half up), and the port
       `ClientReports` with its two reused messages. `artio.ArtioReports` writes them on each
@@ -279,9 +282,31 @@ parallel with item 2.
       - **Not done here:** a client logged out still holds its gateway's whole report stream
         (`ABORT`) until slice 4. A row lost in a host crash is not recovered (§8.17). The 35=8's
         own allocation through Artio was not measured.
-   4. **Delivery** (§6.2–§6.3): the lagging `SessionStore` over `OrderStore.saveFirstMissing`,
-      the `RecordingPos` lookup at each library connect, and reports held from a disconnect until
-      `requestSession` is back.
+   4. ~~**Delivery**~~ **Done 2026-10-25**, uncommitted (Design §6.1–§6.3, §8.18–§8.19; Rationale
+      §11; CLAUDE.md non-negotiable 7). `delivery.ReportDelivery`, the lagging `SessionStore`, one
+      view per shard: the stored first-missing is the lowest of the SDK's ceiling, the lowest
+      `reportSeq` whose 35=8 the archive has not reached, and a library reconnect's floor.
+      `artio.LibraryRecording`, the `RecordingPos` lookup at each library connect.
+      `artio.ReportSessions`: every session held offline from startup (before the bind), requested
+      back after a disconnect replaying from the last received + 1, never written to once it stops
+      being active, and an offline session handed back numbered below the library's last MsgSeqNum
+      released and asked for again. Decided: an answer with no `reportSeq` writes its row only once
+      archived. 41 new tests, among them, end to end: a logged-out client's report archived and
+      consumed while it is away, then resent as PossDup at its Logon; after a restart, a fate
+      written offline before the client is back; a client that logs on again before the library
+      has seen its disconnect, its 35=D not lost (the race forced by not polling the adapter).
+      33 mutations, all caught; five only after a test or the code was changed, two rewritten.
+      - **Found:** `reportSeq` is per shard, and the store kept one per participant: now (participant,
+        shard), and each row keeps its shard. The request after a disconnect must replay, or a
+        client back first loses its 35=D (Artio's source). A report written just after the client's
+        Logout was lost in 2 runs of 5: the library still wrote on the session, and the engine's
+        offline handover reads an index that can lag the library's stream (seen once in 6 runs,
+        on the Logout reply). `FixLibrary.connect` returns before the library is connected.
+      - **Not done here:** a library reconnect freezes the stored `reportSeq` until a restart, and
+        that path is not tested end to end (§8.18). A client back within the indexer's lag after a
+        dropped connection can still have a MsgSeqNum reused: counted, not prevented (§8.19). The
+        35=8's allocation through Artio was not measured. A row lost in a host crash is still not
+        recovered (§8.17), which is next.
    - **Then recovery of lost rows** (Design §8.17): at startup, the archive's inbound 35=D/F past
      the store's last row run through the inbound path without sending. A look at Artio's archive
      scanning first.

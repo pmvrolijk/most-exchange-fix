@@ -25,7 +25,7 @@ class ShardVenue : OrderVenue {
     private val endpointsByShard = Int2ObjectHashMap<List<GatewayEndpoint>>()
 
     /** The shard [securityId] was last listed on, or [DirectoryIndex.NO_SHARD]. */
-    fun shardOf(securityId: Int): Int = shardBySecurity.get(securityId)
+    override fun shardOf(securityId: Int): Int = shardBySecurity.get(securityId)
 
     fun has(shardId: Int): Boolean = sessionByShard.containsKey(shardId)
 
