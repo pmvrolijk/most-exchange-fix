@@ -229,3 +229,60 @@ equals.
 
 **Not real yet:** nothing here has met Artio's `Session` or the SDK's `OrderEntrySession`. That is
 2b, with a real initiator. 35=H and 35=AF answer 35=j until slice 5.
+
+### 2f. Order entry wired to Artio and the SDK (slice 2b), 2026-10-25
+
+**The problem.** Slice 2a's inbound path ran against models only. 2b puts it between a real Artio
+session and the SDK's `OrderEntrySession`: replies on Artio's `Session`, the library's handler,
+one SDK session per shard, the directory, the node file's keys, and the two startup guards.
+
+**Decided with the user** (each the recommendation; Design §3.3, §3.5, Rationale §9):
+- **The SDK runs on the adapter's embedded media driver**, §8.6 closed;
+- **a shard's gateways are the directory's**, unless the node file lists them, as a co-located
+  shard needs. An endpoint that moves later is logged, not followed;
+- **the collision's block** is stored as the `sequenceIndex` it was found at. The engine accepts
+  the Logon, and the library logs it out with the Text. Any reset that raises the index lifts it,
+  the client's 141=Y included.
+
+**Taken without asking**, written into Design §3.3 for review:
+- a local reject's OrderID is `NONE`;
+- a 35=9 with CxlRejReason 1 says OrdStatus 8 and OrderID `NONE`, FIX 4.4's rule;
+- every other 35=9 states the order's last status, `A` before any, never 8 for an order that may
+  be open;
+- before the first complete directory, orders and cancels get "exchange unavailable";
+- the acceptor binds only after the startup guards.
+
+**Built:** in `...orderentry`:
+- `OrderEntryBackend`, `OrderEntryConfig` and `StartupGuards`;
+- `artio.ArtioReplies` and `StatusUnknownText`;
+- `exchange.DirectoryIndex` (with `BytesTable`) and `exchange.ShardVenue`.
+
+The store gained `block`, `isBlocked`, `liftBlock` and `holdsState`. `FixAcceptor` gained
+`bindAtStartup` and `bind()`, and `FixNodeConfig` gained `loadProperties`. fix-session's
+`AcceptorRig` and `Initiator` moved to its `testFixtures`.
+
+**The check.** End-to-end tests in `OrderEntryBackendTest`: a real Artio initiator, the acceptor,
+the library, the SDK's session over Aeron IPC on the adapter's driver, and a gateway model that
+answers the opening mass status and records what it is sent. A directory publisher repeats its
+broadcast on a cycle, as discovery does. Unit tests cover the index, the config, the store's block
+and the inbound path's new rows. What failed on the way:
+- every test took ~10 s: an initiator closed while logged on waits that long. The tests now log out
+  first;
+- the collision test found the first life's Logout. The client's session id is the same at every
+  logon, so its messages accumulate; the waits now look past the last MsgSeqNum seen;
+- the test asserted the client's `sequenceIndex`, which counts the initiator's own resets (4), not
+  the acceptor's (1). The adapter's is what the ids carry.
+
+Read in Artio's source before writing: the handler gets session messages, and messages already
+answered are flagged invalid. Encoders wrap the bytes they are given. A raw `trySend` advances
+MsgSeqNum. `FixEngine.allSessions()` lists offline sessions with their `sequenceIndex` as the
+engine starts.
+
+16 end-to-end tests, 85 in order-entry in all, `./gradlew build` green. 23 mutations, each caught.
+Two needed work first. Raising the `sequenceIndex` at the claim was masked, because the first
+message raises it too; the test now waits for it before the client sends. And one mutation that
+did not compile had been counted as caught. It was rewritten, then caught.
+
+**Not real yet:** there is no `main`. Reports go to a listener that slice 3 writes, and the
+`SessionStore` is the SDK's in-memory one until slice 4. The SDK allocates on every directory
+cycle and for every order (Design §8.16).

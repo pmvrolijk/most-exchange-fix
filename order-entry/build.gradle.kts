@@ -5,6 +5,7 @@ dependencies {
     implementation(project(":fix-session"))
     implementation(libs.most.client)
     implementation(libs.rocksdb)
+    testImplementation(testFixtures(project(":fix-session")))
 }
 
 tasks.test {

@@ -18,7 +18,6 @@ import nl.lamia.most.exchange.sbe.Side
 import nl.lamia.most.exchange.sbe.SmpStrategy
 import org.agrona.AsciiSequenceView
 import org.agrona.DirectBuffer
-import org.agrona.collections.LongHashSet
 import uk.co.real_logic.artio.util.MutableAsciiBuffer
 import java.util.function.IntSupplier
 
@@ -37,7 +36,7 @@ class InboundOrders(
     private val securities: SecurityLookup,
     /** The adapter's trading date, `YYYYMMDD` (§3.6). */
     private val tradingDate: IntSupplier,
-    /** An id collision (§3.3, §8.15): the session is to be refused Logons until reset. */
+    /** An id collision (§3.3, §8.15), after the store has blocked the session: for counting and logging. */
     private val onIdCollision: (participantId: Long) -> Unit,
 ) {
     private val message = MutableAsciiBuffer()
@@ -51,18 +50,11 @@ class InboundOrders(
     private val field = AsciiSequenceView()
     private val field2 = AsciiSequenceView()
 
-    /** Sessions refused after an id collision, until an operator resets them (§3.3). */
-    private val blocked = LongHashSet()
-
     var idCollisions = 0L
         private set
 
-    fun isBlocked(participantId: Long): Boolean = blocked.contains(participantId)
-
-    /** After an operator has reset the session's sequence (§9.1). */
-    fun unblock(participantId: Long) {
-        blocked.remove(participantId)
-    }
+    /** Blocked after an id collision until its session is reset (§3.3). The store keeps it. */
+    fun isBlocked(participantId: Long): Boolean = store.isBlocked(participantId)
 
     @Suppress("LongParameterList")
     fun onMessage(
@@ -89,16 +81,17 @@ class InboundOrders(
 
         val id = derive(sequenceIndex, d.header().msgSeqNum())
         d.clOrdID(clOrdId)
-        if (blocked.contains(participantId)) return answered(replies.rejectOrder(d, OTHER, Texts.SEQUENCE_RESET_REQUIRED))
+        if (store.isBlocked(participantId)) return answered(replies.rejectOrder(d, OTHER, Texts.SEQUENCE_RESET_REQUIRED))
 
         val held = store.find(participantId, id)
         if (held != null) {
             if (!held.fixClOrdIdEquals(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)) {
-                return collision(participantId, replies.rejectOrder(d, OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies)
+                return collision(participantId, sequenceIndex, replies.rejectOrder(d, OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies)
             }
             // The same request again: sent only if this process's own send did not go out (§3.3).
             return if (held.sendPending) sendOrder(held, d, replies) else Action.CONTINUE
         }
+        if (!securities.isReady) return answered(replies.rejectOrder(d, OTHER, Texts.EXCHANGE_UNAVAILABLE))
 
         val securityId = securityOf(d)
         if (securityId == SecurityLookup.NONE) return answered(replies.rejectOrder(d, UNKNOWN_SYMBOL, Texts.UNKNOWN_SECURITY))
@@ -185,20 +178,20 @@ class InboundOrders(
         val id = derive(sequenceIndex, c.header().msgSeqNum())
         c.clOrdID(clOrdId)
         c.origClOrdID(origClOrdId)
-        if (blocked.contains(participantId)) return answered(replies.rejectCancel(c, null, OTHER, Texts.SEQUENCE_RESET_REQUIRED))
+        if (store.isBlocked(participantId)) return answered(replies.rejectCancel(c, orderNamed(participantId), OTHER, Texts.SEQUENCE_RESET_REQUIRED))
 
         val held = store.find(participantId, id)
         if (held != null) {
             if (!held.fixClOrdIdEquals(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)) {
-                return collision(participantId, replies.rejectCancel(c, null, OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies)
+                return collision(participantId, sequenceIndex, replies.rejectCancel(c, orderNamed(participantId), OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies)
             }
             if (!held.sendPending) return Action.CONTINUE
             val order = store.find(participantId, held.origClOrdId) ?: error("cancel ${held.clOrdId} without its order")
             return sendCancel(held, order, c, replies)
         }
-
-        val order = store.findByFixClOrdId(participantId, origClOrdId.buffer(), origClOrdId.offset(), origClOrdId.length)
-        if (order == null || order.kind != RowKind.ORDER) return answered(replies.rejectCancel(c, null, UNKNOWN_ORDER, Texts.UNKNOWN_ORDER))
+        val order = orderNamed(participantId)
+        if (!securities.isReady) return answered(replies.rejectCancel(c, order, OTHER, Texts.EXCHANGE_UNAVAILABLE))
+        if (order == null) return answered(replies.rejectCancel(c, null, UNKNOWN_ORDER, Texts.UNKNOWN_ORDER))
         if (!matches(c, order)) return answered(replies.rejectCancel(c, order, UNKNOWN_ORDER, Texts.ORDER_MISMATCH))
         if (order.ambiguous) return answered(replies.rejectCancel(c, order, OTHER, Texts.STATUS_UNKNOWN, statusUnknown = true))
         if (RequestRow.isTerminal(order.ordStatus)) return answered(replies.rejectCancel(c, order, TOO_LATE, Texts.TOO_LATE))
@@ -246,6 +239,13 @@ class InboundOrders(
             }
         }
     }
+
+    /**
+     * The order the cancel's OrigClOrdID names, or null: unknown, or a cancel's ClOrdID. A refusal
+     * then states that order's status, never a reject for an order that may be open (§3.3).
+     */
+    private fun orderNamed(participantId: Long): RequestRow? =
+        store.findByFixClOrdId(participantId, origClOrdId.buffer(), origClOrdId.offset(), origClOrdId.length)?.takeIf { it.kind == RowKind.ORDER }
 
     /** OrderID, Side and the security, where the cancel states them, must be the order's (§5.2). */
     private fun matches(c: OrderCancelRequestDecoder, order: RequestRow): Boolean {
@@ -303,10 +303,10 @@ class InboundOrders(
         return SecurityLookup.NONE
     }
 
-    private fun collision(participantId: Long, rejected: Boolean, replies: ClientReplies): Action {
+    private fun collision(participantId: Long, sequenceIndex: Int, rejected: Boolean, replies: ClientReplies): Action {
         if (!rejected) return Action.ABORT
         idCollisions++
-        blocked.add(participantId)
+        store.block(participantId, sequenceIndex)
         onIdCollision(participantId)
         replies.logout(Texts.SEQUENCE_RESET_REQUIRED)
         return Action.CONTINUE

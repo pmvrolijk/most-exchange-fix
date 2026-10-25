@@ -243,3 +243,44 @@ with a 35=3 from the decoder's `rejectReason` and `invalidTagId`.
 default. A launch script that forgot it would silently accept tags Design §5.4 says are refused.
 A refusal to start makes the omission loud. Its test runs in a JVM of its own
 (`:fix-session:testAcceptorGuard`), since the switch cannot be turned off inside one.
+
+## 9. Order entry's wiring: one driver, the block after a collision, and what Artio hands over
+
+Decided 2026-10-25 (slice 2b), each the recommendation; Design §2, §3.2, §3.3, §3.5.
+
+**One media driver, the adapter's embedded one.** The alternative was the SDK on a separately run
+driver, the host's, which keeps Artio's IPC and archive apart from network traffic. But the adapter
+is one process either way: a driver fault in it already takes the FIX side down, and a second
+driver is one more process to deploy, configure and supervise. IPC uses no sender or receiver
+thread, so the archive's traffic and the gateways' UDP do not compete for them. A host-wide driver
+shared with other applications is the case this leaves out.
+
+**A shard's gateways: the directory's, unless the node file lists them.** The directory names one
+endpoint per shard, but a co-located shard has a gateway per node, and the adapter must hold them
+all to follow the leader (most-exchange Adapters.md §1). Listing them only when needed keeps the
+common case free of configuration. An endpoint that moves in a later directory is logged and not
+followed: switching a live `OrderEntrySession` to new links is the SDK's business, and it has no
+call for it. A restart takes the new endpoint.
+
+**The block after an id collision: accepted, then logged out, lifted by any reset.** The Logon is
+authenticated on the engine's framer thread, and the store belongs to the library's. Refusing at
+the Logon would need the block shared across threads, and Artio's reject happens before a 141=Y
+could raise the `sequenceIndex`, so only an operator could ever lift it. Logging the session out
+from the library, on acquiring it, keeps the block on one thread and lets the Logout carry the
+reason. Any reset lifts it, the client's own 141=Y included, because what made the collision
+possible, a `sequenceIndex` that did not rise, is then gone: every id derived after it is new. The
+stricter rule, operator only, was weighed and not taken.
+
+**What Artio hands the library** (found 2026-10-25). Every message its session layer has processed
+reaches the `SessionHandler`, session messages included, and messages it has dealt with itself
+are flagged `OnMessageInfo.isValid()` false: a MsgSeqNum gap it answers with a resend request, a
+SendingTime it rejects, a message after a Logout. A backend that took them all would answer a
+Heartbeat with a 35=j, and forward a 35=D Artio had already rejected. The test that shows it sends a
+35=D with an hour-old SendingTime: Artio answers 35=3 (SessionRejectReason 10), and nothing reaches
+the gateway.
+
+**Artio's encoders wrap, they do not copy** (found 2026-10-25). A generated encoder's setter for an
+`AsciiSequenceView`, a `DirectBuffer` or a `byte[]` points the field at the caller's bytes. A later
+`CharSequence` setter on the same field copies into whatever the field points at, which may be the
+inbound message's buffer, Artio's own. `reset()` points every field back at the encoder's buffer.
+So every reply resets its encoder first, and the inbound buffer is never written.

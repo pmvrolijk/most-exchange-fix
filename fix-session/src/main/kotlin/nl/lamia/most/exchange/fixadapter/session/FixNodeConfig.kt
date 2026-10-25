@@ -24,7 +24,10 @@ class FixNodeConfig(
         const val SESSIONS_FILE = "fix.sessionsFile"
 
         /** Loads [path] if given, then lets `fix.*` system properties override individual keys. */
-        fun load(path: String?): FixNodeConfig {
+        fun load(path: String?): FixNodeConfig = parse(loadProperties(path))
+
+        /** The node file's keys as [load] reads them, for a backend's own (`fix.storeDir`, say). */
+        fun loadProperties(path: String?): Properties {
             val properties = Properties()
             if (path != null) {
                 val file = File(path)
@@ -35,7 +38,7 @@ class FixNodeConfig(
                 val name = key as String
                 if (name.startsWith("fix.")) properties.setProperty(name, value as String)
             }
-            return parse(properties)
+            return properties
         }
 
         fun parse(properties: Properties): FixNodeConfig {

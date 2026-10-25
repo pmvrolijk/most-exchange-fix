@@ -4,9 +4,10 @@ Where the adapter stands, what is open, and what to do next. **This is the sessi
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
 Last updated 2026-10-25. **`fix-session` is implemented: the acceptor (2026-10-15) and the FIX
-dictionary (2026-10-20). `order-entry` has its order store and its inbound logic (2026-10-25,
-slices 1 and 2a of §3 item 5), not yet wired to Artio or the SDK; the rest of it and `market-data`
-are still to build.** 2026-10-20: the dictionary is FIX 4.4's own,
+dictionary (2026-10-20). `order-entry` has its order store, its inbound logic, and their wiring to
+Artio and the SDK (2026-10-25, slices 1, 2a and 2b of §3 item 5): a client's 35=D reaches its
+shard's gateway over Aeron. Reports, delivery and 35=H/AF (slices 3–5) and `market-data` are still
+to build, and there is no runnable adapter yet (no `main`).** 2026-10-20: the dictionary is FIX 4.4's own,
 cut to the handled message types, and Artio was found not to validate application messages, so the
 backend must (CLAUDE.md non-negotiable 9, Design §5.4, Rationale §8).
 
@@ -21,6 +22,11 @@ Decided 2026-10-25 (Design §3.2, §6.1), each the recommendation:
 - **`NOT_READY` and `NO_GATEWAY` reject** a 35=D or 35=F, "exchange unavailable". They are not
   held: a lasting `ABORT` stalls every order-entry session, heartbeats included.
 - **A second cancel while one is pending** is a 35=9, CxlRejReason 3.
+- **The SDK runs on the adapter's embedded media driver** (§8.6 closed, Design §3.5).
+- **A shard's gateways are the directory's**, unless the node file lists them, as a co-located
+  shard needs. An endpoint that moves later is logged, not followed (Design §3.5).
+- **The collision's block** is stored, the Logon accepted and then logged out by the library, and
+  lifted by any reset that raises the `sequenceIndex`, the client's 141=Y included (Design §3.3).
 
 Decided 2026-10-09 (Design.md, Rationale §3–§7, CLAUDE.md non-negotiable 1 extended, 7–8 new):
 - **Goals:** low latency, stateful, guaranteed delivery of execution reports, the minimum that
@@ -74,7 +80,7 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 3 — `fix-session`, `order-entry`, `market-data`; packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 51 (the store 18, the inbound path 32); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15 |
+| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 85 (the store 20, the inbound path 36, the directory index 7, the config 5, the backend end to end 16, SDK wiring 1); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -185,7 +191,7 @@ parallel with item 2.
         for the calendar (§3.6). Nothing reads Artio's `sequenceIndex` into the guard yet: that is
         the wiring, slice 2. `fix.*` has no store path yet: it joins the node file with slice 2.
    2. **Inbound**, in two parts:
-      - ~~**2a, the logic**~~ **Done 2026-10-25**, uncommitted (Design §3.3, §5.1, §5.2):
+      - ~~**2a, the logic**~~ **Done 2026-10-25** (`d26fe46`; Design §3.3, §5.1, §5.2):
         `...orderentry.inbound`: `InboundOrders` (a FIX message → a request on its way, or an
         answer given here), `FixParse`, and the ports it is wired through, `OrderVenue`,
         `SecurityLookup` and `ClientReplies`. The store gained two in-memory fields, `sendPending`
@@ -202,22 +208,51 @@ parallel with item 2.
           does not reset a decoder, so the path resets before each one.
         - **Not right yet:** 35=H and 35=AF get a 35=j "unsupported message type" until slice 5
           answers them from the store. Design §3.3 says they are answered.
-      - **2b, the wiring.** `ClientReplies` on Artio's `Session`: the 35=3, 35=j, 35=8 and 35=9
-        encoders, ExecID `A<sequenceIndex>.<MsgSeqNum>` and OrderID for a local reject. The
-        order-entry library's `SessionHandler` calling `InboundOrders`. `OrderVenue` over one
-        `OrderEntrySession` per shard. `SecurityLookup` over `DirectoryClient`, with an
-        allocation-free byte index of symbols and ISINs (its own maps allocate a `String`). The
-        store path in the node file. The two guards: `requireSequenceIndex` at each claim, and the
-        startup refusal for a session Artio does not know (§3.2). The id collision's Logon refusal,
-        persisted. Tested against a real Artio initiator. The trading calendar (§3.6) is still to
-        build: the inbound path takes the trading date as a supplier.
+      - ~~**2b, the wiring**~~ **Done 2026-10-25**, uncommitted (Design §2, §3.2, §3.3, §3.5;
+        Rationale §9). `OrderEntryBackend`, one duty cycle: the order-entry library, `RoleClaims`,
+        the directory's subscription, and an `OrderEntrySession` per shard (`ShardVenue`), all on
+        the embedded driver. `ArtioReplies`, the 35=3/j/8/9 on Artio's `Session`. `DirectoryIndex`,
+        symbol, ISIN and id to the security and its shard, rebuilt per version and read without
+        allocating. `OrderEntryConfig`: `fix.storeDir`, `fix.directoryChannel`/`StreamId`, and a
+        shard's listed gateways. `StartupGuards`, run before the acceptor binds (`FixAcceptor`
+        gained `bindAtStartup` and `bind()`). The store keeps the collision's block.
+        fix-session's test rig moved to `testFixtures`, so order-entry's tests drive a real
+        initiator. 16 end-to-end tests, a real Artio initiator through to a gateway model on
+        Aeron IPC, among them:
+        - a 35=D reaches its security's shard, for the session's participant, with the derived id;
+        - every reply as the client reads it, ExecID `A<sequenceIndex>.<MsgSeqNum>` included;
+        - the collision: a reject and a Logout, logged out at every Logon across a restart, until
+          a 141=Y;
+        - both startup refusals, with nothing listening;
+        - a message Artio rejected itself never reaching the gateway.
+
+        23 mutations, each caught. Two were caught only after a fix: the `sequenceIndex` raised at
+        the claim was also raised by the first message, so the test now waits for it before the
+        client sends; and one mutation first failed to compile, which proves nothing, and was
+        rewritten. Among them: Artio's invalid messages or session messages passed on, the blocked
+        session not logged out, the block never lifted or lifted at the same index, either startup
+        guard skipped, the acceptor bound before them, every order to one shard, listed gateways
+        ignored, the ExecID off by one, a mismatched cancel stating the row.
+        - **Found:** Artio hands the library session messages and messages it has already answered
+          (`isValid()` false), so a Heartbeat would have drawn a 35=j and a 35=D Artio rejected
+          would have been forwarded (CLAUDE.md non-negotiable 10). Artio's encoders wrap the bytes
+          they are given, so each reply resets its encoder. Before the directory every order would
+          have been "unknown security"; it is now "exchange unavailable". An initiator closed while
+          logged on waits ~10 s, so the tests log out first.
+        - **Not done here:** reports (`listener` is slice 3's), the lagging `SessionStore` (slice 4;
+          the SDK's in-memory one stands in), `restoreInFlight` at a shard session's creation
+          (slice 3), the trading calendar (§3.6; still a supplier), and a `main` that reads the
+          node file and runs the backend on a thread. The SDK allocates per directory cycle and per
+          order (Design §8.16): a change to most-exchange's `client`. The replies' allocation was not
+          measured.
    3. **Outbound:** `onReport` → 35=8/35=9 (§5.3), and the fates per CLAUDE.md non-negotiable 1.
       Also AvgPx from the 128-bit notional, the "missing from a completed mass status" rule
       (§3.4), and `restoreInFlight` from `OrderStore.forEachInFlight`.
    4. **Delivery** (§6.2–§6.3): the lagging `SessionStore` over `OrderStore.saveFirstMissing`,
       the `RecordingPos` lookup at each library connect, and reports held from a disconnect until
       `requestSession` is back.
-   5. **35=H and 35=AF** from the store. Then this repo's **e2e**, against most-exchange's real
+   5. **35=H and 35=AF** from the store (until then they get a 35=j, "unsupported message type",
+      against Design §3.3). Then this repo's **e2e**, against most-exchange's real
       processes. That is the first test of `OrderEntrySession` through a real failover
       (most-exchange Status §3, item 13(a)).
 6. **Tooling** (Design §10): the paced FIX sender and the HTML latency report, with service and

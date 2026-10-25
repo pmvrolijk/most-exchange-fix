@@ -21,11 +21,16 @@ import uk.co.real_logic.artio.validation.SessionPersistenceStrategy
  * - Sequence numbers are always persistent: MsgSeqNum is the FIX session's, across logons and
  *   restarts. Sessions are accepted engine-owned, and each library claims those of its role.
  *
+ * With [bindAtStartup] false the engine listens only once [bind] is called: the adapter binds after
+ * its backends' startup checks (Design.md §3.2), so no Logon reaches an adapter about to refuse to
+ * start.
+ *
  * [configureDriver] is for test rigs (threading, say); production takes Aeron's `aeron.*` system properties.
  */
 class FixAcceptor(
     val config: FixNodeConfig,
     val sessions: ConfiguredSessions = ConfiguredSessions.load(config.sessionsFile),
+    bindAtStartup: Boolean = true,
     configureDriver: (MediaDriver.Context, Archive.Context) -> Unit = { _, _ -> },
 ) : AutoCloseable {
 
@@ -57,6 +62,7 @@ class FixAcceptor(
         FixEngine.launch(
             EngineConfiguration().apply {
                 bindTo(config.bindAddress, config.port)
+                bindAtStartup(bindAtStartup)
                 libraryAeronChannel(IPC)
                 logFileDir(config.logDir.path)
                 deleteLogFileDirOnStart(false)
@@ -83,6 +89,17 @@ class FixAcceptor(
         libraryAeronChannels(listOf(IPC))
         sessionExistsHandler(sessionExists)
         aeronContext().aeronDirectoryName(config.aeronDir)
+    }
+
+    /** Starts listening, for an acceptor created with `bindAtStartup` false. Waits for the engine to bind. */
+    fun bind(timeoutMs: Long = 10_000L) {
+        val reply = engine.bind()
+        val deadline = System.nanoTime() + timeoutMs * 1_000_000L
+        while (reply.isExecuting) {
+            check(System.nanoTime() < deadline) { "the engine did not bind within $timeoutMs ms" }
+            Thread.onSpinWait()
+        }
+        check(reply.hasCompleted()) { "the engine did not bind: ${reply.state()} ${reply.error() ?: ""}" }
     }
 
     override fun close() = CloseHelper.closeAll(engine, driver)

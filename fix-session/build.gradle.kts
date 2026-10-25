@@ -1,6 +1,11 @@
 // The FIX side, shared by both backends: the Artio engine and library, the acceptor, logon and
 // authentication, session persistence, and the FIX dictionary's generated codecs (docs/Design.md §2).
 
+plugins {
+    // AcceptorRig, the Initiator and their helpers: order-entry's tests drive a real Artio session too.
+    `java-test-fixtures`
+}
+
 val codecGeneration: Configuration by configurations.creating
 
 dependencies {

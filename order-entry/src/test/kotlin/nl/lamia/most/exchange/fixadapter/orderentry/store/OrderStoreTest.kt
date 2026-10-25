@@ -372,6 +372,40 @@ class OrderStoreTest {
         again.requireSequenceIndex(P2, 0)
     }
 
+    @Test
+    fun `an id collision's block survives a restart, and lifts only for a higher sequenceIndex`() {
+        // Design.md §3.3, the id collision: stored as the sequenceIndex it was found at (§6.1 meta).
+        val s = open()
+        assertFalse(s.isBlocked(P1))
+        s.block(P1, 2)
+        assertTrue(s.isBlocked(P1))
+        assertFalse(s.isBlocked(P2))
+        val again = restart()
+        assertTrue(again.isBlocked(P1))
+        assertFalse(again.liftBlock(P1, 1), "a lower sequenceIndex does not lift it")
+        assertFalse(again.liftBlock(P1, 2), "nor the same one: the ids it derives still collide")
+        assertTrue(again.isBlocked(P1))
+        assertTrue(again.liftBlock(P1, 3), "a reset raised it")
+        assertFalse(again.isBlocked(P1))
+        assertFalse(restart().isBlocked(P1), "the lift is stored too")
+    }
+
+    @Test
+    fun `the store holds state for a participant with a row, a sequenceIndex, a first-missing or a block`() {
+        // Design.md §3.2, "Where the guards run": what makes a session Artio does not know a wipe.
+        val s = open()
+        s.recordSequenceIndex(P1, 0) // not stored: 0 is where every session starts
+        s.find(P1, 1L)
+        assertFalse(s.holdsState(P1))
+        s.recordSequenceIndex(P1, 1)
+        s.saveFirstMissing(P2, 5L)
+        s.block(P3, 0)
+        assertEquals(InsertResult.NEW, s.insert(s.order(P4, 7L, "ORD-7")))
+        val again = restart()
+        for (p in listOf(P1, P2, P3, P4)) assertTrue(again.holdsState(p), "participant $p")
+        assertFalse(again.holdsState(P5))
+    }
+
     // ---------------------------------------------------------------- refusals at load
 
     @Test
@@ -449,6 +483,9 @@ class OrderStoreTest {
     private companion object {
         const val P1 = 1001L
         const val P2 = 1002L
+        const val P3 = 1003L
+        const val P4 = 1004L
+        const val P5 = 1005L
         const val TODAY = 20261026
         const val YESTERDAY = 20261023
 

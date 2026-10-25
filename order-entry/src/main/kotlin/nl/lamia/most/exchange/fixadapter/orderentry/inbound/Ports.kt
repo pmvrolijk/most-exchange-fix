@@ -27,6 +27,9 @@ interface OrderVenue {
 
 /** The directory's securities (Design.md §5.1). Lookups by bytes allocate nothing. */
 interface SecurityLookup {
+    /** A complete directory has arrived. Until then every request is refused "exchange unavailable" (§3.3). */
+    val isReady: Boolean
+
     fun isKnown(securityId: Int): Boolean
 
     /** The `securityId` of an ISIN (22=4), or [NONE]. */

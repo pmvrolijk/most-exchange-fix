@@ -23,6 +23,9 @@ class RecordingReplies : ClientReplies {
     val sent = mutableListOf<Reply>()
     var accepting = true
 
+    /** For each 35=9 sent, the FIX ClOrdID of the order it names, or null: its status is stated from it. */
+    val namedOrders = mutableListOf<String?>()
+
     private fun record(reply: Reply): Boolean {
         if (accepting) sent += reply
         return accepting
@@ -40,6 +43,7 @@ class RecordingReplies : ClientReplies {
     override fun rejectCancel(
         cancel: OrderCancelRequestDecoder, order: RequestRow?, cxlRejReason: Int, text: String, statusUnknown: Boolean,
     ) = record(Reply.CancelReject(cancel.clOrdIDAsString(), cancel.origClOrdIDAsString(), cxlRejReason, text, statusUnknown))
+        .also { if (it) namedOrders += order?.fixClOrdIdAsString() }
 
     override fun rejectReplace(replace: OrderCancelReplaceRequestDecoder, order: RequestRow?, cxlRejReason: Int, text: String) =
         record(Reply.ReplaceReject(replace.clOrdIDAsString(), replace.origClOrdIDAsString(), cxlRejReason, text))

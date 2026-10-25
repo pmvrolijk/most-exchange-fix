@@ -17,8 +17,8 @@ import java.nio.ByteOrder
 
 /**
  * The order store (Design.md §6.1): a row per request in RocksDB, every read served from memory,
- * and per participant the durable first-missing `reportSeq` (§6.2) and the highest `sequenceIndex`
- * (§3.2). Keyed by `participantId`, never Artio's session id, which a wipe of Artio's state changes.
+ * and per participant the durable first-missing `reportSeq` (§6.2), the highest `sequenceIndex`
+ * (§3.2) and an id collision's block (§3.3). Keyed by `participantId`, never Artio's session id, which a wipe of Artio's state changes.
  *
  * Single-threaded: the order-entry library's thread owns it (§3.5). After [open], call [load] once,
  * then use it. A lookup, an insert and an update allocate nothing once the maps have grown.
@@ -69,6 +69,9 @@ class OrderStore private constructor(
         val byFixHash = Long2ObjectHashMap<RequestRow>()
         var firstMissing = 1L
         var highestSequenceIndex = 0
+
+        /** The `sequenceIndex` an id collision was found at, or [NOT_BLOCKED] (§3.3). */
+        var blockedAt = NOT_BLOCKED
     }
 
     /**
@@ -130,6 +133,7 @@ class OrderStore private constructor(
                 when (val type = k.getByte(0)) {
                     META_FIRST_MISSING -> p.firstMissing = v.getLong(0, ByteOrder.LITTLE_ENDIAN)
                     META_SEQUENCE_INDEX -> p.highestSequenceIndex = v.getInt(0, ByteOrder.LITTLE_ENDIAN)
+                    META_BLOCKED -> p.blockedAt = v.getInt(0, ByteOrder.LITTLE_ENDIAN)
                     else -> error("order store meta entry of type $type")
                 }
                 entries.next()
@@ -270,6 +274,43 @@ class OrderStore private constructor(
         }
     }
 
+    /** Whether the participant's session is blocked after an id collision (Design.md §3.3). */
+    fun isBlocked(participantId: Long): Boolean = (participants.get(participantId)?.blockedAt ?: NOT_BLOCKED) != NOT_BLOCKED
+
+    /** Blocks the participant's session: an id collision found at [sequenceIndex] (§3.3). Stored. */
+    fun block(participantId: Long, sequenceIndex: Int) {
+        require(sequenceIndex >= 0) { "sequenceIndex $sequenceIndex" }
+        metaValue.putInt(0, sequenceIndex, ByteOrder.LITTLE_ENDIAN)
+        putMeta(META_BLOCKED, participantId, Int.SIZE_BYTES)
+        rowsOf(participantId).blockedAt = sequenceIndex
+    }
+
+    /**
+     * Lifts the block if the session is back with a [sequenceIndex] above the one it was found at: a
+     * reset, which makes its derived ids new (§3.3). True if it lifted one.
+     */
+    fun liftBlock(participantId: Long, sequenceIndex: Int): Boolean {
+        val p = participants.get(participantId) ?: return false
+        if (p.blockedAt == NOT_BLOCKED || sequenceIndex <= p.blockedAt) return false
+        metaKey.putByte(0, META_BLOCKED)
+        metaKey.putLong(1, participantId, ByteOrder.BIG_ENDIAN)
+        val k = ByteArray(META_KEY_LENGTH)
+        metaKey.getBytes(0, k)
+        db.delete(meta, writeOptions, k)
+        p.blockedAt = NOT_BLOCKED
+        return true
+    }
+
+    /**
+     * Whether anything is stored for the participant: a row, a `sequenceIndex` above 0, a durable
+     * first-missing above 1, or a block. A configured session Artio does not know while this holds
+     * means Artio's state was wiped (Design.md §3.2).
+     */
+    fun holdsState(participantId: Long): Boolean {
+        val p = participants.get(participantId) ?: return false
+        return !p.byClOrdId.isEmpty() || p.highestSequenceIndex > 0 || p.firstMissing > 1L || p.blockedAt != NOT_BLOCKED
+    }
+
     private fun putMeta(type: Byte, participantId: Long, valueLength: Int) {
         metaKey.putByte(0, type)
         metaKey.putLong(1, participantId, ByteOrder.BIG_ENDIAN)
@@ -300,6 +341,8 @@ class OrderStore private constructor(
         private const val INITIAL_VALUE_CAPACITY = 512
         private const val META_FIRST_MISSING: Byte = 1
         private const val META_SEQUENCE_INDEX: Byte = 2
+        private const val META_BLOCKED: Byte = 3
+        private const val NOT_BLOCKED = -1
 
         /** Rationale §4: a crash leaves a prefix. Never relax this without rereading that section. */
         internal val WAL_RECOVERY_MODE = WALRecoveryMode.PointInTimeRecovery

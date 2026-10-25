@@ -118,6 +118,9 @@ Decided 2026-10-15. Properties files, as the exchange's processes use.
   | `fix.aeronDir` | The embedded media driver's directory. Defaults to Aeron's own, plus `-most-fix` |
   | `fix.fileSyncLevel` | The archive's fsync level, default 1 (§6.4). A test rig may set 0 |
   | `fix.sessionsFile` | The sessions file, below |
+  | `fix.storeDir` | The order store (§6.1). Required for order entry, durable, never deleted at start |
+  | `fix.directoryChannel`, `fix.directoryStreamId` | Where the exchange broadcasts its directory (most-exchange Design.md §7). Required for order entry |
+  | `fix.shard.<id>.gateway.<n>.orderEntryChannel`, `…orderEntryStreamId`, `…executionReportChannel`, `…executionReportStreamId` | Optional: a shard's gateways, `n` from 0, in the order the SDK tries them. Listed, they replace the directory's one endpoint for that shard (§3.5) |
 
 - **The sessions file** has one block of `session.<name>.*` keys per session. The name is only a
   label:
@@ -194,6 +197,15 @@ orders, IOC and FOK, replace (35=G), and any value the exchange cannot carry (§
   - **And at startup** (decided 2026-10-25): a configured order-entry session Artio does not know
     at all, while the store holds rows or a `sequenceIndex` for its participant, means Artio's state
     was wiped. The adapter refuses to start.
+  - **Where the guards run** (2026-10-25, slice 2b): both read Artio's own list of the sessions it
+    knows (`FixEngine.allSessions()`, loaded from its session file as the engine starts, offline
+    sessions included), after the store is loaded and **before the acceptor binds**, so no Logon
+    is accepted by an adapter about to refuse to start. "Holds" means any row, a stored
+    `sequenceIndex` above 0, a durable first-missing `reportSeq` above 1, or a block. A session
+    whose `sequenceIndex` is still unknown to Artio (-1) counts as not known. While running, the
+    stored `sequenceIndex` is raised at each claim and on any message that carries a higher one.
+    A claim that comes back below it (Artio's state lost while running) is treated as an id
+    collision: blocked and logged out.
 - **FIX ClOrdID (11)** is unique per session for the trading day, and for as long as the order is
   open. A new 35=D reusing a known one is rejected with OrdRejReason 6, *duplicate order*.
 - **`exchangeOrderId`** is kept from the first report (Adapters.md §2) and sent back as OrderID (37).
@@ -209,7 +221,8 @@ except a 35=j, which is never answered.
 | 35=D | Validated (§5.1), written to the order store, then `newOrder`. `BACK_PRESSURED` → `Action.ABORT` |
 | 35=D, ClOrdID known | Another of the session's rows holds the ClOrdID: 35=8, OrdRejReason 6. With PossDup=Y it is dropped instead: a resend of a request already answered |
 | 35=D or 35=F, the same request again | Its derived `clOrdId` and its ClOrdID are already stored together (§6.1, *same*): a back-pressure redelivery, a PossDup resend, or a claim's replay (§2). **Sent again only if this process's own send of it did not go out**, back-pressured. Otherwise dropped. The engine does not check `clOrdId` (most-exchange Adapters.md §2): sent twice, it would be two orders under one id |
-| 35=D or 35=F, an id collision | Another ClOrdID holds the derived `clOrdId` (§3.2, §6.1). **Decided 2026-10-25** (§8.15): answered locally, 35=8 OrdRejReason 99 or 35=9 CxlRejReason 99, Text "session sequence reset required", never sent. Then a Logout with that Text. The session's Logons are refused until an operator resets its sequence, which raises its `sequenceIndex` (§9.1). Its open orders are untouched. Counted, and alertable (§9.2) |
+| 35=D or 35=F, an id collision | Another ClOrdID holds the derived `clOrdId` (§3.2, §6.1). **Decided 2026-10-25** (§8.15): answered locally, 35=8 OrdRejReason 99 or 35=9 CxlRejReason 99, Text "session sequence reset required", never sent. Then a Logout with that Text. The session's Logons are refused until an operator resets its sequence, which raises its `sequenceIndex` (§9.1). Its open orders are untouched. Counted, and alertable (§9.2). **How, decided 2026-10-25** (slice 2b): the block is stored per participant as the `sequenceIndex` it was found at (`meta`, §6.1), so it survives a restart. The engine still accepts the Logon (its check runs on the framer thread, away from the store); on acquiring the session, the order-entry library sends a Logout with the same Text and disconnects. A message replayed or arriving before that is rejected with the same Text. **The block lifts when the session comes back with a higher `sequenceIndex`**: an operator's reset, or the client's own Logon with 141=Y. Either makes the derived ids new, so the collision cannot recur |
+| 35=D or 35=F, before the directory | No complete directory has arrived yet, so no security can be resolved or routed (§3.5). The same reject as `NOT_READY` below, "exchange unavailable", never "unknown security" (2026-10-25, slice 2b) |
 | 35=D or 35=F, the SDK cannot send | `NOT_READY` (the opening mass status has not finished) or `NO_GATEWAY`. **Decided 2026-10-25: rejected**, 35=8 OrdRejReason 99 or 35=9 CxlRejReason 99, Text "exchange unavailable". Never sent, so the client may retry with a new ClOrdID. Not held: an `ABORT` that lasts stalls every order-entry session, heartbeats included. `UNKNOWN_PARTICIPANT`, a shard's session not holding the participant, is a configuration error: the same reject, Text "participant not served", and logged |
 | 35=F | Looked up by OrigClOrdID (41) in the store, then `cancel` with the stored `exchangeOrderId`, security and side. Unknown order, or 41 naming a cancel → 35=9, CxlRejReason 1. OrderID, Side or the security sent and not matching the order's → 35=9, CxlRejReason 1 |
 | 35=F before the order's first report | **Parked** (decided 2026-10-09): written to the store as a cancel row in state *parked* (§6.1), so it survives a restart, and sent when the first report brings `exchangeOrderId`. If that report is terminal, 35=9 with CxlRejReason 0, *too late* |
@@ -225,6 +238,26 @@ except a 35=j, which is never answered.
   reports it was accepted, or in a form the second run recognises (a row sent, parked or still to
   be sent). A crash between a reply and the row's update errs toward a second reply, never none.
 - **The participant is the session's** (§2), never the message's.
+- **What reaches the inbound path** (2026-10-25, slice 2b). Artio hands the library every message
+  its session layer has processed, session messages included. Session messages (35=0, 1, 2, 3, 4,
+  5, A) are Artio's and go no further. Nor does a message Artio has marked invalid
+  (`OnMessageInfo.isValid()` false: a MsgSeqNum gap it answers with a resend request, a message
+  after a Logout, one it rejected itself). The resend brings it back, PossDup, and §3.3's rows
+  handle that.
+- **The adapter's own answers** (2026-10-25, slice 2b), on the request's session, numbered by Artio:
+  - **35=8 reject of a 35=D:** OrderID (37) `NONE`, ExecID `A<sequenceIndex>.<MsgSeqNum>` of this
+    35=8 (§5.3), ExecType 8, OrdStatus 8, LeavesQty, CumQty and AvgPx 0, OrdRejReason and Text,
+    TransactTime now. Echoed from the request: ClOrdID, Side, OrderQty, Price, TimeInForce,
+    ExpireDate and the security as sent (55, 48, 22).
+  - **35=9:** ClOrdID and OrigClOrdID as sent. OrderID the order's `exchangeOrderId`, `NONE`
+    before it is acknowledged. OrdStatus the status last sent to the client, `A` (pending new)
+    before any. With CxlRejReason 1, an unknown order or one the cancel does not match, OrderID is
+    `NONE` and OrdStatus `8` (FIX 4.4's rule for 35=9). Every other refusal names the order's
+    status, never `8` for an order that may be open: the block, the collision and "exchange
+    unavailable" included. CxlRejResponseTo 1 for a 35=F, 2 for a 35=G. With OrdStatusUnknown=Y,
+    the Text is §3.4's in full, with the CumQty last stated.
+  - **35=3:** RefSeqNum, RefMsgType, RefTagID (when the decoder names one) and
+    SessionRejectReason. **35=j:** RefSeqNum, RefMsgType, BusinessRejectReason and Text.
 
 | From the SDK | To the client |
 | --- | --- |
@@ -282,6 +315,24 @@ truncates.
   duty cycle: `FixLibrary.poll`, each `OrderEntrySession.doWork`, the reportSeq store's advance
   (§6.2). There is no hand-off between threads on the order path.
 - An order is routed to the session of its security's shard, from the directory.
+- **The SDK's links run on the adapter's embedded media driver** (decided 2026-10-25, §8.6 closed):
+  the archiving driver of `fix.aeronDir` (§2) carries the gateways' UDP and the directory's
+  subscription too. One process, one driver directory. A driver fault takes FIX and the exchange
+  links down together, as they live in one process anyway. Not covered: sharing a host-wide driver
+  with other applications.
+- **The directory is polled on the order-entry thread** (2026-10-25, slice 2b), in the same duty
+  cycle. Until a complete directory has arrived, every order and cancel is refused "exchange
+  unavailable" (§3.3). The adapter's own index of it (symbol, ISIN and `securityId` to the security
+  and its shard) is rebuilt only when the directory's version changes, and looked up without
+  allocating.
+- **Where a shard's gateways come from** (decided 2026-10-25): the directory's one endpoint, unless
+  the node file lists the shard's gateways (§2), which then replace it. A co-located shard needs
+  them listed, one per node, to fail over (most-exchange Adapters.md §1). A shard's
+  `OrderEntrySession` is created when the shard first appears in a complete directory, from the
+  first directory on for those present at startup, and later for a shard added. **An endpoint that
+  changes in a later directory is logged, not followed**: the session keeps the links it was
+  created with until the adapter restarts. A shard that leaves the directory keeps its session,
+  so the orders still open on it are still reported.
 
 ### 3.6 The trading date
 
@@ -511,8 +562,9 @@ Decided 2026-10-09: **RocksDB, with the working set in memory.**
       and `expireDate`, SMP as sent, the status last sent (OrdStatus, `cumQty`, `leavesQty`), the
       cumulative notional (128-bit), the ambiguous flag, and room for §5.5's fields. A cancel: its
       order's `clOrdId`, and its state, *parked*, *sent* or *answered*;
-    - `meta`: per participant, the durable first-missing `reportSeq` and the highest
-      `sequenceIndex`.
+    - `meta`: per participant, the durable first-missing `reportSeq`, the highest
+      `sequenceIndex`, and an id collision's block, as the `sequenceIndex` it was found at
+      (§3.3; deleted when the block lifts).
 
     A row of an unknown version is refused, and the adapter does not start.
   - **Retention** (decided 2026-10-25 for ambiguous orders). A row is dropped when all hold:
@@ -672,8 +724,8 @@ The archive's recorded position (§6.2) then means durable.
   `String` on the order path, and `PriceCodec` conversions without allocation (§8.11). Recording a
   latency allocates nothing (§9.2).
 - *To specify:*
-  - one Aeron media driver for Artio and the SDK's links, or two (§8.6). The Aeron **version** is
-    the exchange's, pinned (R§2);
+  - ~~one Aeron media driver for Artio and the SDK's links, or two (§8.6)~~ **one, the embedded
+    driver** (decided 2026-10-25, §3.5). The Aeron **version** is the exchange's, pinned (R§2);
   - gateway placement (independent or co-located, most-exchange Design.md §7);
   - the native image.
 
@@ -691,7 +743,8 @@ The archive's recorded position (§6.2) then means durable.
 4. ~~35=G~~ **Rejected** (2026-10-09, §3.3).
 5. ~~Threading~~ **Decided** (2026-10-09, §3.5, §4). That one Artio engine can hand order-entry
    sessions to one library and market-data sessions to another is a spike (§8.13).
-6. Media driver topology (§7).
+6. ~~Media driver topology (§7)~~ **One driver, the adapter's embedded one** (decided 2026-10-25,
+   §3.5).
 7. ~~Market data subscription model~~ **The minimum model of §4** (2026-10-09).
 8. Trade capture (35=AE) and historical market data wait on the exchange (drop copy, TimescaleDB).
 9. ~~The store lags the ledger~~ **Decided (§6.2):** a lagging `SessionStore` in the adapter, with no
@@ -740,6 +793,18 @@ The archive's recorded position (§6.2) then means durable.
     rows already hold. The store detects it on insert and writes nothing. Only rows still held
     collide, which covers every open order, because retention keeps those. A wipe of all of Artio's
     state is also refused at startup (§3.2).
+16. **The SDK's `DirectoryClient` allocates on every broadcast cycle** (found 2026-10-25, slice 2b).
+    It stages and commits the whole table each time, new maps, `String`s and records, even when the
+    version has not changed. The broadcast repeats every 2–5 s (most-exchange
+    `discovery.intervalMs`), and the order-entry thread polls it (§3.5), so that thread is not
+    allocation-free in the steady state (§7). The adapter's own index is rebuilt only on a new
+    version. The fix belongs in most-exchange's `client` (CLAUDE.md non-negotiable 4): skip staging a
+    broadcast whose version is the live one. Not yet made.
+    - **And `OrderEntrySession` allocates per request** (read in its source 2026-10-25, not
+      measured): `send` puts a new `InFlight` object in the participant's map for every order and
+      cancel. The inbound path's 0 bytes per order (slice 2a) was measured against a model of the
+      SDK, so the whole path is not allocation-free until `client` pools them. The same change, in
+      most-exchange.
 
 ## 9. Control and metrics
 

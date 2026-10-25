@@ -299,6 +299,47 @@ class InboundOrdersTest {
         assertTrue(assertNotNull(store.find(P, 1L)).isInFlight)
     }
 
+    // ================================================================ before the directory, §3.3
+
+    @Test
+    fun `before the directory a 35=D is rejected exchange unavailable, never unknown security, and nothing is stored`() {
+        securities.isReady = false
+        order(1)
+        assertEquals(listOf<Reply>(Reply.OrderReject("ORD-1", 99, Texts.EXCHANGE_UNAVAILABLE)), replies.sent)
+        assertTrue(venue.orders.isEmpty())
+        assertNull(store.find(P, 1L), "no row: the client may retry with the same ClOrdID")
+    }
+
+    @Test
+    fun `before the directory a 35=F is rejected exchange unavailable`() {
+        order(1)
+        acknowledge("ORD-1")
+        securities.isReady = false
+        replies.sent.clear()
+        cancel(2, "ORD-1")
+        assertEquals(listOf<Reply>(Reply.CancelReject("CXL-2", "ORD-1", 99, Texts.EXCHANGE_UNAVAILABLE)), replies.sent)
+        assertTrue(venue.cancels.isEmpty())
+        assertNull(store.find(P, 2L))
+    }
+
+    @Test
+    fun `a cancel refused before the directory, for a collision or for the block names its order, so its status is stated`() {
+        // Design.md §3.3, "The adapter's own answers": never OrdStatus 8 for an order that may be open.
+        order(1)
+        acknowledge("ORD-1")
+        securities.isReady = false
+        cancel(2, "ORD-1")
+        securities.isReady = true
+        order(3, "OLD-3")
+        cancel(3, "ORD-1", "CXL-NEW") // MsgSeqNum 3 again: a collision
+        cancel(4, "ORD-1") // blocked
+        assertEquals(
+            listOf(Texts.EXCHANGE_UNAVAILABLE, Texts.SEQUENCE_RESET_REQUIRED, Texts.SEQUENCE_RESET_REQUIRED),
+            replies.sent.filterIsInstance<Reply.CancelReject>().map { it.text },
+        )
+        assertEquals(listOf<String?>("ORD-1", "ORD-1", "ORD-1"), replies.namedOrders)
+    }
+
     // ================================================================ id collision, §8.15
 
     @Test
@@ -320,6 +361,19 @@ class InboundOrdersTest {
         assertEquals(listOf<Reply>(Reply.OrderReject("NEW-6", 99, Texts.SEQUENCE_RESET_REQUIRED)), replies.sent)
         assertEquals(1, venue.orders.size, "only OLD-5 was ever sent")
         assertNull(store.find(P, 6L))
+    }
+
+    @Test
+    fun `the block is stored at the collision's sequenceIndex, and outlives a restart`() {
+        order(5, "OLD-5")
+        order(5, "NEW-5")
+        assertTrue(store.isBlocked(P))
+        assertFalse(store.liftBlock(P, 0), "found at sequenceIndex 0: only a higher one lifts it")
+        restart()
+        replies.sent.clear()
+        order(6, "NEW-6")
+        assertEquals(listOf<Reply>(Reply.OrderReject("NEW-6", 99, Texts.SEQUENCE_RESET_REQUIRED)), replies.sent)
+        assertEquals(1, venue.orders.size)
     }
 
     @Test
@@ -600,6 +654,7 @@ class InboundOrdersTest {
 
     /** Every security is ACME, found without allocating: for measuring the path, not the directory. */
     private object QuietSecurities : SecurityLookup {
+        override val isReady = true
         override fun isKnown(securityId: Int) = true
         override fun byIsin(buffer: org.agrona.DirectBuffer, offset: Int, length: Int) = ACME
         override fun bySymbol(buffer: org.agrona.DirectBuffer, offset: Int, length: Int) = ACME
@@ -608,6 +663,9 @@ class InboundOrdersTest {
     /** The directory, as §5.1 uses it: securityId, ISIN and Symbol. */
     private class SecuritiesModel : SecurityLookup {
         private val ids = mapOf(ACME to ("NL0000000001" to "ACME"), OTHER to ("NL0000000002" to "OTHER"))
+
+        /** False until a complete directory has arrived (§3.5). */
+        override var isReady = true
         override fun isKnown(securityId: Int) = securityId in ids
         override fun byIsin(buffer: org.agrona.DirectBuffer, offset: Int, length: Int): Int {
             val isin = buffer.getStringWithoutLengthAscii(offset, length)
