@@ -208,3 +208,38 @@ What it costs, and why it is acceptable:
 
 **Revisit** if off-calendar sessions turn out to be common, or when most-exchange is changed for
 another reason near `NewOrderSingle`. The sentinel then becomes the cheaper path.
+
+## 8. The dictionary is FIX 4.4's own, cut to what the adapter handles; validation is the backend's
+
+Decided with the user on 2026-10-20 (Design.md §5.4).
+
+**Where FIX 4.4 comes from.** Artio ships only a small session dictionary, so the adapter needs a
+base. Three were weighed:
+- **The FIX Trading Community's FIX 4.4 repository, cut to the message types the adapter handles,
+  each with its complete structure.** *Chosen.* Apache-2.0, the standard's own publisher, and
+  machine-readable, so the cut is a script rather than a transcription. Complete structures keep
+  Design §5.1's promise that a standard field the adapter does not read is accepted and ignored.
+- **QuickFIX/J's `FIX44.xml`.** Complete and widely used, but its licence carries an acknowledgment
+  clause and name restrictions, the shape of Apache 1.1, which the FSF holds GPL-incompatible. Not
+  worth the question in an AGPL project, and several thousand generated classes besides.
+- **Only the fields the adapter reads, unknown fields let through.** Smallest, but every other
+  tag, a misspelt custom tag included, would be dropped silently, and §5.1's accepted-and-ignored
+  standard fields would be indistinguishable from garbage.
+
+**2964=3 is a session reject, not an order reject** (against the recommendation). FIX Latest's
+CancelAggressivePassive has no exchange equivalent. Keeping it out of the dictionary lets the
+decoder's own validation refuse it, the same way as any other value outside a code set; the cost is
+that the client gets a 35=3 rather than a 35=8 on its ClOrdID.
+
+**Why validation is the backend's.** The design first assumed Artio refuses an invalid application
+message before the backend sees it. Artio 0.182 does not: `SessionParser` checks only the MsgType
+and header of a message that is not a session message, and hands the body to the library as is.
+A backend that trusted Artio would forward to the exchange a 35=D with any tag or value in it. So
+every application message is decoded and `validate()`d by the backend, and a failure is answered
+with a 35=3 from the decoder's `rejectReason` and `invalidTagId`.
+
+**Why the acceptor refuses to start without the switches.** Unknown tags are refused only with
+`-Dfix.codecs.reject_unknown_field=true`, which Artio reads once per JVM, and which is off by
+default. A launch script that forgot it would silently accept tags Design §5.4 says are refused.
+A refusal to start makes the omission loud. Its test runs in a JVM of its own
+(`:fix-session:testAcceptorGuard`), since the switch cannot be turned off inside one.

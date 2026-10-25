@@ -4,11 +4,12 @@ import io.aeron.archive.ArchiveThreadingMode
 import io.aeron.driver.MediaDriver
 import io.aeron.driver.ThreadingMode
 import io.aeron.logbuffer.ControlledFragmentHandler.Action
+import nl.lamia.most.exchange.fixadapter.codecs.FixDictionaryImpl
 import org.agrona.CloseHelper
 import org.agrona.DirectBuffer
 import uk.co.real_logic.artio.Reply
 import uk.co.real_logic.artio.builder.Encoder
-import uk.co.real_logic.artio.builder.LogonEncoder
+import nl.lamia.most.exchange.fixadapter.codecs.builder.LogonEncoder
 import uk.co.real_logic.artio.engine.EngineConfiguration
 import uk.co.real_logic.artio.engine.FixEngine
 import uk.co.real_logic.artio.library.FixLibrary
@@ -74,15 +75,7 @@ object TestSessions {
  * shared-thread driver, with one library per role claiming through [RoleClaims].
  */
 class AcceptorRig(val dir: File, val port: Int) : AutoCloseable {
-    val config: FixNodeConfig = FixNodeConfig.parse(Properties().apply {
-        setProperty("fix.bindAddress", "localhost")
-        setProperty("fix.port", port.toString())
-        setProperty("fix.logDir", File(dir, "logs").path)
-        setProperty("fix.archiveDir", File(dir, "archive").path)
-        setProperty("fix.aeronDir", File(dir, "aeron").path)
-        setProperty("fix.fileSyncLevel", "0")
-        setProperty("fix.sessionsFile", TestSessions.write(dir).path)
-    })
+    val config: FixNodeConfig = nodeConfig(dir, port)
 
     val acceptor = FixAcceptor(config) { driver, archive ->
         driver.threadingMode(ThreadingMode.SHARED).dirDeleteOnShutdown(true)
@@ -95,6 +88,17 @@ class AcceptorRig(val dir: File, val port: Int) : AutoCloseable {
 
     companion object {
         fun freePort(): Int = ServerSocket(0).use { it.localPort }
+
+        /** The rig's node configuration, on [dir]: fileSyncLevel 0, the [TestSessions]. */
+        fun nodeConfig(dir: File, port: Int): FixNodeConfig = FixNodeConfig.parse(Properties().apply {
+            setProperty("fix.bindAddress", "localhost")
+            setProperty("fix.port", port.toString())
+            setProperty("fix.logDir", File(dir, "logs").path)
+            setProperty("fix.archiveDir", File(dir, "archive").path)
+            setProperty("fix.aeronDir", File(dir, "aeron").path)
+            setProperty("fix.fileSyncLevel", "0")
+            setProperty("fix.sessionsFile", TestSessions.write(dir).path)
+        })
     }
 }
 
@@ -138,6 +142,8 @@ class Initiator(dir: File) : Polled, AutoCloseable {
         logFileDir(File(dir, "logs").path)
         logInboundMessages(false)
         logOutboundMessages(false)
+        // The adapter's dictionary on the client side too: Artio's own codecs are not on the classpath.
+        acceptorfixDictionary(FixDictionaryImpl::class.java)
         aeronContext().aeronDirectoryName(File(dir, "aeron").path)
     })
     val received = LinkedHashMap<Long, MutableList<FixMessage>>()
@@ -159,6 +165,7 @@ class Initiator(dir: File) : Polled, AutoCloseable {
         .senderCompId(targetCompId)
         .targetCompId(TestSessions.ADAPTER)
         .credentials(username, password)
+        .fixDictionary(FixDictionaryImpl::class.java)
         .resetSeqNum(reset)
         .apply {
             initialSent?.let { initialSentSequenceNumber(it) }
@@ -241,7 +248,35 @@ fun rawLogon(
     val result = logon.encode(buffer, 0)
     val bytes = ByteArray(Encoder.length(result))
     buffer.getBytes(Encoder.offset(result), bytes)
+    return rawExchange(port, bytes, *polled)
+}
 
+/** A Logon at [seqNum], now, as raw [fixMessage] bytes: for a Logon no encoder can write. */
+fun rawLogonFields(
+    senderCompId: String, targetCompId: String, username: String, password: String, seqNum: Int = 1, vararg extra: Pair<Int, String>,
+) =
+    fixMessage(
+        "A",
+        listOf(
+            49 to senderCompId, 56 to targetCompId, 34 to seqNum.toString(),
+            52 to DateTimeFormatter.ofPattern("yyyyMMdd-HH:mm:ss.SSS").withZone(ZoneOffset.UTC).format(Instant.now()),
+            98 to "0", 108 to "10", 553 to username, 554 to password,
+        ) + extra,
+    )
+
+/**
+ * A FIX 4.4 message of [msgType] with [fields] in the order given, between a correct BodyLength
+ * and CheckSum: what no encoder writes, such as a tag outside the dictionary.
+ */
+fun fixMessage(msgType: String, fields: List<Pair<Int, String>>): ByteArray {
+    val body = (listOf(35 to msgType) + fields).joinToString("") { (tag, value) -> "$tag=$value\u0001" }
+    val head = "8=FIX.4.4\u00019=${body.toByteArray(Charsets.ISO_8859_1).size}\u0001"
+    val checksum = (head + body).toByteArray(Charsets.ISO_8859_1).sumOf { it.toInt() and 0xFF } % 256
+    return "$head${body}10=${"%03d".format(checksum)}\u0001".toByteArray(Charsets.ISO_8859_1)
+}
+
+/** Writes [bytes] to a new connection and reads everything the acceptor answers until it closes it. */
+fun rawExchange(port: Int, bytes: ByteArray, vararg polled: Polled): RawReply {
     Socket().use { socket ->
         socket.connect(InetSocketAddress("localhost", port), 5_000)
         socket.soTimeout = 1

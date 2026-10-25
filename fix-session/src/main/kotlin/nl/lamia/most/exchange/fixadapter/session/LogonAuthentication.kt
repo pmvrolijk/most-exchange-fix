@@ -1,6 +1,6 @@
 package nl.lamia.most.exchange.fixadapter.session
 
-import uk.co.real_logic.artio.builder.LogoutEncoder
+import nl.lamia.most.exchange.fixadapter.codecs.builder.LogoutEncoder
 import uk.co.real_logic.artio.decoder.AbstractLogonDecoder
 import uk.co.real_logic.artio.validation.AuthenticationProxy
 import uk.co.real_logic.artio.validation.AuthenticationStrategy

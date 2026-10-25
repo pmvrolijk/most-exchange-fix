@@ -7,10 +7,10 @@ import nl.lamia.most.exchange.fixadapter.session.TestSessions.FEED_SECRET
 import nl.lamia.most.exchange.fixadapter.session.TestSessions.SECRET1
 import nl.lamia.most.exchange.fixadapter.session.TestSessions.SECRET2
 import org.junit.jupiter.api.io.TempDir
-import uk.co.real_logic.artio.OrdType
+import nl.lamia.most.exchange.fixadapter.codecs.OrdType
 import uk.co.real_logic.artio.Reply
-import uk.co.real_logic.artio.Side
-import uk.co.real_logic.artio.builder.NewOrderSingleEncoder
+import nl.lamia.most.exchange.fixadapter.codecs.Side
+import nl.lamia.most.exchange.fixadapter.codecs.builder.NewOrderSingleEncoder
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -104,5 +104,26 @@ class LogonTest {
         // The same Logon, byte for byte, with what the session is configured with: let in.
         val accepted = rawLogon(port, CLIENT1, ADAPTER, "client1", SECRET1, *all)
         assertEquals("A", accepted.messages.firstOrNull()?.msgType, "the control case: $accepted")
+    }
+
+    @Test
+    fun `a Logon carrying a tag the dictionary does not define is rejected in the session's sequence, and not let in`() = rig { rig, _, all ->
+        // Design.md §5.4: unknown tags are refused, and the switch is Artio's, for its session messages too.
+        val refused = rawExchange(port, rawLogonFields(CLIENT1, ADAPTER, "client1", SECRET1, 1, 9999 to "X"), *all)
+        println("a Logon with 9999=X: $refused")
+        assertEquals(listOf("3"), refused.messages.map { it.msgType }, "a session Reject and nothing else: $refused")
+        val reject = refused.messages.single()
+        assertEquals("1", reject[45], "RefSeqNum: the Logon's")
+        assertEquals("9999", reject[371], "RefTagID")
+        assertEquals("0", reject[373], "SessionRejectReason: invalid tag number")
+        assertEquals(1, reject.seqNum, "in the session's sequence: the credentials were good")
+        assertTrue(refused.closed, "then the connection is closed: $refused")
+        pollFor(200, *all)
+        assertEquals(emptyList(), rig.orderEntry.announced + rig.marketData.announced, "the session reaches no library")
+
+        // A rejected message has used its MsgSeqNum, on both sides: the client goes on at 2.
+        val accepted = rawExchange(port, rawLogonFields(CLIENT1, ADAPTER, "client1", SECRET1, 2), *all)
+        assertEquals("A", accepted.messages.firstOrNull()?.msgType, "the same Logon without the tag, at 2: $accepted")
+        assertEquals(2, accepted.messages.first().seqNum, "the adapter's 35=3 used its 1")
     }
 }

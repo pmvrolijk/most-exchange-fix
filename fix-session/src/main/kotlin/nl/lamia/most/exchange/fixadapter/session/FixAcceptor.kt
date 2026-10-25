@@ -4,6 +4,7 @@ import io.aeron.archive.Archive
 import io.aeron.archive.ArchivingMediaDriver
 import io.aeron.archive.client.AeronArchive
 import io.aeron.driver.MediaDriver
+import nl.lamia.most.exchange.fixadapter.codecs.FixDictionaryImpl
 import org.agrona.CloseHelper
 import uk.co.real_logic.artio.engine.EngineConfiguration
 import uk.co.real_logic.artio.engine.FixEngine
@@ -27,6 +28,10 @@ class FixAcceptor(
     val sessions: ConfiguredSessions = ConfiguredSessions.load(config.sessionsFile),
     configureDriver: (MediaDriver.Context, Archive.Context) -> Unit = { _, _ -> },
 ) : AutoCloseable {
+
+    init {
+        CodecValidation.require()
+    }
 
     private val driver: ArchivingMediaDriver = MediaDriver.Context()
         .aeronDirectoryName(config.aeronDir)
@@ -58,6 +63,8 @@ class FixAcceptor(
                 // Artio's default resets sequence numbers at every logon (Design §2).
                 sessionPersistenceStrategy(SessionPersistenceStrategy.alwaysPersistent())
                 authenticationStrategy(LogonAuthentication(sessions))
+                // The adapter's dictionary (Design §5.4); the engine hands it to each library with the session.
+                acceptorfixDictionary(FixDictionaryImpl::class.java)
                 aeronContext().aeronDirectoryName(config.aeronDir)
                 aeronArchiveContext()
                     .aeronDirectoryName(config.aeronDir)
