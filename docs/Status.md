@@ -3,10 +3,17 @@
 Where the adapter stands, what is open, and what to do next. **This is the session entry point** —
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
-Last updated 2026-10-20. **`fix-session` is implemented: the acceptor (2026-10-15) and the FIX
-dictionary (2026-10-20). `order-entry` and `market-data` are still scaffolds.** 2026-10-20: the
-dictionary is FIX 4.4's own, cut to the handled message types, and Artio was found not to validate
-application messages, so the backend must (CLAUDE.md non-negotiable 9, Design §5.4, Rationale §8).
+Last updated 2026-10-25. **`fix-session` is implemented: the acceptor (2026-10-15) and the FIX
+dictionary (2026-10-20). `order-entry` has its order store (2026-10-25, slice 1 of §3 item 5);
+the rest of it and `market-data` are still to build.** 2026-10-20: the dictionary is FIX 4.4's own,
+cut to the handled message types, and Artio was found not to validate application messages, so the
+backend must (CLAUDE.md non-negotiable 9, Design §5.4, Rationale §8).
+
+Decided 2026-10-25 (Design §3.2, §6.1), each the recommendation:
+- **The store is keyed by `participantId`,** not Artio's session id, which a wipe of Artio's state
+  can change, and the `sequenceIndex` guard with it.
+- **A cancel has its own row,** pointing at its order. Parked is a state of that row.
+- **An ambiguous order is retained like an open one** until a report or an operator settles it.
 
 Decided 2026-10-09 (Design.md, Rationale §3–§7, CLAUDE.md non-negotiable 1 extended, 7–8 new):
 - **Goals:** low latency, stateful, guaranteed delivery of execution reports, the minimum that
@@ -60,8 +67,8 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 3 — `fix-session`, `order-entry`, `market-data`; packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); 1 each in `order-entry` and `market-data`. `./gradlew build` green 2026-10-20. The 15 spikes (`:spikes:test`) last ran 2026-10-15 |
-| Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182 |
+| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 17 (16 the store's); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15 |
+| Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
 
@@ -86,6 +93,9 @@ Each changes what gets built (`decision-fork`):
    - the media driver topology (§8.6);
    - ~~the `OrdStatusUnknown` tag number and the exact 2964 code set~~ **5001; 1 and 2 only, 3 a
      session reject** (2026-10-20, §5.4).
+   - **an id collision** (§8.15, found 2026-10-25): what the client sees when Artio's state was
+     wiped at `sequenceIndex` 0 and derived `clOrdId`s repeat. The store detects it; the policy is
+     slice 2's, below.
    - ~~Unverified assumptions the design rests on~~ **All four hold** (spikes, 2026-10-15, §8.13).
      They left three decisions, all made:
      - ~~how the adapter finds its library's `RecordingPos`~~ **from Aeron's public counters**, by
@@ -137,7 +147,7 @@ parallel with item 2.
      and `RoleClaims`. 22 tests. The Logon tests use a real initiator, and the refusals are read
      byte for byte off a raw socket. Five mutations, each caught: password unchecked, any session's
      username, claim without replay, role ignored, transient sequence numbers.
-   - ~~**The dictionary**~~ **Done 2026-10-20**, uncommitted (Design §5.4, Rationale §8):
+   - ~~**The dictionary**~~ **Done 2026-10-20** (`bf23666`; Design §5.4, Rationale §8):
      `fix44-most.xml`, cut from the FIX Trading Community's FIX 4.4 repository (Apache-2.0) by
      `extract_fix44.py`, and generated into `...fixadapter.codecs` by the Gradle task
      `generateFixCodecs`. Artio's session codecs are off `fix-session`'s classpath. 2362 String,
@@ -150,12 +160,41 @@ parallel with item 2.
      sides' MsgSeqNum 1 is used, so the client's next Logon is 2.
    - **Left for later:** the session schedule (§8.2); market data messages join the dictionary
      with item 7.
-5. **`order-entry`:** 35=D/35=F through `OrderEntrySession`, stamped with the session's
-   participant, and 35=8 back. Every inbound message is decoded and `validate()`d first, a
-   failure answered with 35=3; a message type outside the dictionary gets 35=j, reason 3
-   (non-negotiable 9, Design §5.4). The fates are mapped per CLAUDE.md non-negotiable 1, tested
-   spec-first. Then this repo's **e2e**, against most-exchange's real processes. That is the first
-   test of `OrderEntrySession` through a real failover (most-exchange Status §3, item 13(a)).
+5. **`order-entry`**, in slices, each tested spec-first. The store first, because every other
+   slice writes to it:
+   1. ~~**The order store**~~ **Done 2026-10-25**, uncommitted (Design §6.1, §3.2):
+      `...orderentry.store`: `OrderStore` (RocksDB, `orders` and `meta` column families in one
+      database, WAL unsynced, point-in-time recovery), `RequestRow` (pooled), `RowCodec`
+      (version 1) and `ClOrdIdHasher`. 16 tests. Among them:
+      - a WAL torn in the middle comes back as a prefix;
+      - 10,000 lookups and updates allocate 0 bytes, measured with `ThreadMXBean`;
+      - a forced hash collision is never a false duplicate.
+
+      13 mutations, each caught: two weaker WAL recovery modes, the ClOrdID byte compare skipped,
+      four retention conditions, settled requests restored in flight, a collision reported as
+      *same*, the guard off by one, an unknown row version read, an insert not written, one
+      ClOrdID namespace for all participants. Found: RocksDB drops the rest of a 32 KiB WAL block
+      after a bad checksum in every mode, so the WAL test had to write past it before it could tell
+      the modes apart.
+      - **Not done here:** retention runs at `load` only. Dropping at the trading-date roll waits
+        for the calendar (§3.6). Nothing reads Artio's `sequenceIndex` into the guard yet: that is
+        the wiring, slice 2. `fix.*` has no store path yet: it joins the node file with slice 2.
+   2. **Inbound:** 35=D/35=F through `OrderEntrySession`, stamped with the session's participant.
+      Every message is decoded and `validate()`d first, a failure answered with 35=3. A message
+      type outside the dictionary gets 35=j, reason 3 (non-negotiable 9, Design §5.4). The insert
+      outcomes become FIX: duplicate → OrdRejReason 6; PossDup *same* → dropped; *same* after
+      back-pressure → resent; **id collision → decide §8.15 first**. Also 35=G rejected,
+      `BACK_PRESSURED` → `ABORT`, the parked cancel, the store path in the node file and the
+      `sequenceIndex` guard at library connect.
+   3. **Outbound:** `onReport` → 35=8/35=9 (§5.3), and the fates per CLAUDE.md non-negotiable 1.
+      Also AvgPx from the 128-bit notional, the "missing from a completed mass status" rule
+      (§3.4), and `restoreInFlight` from `OrderStore.forEachInFlight`.
+   4. **Delivery** (§6.2–§6.3): the lagging `SessionStore` over `OrderStore.saveFirstMissing`,
+      the `RecordingPos` lookup at each library connect, and reports held from a disconnect until
+      `requestSession` is back.
+   5. **35=H and 35=AF** from the store. Then this repo's **e2e**, against most-exchange's real
+      processes. That is the first test of `OrderEntrySession` through a real failover
+      (most-exchange Status §3, item 13(a)).
 6. **Tooling** (Design §10): the paced FIX sender and the HTML latency report, with service and
    response time per outcome. Then a baseline measurement (`perf-claim`).
 7. **`market-data`:** 35=y from the directory, then 35=V/W/X from `DepthFeedAssembler`.

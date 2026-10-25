@@ -4,4 +4,5 @@
 dependencies {
     implementation(project(":fix-session"))
     implementation(libs.most.client)
+    implementation(libs.rocksdb)
 }

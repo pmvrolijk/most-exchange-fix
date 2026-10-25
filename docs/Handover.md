@@ -132,3 +132,46 @@ measured.**
 
 **The check:** none possible yet. The design's load-bearing assumptions about Artio and Aeron
 Archive are listed as spikes (Design §8.13), and are unverified.
+
+### 2d. The order store (`order-entry`, slice 1), 2026-10-25
+
+**The problem.** Every other part of `order-entry` writes to the store: the inbound path, reports,
+fates, delivery, 35=H/AF. Design §6.1 described it, but going through it before writing code
+turned up three places where it was underspecified or would defeat itself.
+
+**Decided with the user** (each the recommendation, Design §3.2, §6.1):
+- **Keyed by `participantId`, not Artio's session id.** A wipe of Artio's state, which the
+  `sequenceIndex` guard exists to catch, can also change the session id. A guard keyed by it then
+  finds nothing stored, and lets the adapter start.
+- **A cancel has its own row.** A sent cancel needs its own ClOrdID for 11 on its 35=8/35=9, and
+  after a restart it goes back to the SDK with `restoreInFlight` like an order. Parked is now a
+  state of the cancel row.
+- **An ambiguous order is retained like an open one.**
+
+**Found without needing a decision:**
+- **The `sequenceIndex` guard misses a wipe at index 0,** the normal case for a session never
+  reset. The store reports an *id collision* on insert and writes nothing. What the client sees is
+  open (Design §8.15), for slice 2.
+- **A settled request is not restored in flight.** Handing back an order whose `AMBIGUOUS` 35=8
+  is owed could get it settled `NEVER_SEQUENCED` by a startup resend that completes.
+- **Retention also waits for the reports:** a row is dropped only once its last `reportSeq` is
+  below the participant's durable first-missing, so a resend cannot bring a report for a dropped
+  row.
+
+**Built:** `nl.lamia.most.exchange.fixadapter.orderentry.store`:
+- `OrderStore`: RocksDB with `orders` and `meta` in one database (one WAL), WAL unsynced,
+  `PointInTimeRecovery`, direct-buffer puts;
+- the in-memory maps per participant, by `clOrdId`, and by ClOrdID hash with a byte-compared chain;
+- `RequestRow`, pooled; `RowCodec`, version 1 with explicit codes; `ClOrdIdHasher` (FNV-1a plus
+  Murmur's finaliser).
+
+rocksdbjni 11.8.1.
+
+**The check.** `OrderStoreTest`, 16 tests, written from the clauses first. All passed on the first
+run, so 13 mutations followed. One was not caught at first: `SkipAnyCorruptedRecords` passed the
+torn-WAL test. RocksDB's log reader drops the rest of a 32 KiB block after a bad checksum in every
+mode, so the third row, written in the same block, was lost either way. The test now writes 100 KB
+between the torn record and the last one, and catches both weaker modes tried
+(`SkipAnyCorruptedRecords`, `TolerateCorruptedTailRecords`). The allocation
+test measured 0 bytes over 10,000 lookups and updates (`ThreadMXBean`, after a 20,000-cycle warm-up)
+on this laptop. That is a count of bytes, not a latency.

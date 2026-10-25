@@ -183,8 +183,14 @@ orders, IOC and FOK, replace (35=G), and any value the exchange cannot carry (§
   session's lifetime, and the session is one participant. Nothing has to be persisted to allocate
   it. A PossDup resend of the same message carries the same MsgSeqNum and so derives the same
   `clOrdId`. Any 35=D can be found again in Artio's archive by its `clOrdId`.
-- **Guard:** the store keeps the highest `sequenceIndex` seen per session. If Artio starts with a
-  lower one (its state was wiped), the adapter refuses to start. Derived ids would otherwise repeat.
+- **Guard:** the store keeps the highest `sequenceIndex` seen per participant (its one session,
+  keyed by `participantId`, not Artio's session id, which a wipe can change: decided 2026-10-25).
+  If Artio starts with a lower one (its state was wiped), the adapter refuses to start. Derived ids
+  would otherwise repeat.
+  - **The guard misses a wipe at `sequenceIndex` 0**, the normal case for a session never reset
+    (found 2026-10-25). The store catches the repeat itself: a new request whose `clOrdId` is held
+    by a row with a different FIX ClOrdID is an **id collision** (§6.1). What the client then sees
+    is open (§8.15).
 - **FIX ClOrdID (11)** is unique per session for the trading day, and for as long as the order is
   open. A new 35=D reusing a known one is rejected with OrdRejReason 6, *duplicate order*.
 - **`exchangeOrderId`** is kept from the first report (Adapters.md §2) and sent back as OrderID (37).
@@ -418,18 +424,37 @@ The order store's row is versioned so the fields can be added (§6.1).
 | State | Why | Where |
 | --- | --- | --- |
 | FIX session sequence numbers, every message in and out | FIX resend on reconnect, offline delivery | Artio's archive and replay index, **fsynced** (§6.4) |
-| Per order: FIX ClOrdID ↔ `clOrdId` ↔ `exchangeOrderId`, and what the client was told | Answering, cancelling, uniqueness for the day, 35=H/AF | **RocksDB** plus an in-memory working set (§6.1, decided 2026-10-09) |
+| Per request (an order or a cancel): FIX ClOrdID ↔ `clOrdId` ↔ `exchangeOrderId`, and what the client was told | Answering, cancelling, uniqueness for the day, 35=H/AF, `restoreInFlight` | **RocksDB** plus an in-memory working set (§6.1, decided 2026-10-09) |
 | Per participant: first `reportSeq` not yet durably delivered | Resume with a resend after a restart | RocksDB, **advanced only behind the archive** (§6.2) |
-| Per session: highest `sequenceIndex` | The derived-id guard (§3.2) | RocksDB |
+| Per participant (its one session): highest `sequenceIndex` | The derived-id guard (§3.2) | RocksDB |
 
 ### 6.1 The order store
 
 Decided 2026-10-09: **RocksDB, with the working set in memory.**
 
-- **In memory:** Agrona maps on the order-entry thread, keyed by `clOrdId` and by FIX ClOrdID. The
-  ClOrdID is hashed from the message's bytes, so a lookup allocates nothing. Every read is served
-  from here.
-- **RocksDB:** a row per order, written on the library thread. The WAL is **not fsynced**, so a write
+- **A row per request, an order or a cancel** (decided 2026-10-25). A cancel has its own row, which
+  points at its order's `clOrdId`. Its 35=8 or 35=9 needs the cancel's own ClOrdID (§5.3), and after
+  a restart a sent, unanswered cancel goes back to the SDK with `restoreInFlight` like an order.
+  A **parked** cancel (§3.3) is a cancel row in state *parked*, so it still survives a restart. Both
+  kinds share the session's ClOrdID namespace, so ClOrdID uniqueness covers cancels too.
+- **Keyed by `participantId`**, not Artio's session id (decided 2026-10-25). It is configured one to
+  one with a session (§2), it does not change when Artio's state is wiped (§3.2), and every report
+  carries it.
+- **In memory:** Agrona maps on the order-entry thread, keyed by (`participantId`, `clOrdId`) and by
+  (`participantId`, FIX ClOrdID). The ClOrdID is hashed from the message's bytes and compared byte
+  for byte along the hash's chain, so a lookup allocates nothing and a hash collision is never a
+  false duplicate. Every read is served from here.
+- **Inserting a request** reports one of:
+  - *new*: written;
+  - *same*: the same `clOrdId` with the same ClOrdID, the very request again (a redelivery after
+    back-pressure, or a PossDup resend). The row is left as it is;
+  - *duplicate ClOrdID*: another of the participant's rows holds the ClOrdID (§3.2, OrdRejReason 6
+    for an order);
+  - *id collision*: another ClOrdID holds the `clOrdId`. Artio's sequence went back without its
+    `sequenceIndex` rising (§3.2). Nothing is written.
+
+  What each means to the client is the backend's (§3.3); the store only reports it.
+- **RocksDB:** a row per request, written on the library thread. The WAL is **not fsynced**, so a write
   survives a process crash but not a host crash. That is enough, because everything a host crash
   can lose from RocksDB can be rebuilt from Artio's fsynced archive, or errs toward re-delivery
   (R§4).
@@ -441,18 +466,33 @@ Decided 2026-10-09: **RocksDB, with the working set in memory.**
     (§6.2) is written after the row updates it covers, so if it survived, they did too. The
     argument that the WAL need not be fsynced depends on this (R§4). It must stay configured, and a
     test must hold it.
-  - **Column families:**
-    - `orders`: (`sessionId`, `clOrdId`) → a versioned row: FIX ClOrdID, `exchangeOrderId`,
-      security, side, price, `origQty`, `cumQty`, cumulative notional, `expireDate`, SMP, the
-      status last sent, the last `reportSeq`, a parked cancel, the ambiguous flag, and room for
-      §5.5's fields;
-    - `meta`: per participant, the durable first-missing `reportSeq`; per session, the highest
+  - **Column families**, in one database, so they share one WAL and one prefix:
+    - `orders`: (`participantId`, `clOrdId`) → a versioned row. Every row: its kind, FIX ClOrdID,
+      the trading date it was entered on, the last `reportSeq`, and a fate's 35=8 owed (§6.2). An
+      order: `exchangeOrderId` once acknowledged, security, side, price, `origQty`, TimeInForce
+      and `expireDate`, SMP as sent, the status last sent (OrdStatus, `cumQty`, `leavesQty`), the
+      cumulative notional (128-bit), the ambiguous flag, and room for §5.5's fields. A cancel: its
+      order's `clOrdId`, and its state, *parked*, *sent* or *answered*;
+    - `meta`: per participant, the durable first-missing `reportSeq` and the highest
       `sequenceIndex`.
-  - **Retention:** terminal orders until the end of their trading day, for ClOrdID uniqueness.
-    Open GTC and GTD orders until terminal, across days.
-- **At startup:** load open orders and today's terminal ones into memory. Hand the rows with no
-  report to the SDK with `restoreInFlight` (§3.4). Then the SDK's resend and mass status reconcile
-  them. If a report names a `clOrdId` the store does not have (its row was lost in a
+
+    A row of an unknown version is refused, and the adapter does not start.
+  - **Retention** (decided 2026-10-25 for ambiguous orders). A row is dropped when all hold:
+    - it was entered before the current trading date (ClOrdID uniqueness is for the day);
+    - it is finished: an order in a terminal state (OrdStatus 2, 4, C or 8) and not ambiguous, or
+      a cancel answered;
+    - no fate's 35=8 is owed on it;
+    - its last `reportSeq` is below the participant's durable first-missing, so no resend can
+      bring a report for it again.
+
+    So open GTC and GTD orders are kept until terminal, across days, and an **ambiguous order is
+    kept like an open one** until a report or an operator settles it (§3.4).
+- **At startup:** drop what retention allows, and load the rest into memory. Hand the requests in
+  flight, orders not acknowledged and cancels *sent*, to the SDK with `restoreInFlight` (§3.4).
+  Not handed back: a parked cancel, which was never sent, and a request the SDK already settled
+  (a fate's 35=8 owed, or sent: an order rejected or ambiguous). Restored, it could be settled
+  again, an `AMBIGUOUS` order as `NEVER_SEQUENCED` by a startup resend that completes. Then the SDK's resend and mass status
+  reconcile them. If a report names a `clOrdId` the store does not have (its row was lost in a
   host crash), its 35=D is read back from Artio's archive by (`sequenceIndex`, MsgSeqNum).
 
 ### 6.2 Execution report delivery: consume a report only behind the archive
@@ -656,6 +696,12 @@ The archive's recorded position (§6.2) then means durable.
       decided 2026-10-15).
 14. ~~Unsolicited status after a restart~~ **Only when it changes what the client was told**
     (2026-10-09, §3.3).
+15. **An id collision** (found 2026-10-25, §3.2, §6.1). Artio's state wiped at `sequenceIndex` 0,
+    and a client starting again from MsgSeqNum 1, derive `clOrdId`s that rows already hold. The store
+    detects it on insert and writes nothing. Open, for `order-entry`'s inbound slice: what the client
+    sees (a reject, a 35=3, a Logout), and whether the session or the adapter stops until an operator
+    acts. Only rows still held collide, which covers every open order, because retention keeps
+    those.
 
 ## 9. Control and metrics
 
