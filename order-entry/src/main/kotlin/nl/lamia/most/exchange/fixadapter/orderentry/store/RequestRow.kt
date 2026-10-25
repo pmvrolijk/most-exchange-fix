@@ -81,6 +81,18 @@ class RequestRow internal constructor() {
     var fixClOrdIdLength = 0
         private set
 
+    // In memory only, never stored.
+
+    /**
+     * This process wrote the row but its send did not go out (back-pressured, Design.md §3.3): the
+     * same request delivered again is sent. False after a restart, when a stored request may have
+     * been sent, and a request sent twice is two orders under one `clOrdId`.
+     */
+    var sendPending = false
+
+    /** An order's cancel parked or sent, and not yet answered (§3.3). Rebuilt by [OrderStore.load]. */
+    var pendingCancel: RequestRow? = null
+
     // The store's bookkeeping.
     internal var hash = 0L
     internal var nextSameHash: RequestRow? = null
@@ -163,6 +175,8 @@ class RequestRow internal constructor() {
         origClOrdId = 0L
         cancelState = CancelState.SENT
         fixClOrdIdLength = 0
+        sendPending = false
+        pendingCancel = null
         hash = 0L
         nextSameHash = null
         stored = false

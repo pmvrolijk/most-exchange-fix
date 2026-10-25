@@ -6,3 +6,9 @@ dependencies {
     implementation(libs.most.client)
     implementation(libs.rocksdb)
 }
+
+tasks.test {
+    // As the adapter runs: the acceptor refuses to start without it (Design.md §5.4), and the inbound
+    // path's 35=3 for an unknown tag depends on it.
+    systemProperty("fix.codecs.reject_unknown_field", "true")
+}

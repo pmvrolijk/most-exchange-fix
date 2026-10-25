@@ -106,6 +106,11 @@ class OrderStore private constructor(
         } finally {
             drop.close()
         }
+        forEach { row ->
+            if (row.kind == RowKind.CANCEL && row.cancelState != CancelState.ANSWERED) {
+                find(row.participantId, row.origClOrdId)?.pendingCancel = row
+            }
+        }
         return size
     }
 

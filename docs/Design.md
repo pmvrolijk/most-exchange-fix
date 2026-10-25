@@ -189,23 +189,42 @@ orders, IOC and FOK, replace (35=G), and any value the exchange cannot carry (§
   would otherwise repeat.
   - **The guard misses a wipe at `sequenceIndex` 0**, the normal case for a session never reset
     (found 2026-10-25). The store catches the repeat itself: a new request whose `clOrdId` is held
-    by a row with a different FIX ClOrdID is an **id collision** (§6.1). What the client then sees
-    is open (§8.15).
+    by a row with a different FIX ClOrdID is an **id collision** (§6.1). The request is rejected and
+    the session logged out until an operator resets its sequence (§3.3, decided 2026-10-25).
+  - **And at startup** (decided 2026-10-25): a configured order-entry session Artio does not know
+    at all, while the store holds rows or a `sequenceIndex` for its participant, means Artio's state
+    was wiped. The adapter refuses to start.
 - **FIX ClOrdID (11)** is unique per session for the trading day, and for as long as the order is
   open. A new 35=D reusing a known one is rejected with OrdRejReason 6, *duplicate order*.
 - **`exchangeOrderId`** is kept from the first report (Adapters.md §2) and sent back as OrderID (37).
 
 ### 3.3 Messages
 
+**Every inbound application message** is decoded and `validate()`d first (§5.4). A failure is a
+35=3 and goes no further. A type order entry does not handle gets 35=j, BusinessRejectReason 3,
+except a 35=j, which is never answered.
+
 | In | Handling |
 | --- | --- |
 | 35=D | Validated (§5.1), written to the order store, then `newOrder`. `BACK_PRESSURED` → `Action.ABORT` |
-| 35=D, PossDup=Y | If its ClOrdID is known, it is a duplicate and is dropped. Otherwise it is processed as new |
-| 35=F | Looked up by OrigClOrdID (41) in the store, then `cancel` with the stored `exchangeOrderId`, security and side. Unknown order → 35=9, CxlRejReason 1 |
-| 35=F before the order's first report | **Parked** (decided 2026-10-09): written onto the order's row, so it survives a restart, and sent when the first report brings `exchangeOrderId`. If that report is terminal, 35=9 with CxlRejReason 0, *too late* |
+| 35=D, ClOrdID known | Another of the session's rows holds the ClOrdID: 35=8, OrdRejReason 6. With PossDup=Y it is dropped instead: a resend of a request already answered |
+| 35=D or 35=F, the same request again | Its derived `clOrdId` and its ClOrdID are already stored together (§6.1, *same*): a back-pressure redelivery, a PossDup resend, or a claim's replay (§2). **Sent again only if this process's own send of it did not go out**, back-pressured. Otherwise dropped. The engine does not check `clOrdId` (most-exchange Adapters.md §2): sent twice, it would be two orders under one id |
+| 35=D or 35=F, an id collision | Another ClOrdID holds the derived `clOrdId` (§3.2, §6.1). **Decided 2026-10-25** (§8.15): answered locally, 35=8 OrdRejReason 99 or 35=9 CxlRejReason 99, Text "session sequence reset required", never sent. Then a Logout with that Text. The session's Logons are refused until an operator resets its sequence, which raises its `sequenceIndex` (§9.1). Its open orders are untouched. Counted, and alertable (§9.2) |
+| 35=D or 35=F, the SDK cannot send | `NOT_READY` (the opening mass status has not finished) or `NO_GATEWAY`. **Decided 2026-10-25: rejected**, 35=8 OrdRejReason 99 or 35=9 CxlRejReason 99, Text "exchange unavailable". Never sent, so the client may retry with a new ClOrdID. Not held: an `ABORT` that lasts stalls every order-entry session, heartbeats included. `UNKNOWN_PARTICIPANT`, a shard's session not holding the participant, is a configuration error: the same reject, Text "participant not served", and logged |
+| 35=F | Looked up by OrigClOrdID (41) in the store, then `cancel` with the stored `exchangeOrderId`, security and side. Unknown order, or 41 naming a cancel → 35=9, CxlRejReason 1. OrderID, Side or the security sent and not matching the order's → 35=9, CxlRejReason 1 |
+| 35=F before the order's first report | **Parked** (decided 2026-10-09): written to the store as a cancel row in state *parked* (§6.1), so it survives a restart, and sent when the first report brings `exchangeOrderId`. If that report is terminal, 35=9 with CxlRejReason 0, *too late* |
+| 35=F, a cancel already pending | **Decided 2026-10-25:** another cancel of the order is parked or sent → 35=9, CxlRejReason 3, *already pending*. The first stands. Once it is answered, a new cancel is accepted |
+| 35=F, the order terminal | 35=9, CxlRejReason 0, *too late*, answered locally |
+| 35=F, the order ambiguous | Answered locally (§3.4) |
 | 35=G | **Rejected:** 35=9 with CxlRejResponseTo 2 and CxlRejReason 2, Text "replace not supported" (decided 2026-10-09: the exchange has no replace, and the adapter does minimum) |
 | 35=H | Answered from the order store with a 35=8, ExecType I. The exchange has no per-order status query |
 | 35=AF | Answered from the order store: one 35=8 ExecType I per open order, with MassStatusReqID, TotNumReports and LastRptRequested. The store is exact, because it is reconciled by the SDK's own mass status at startup and after each reconnect |
+
+- **A reply Artio refuses** (back-pressured) aborts the inbound message (`Action.ABORT`), which
+  Artio delivers again. Every path is safe to run again: state changes only after the reply that
+  reports it was accepted, or in a form the second run recognises (a row sent, parked or still to
+  be sent). A crash between a reply and the row's update errs toward a second reply, never none.
+- **The participant is the session's** (§2), never the message's.
 
 | From the SDK | To the client |
 | --- | --- |
@@ -333,6 +352,25 @@ than 8 significant decimals is **rejected, not rounded**. The conversion must be
 
 Standard FIX 4.4 header and body fields not listed here are accepted and ignored. Account (1) is
 among them until §5.5.
+
+**The refusals' codes** (2026-10-25). Each is a 35=8, ExecType 8, OrdStatus 8, answered locally and
+never sent. No row is written, so the ClOrdID is not reserved. The Text is fixed, so a client can
+match on it:
+
+| Refused | OrdRejReason | Text |
+| --- | --- | --- |
+| Neither 48 nor 55; 48 without 22, or 22 other than 4 and 8; a security the directory does not know | 1 | "unknown security" |
+| 38 absent, not exact at 8 decimals, or ≤ 0 | 13 | "incorrect quantity" |
+| 40 other than 2 | 99 | "limit orders only" |
+| 44 absent | 99 | "price required" |
+| 44 not exact at 8 decimals | 99 | "price not exact at 8 decimals" |
+| 54 other than 1 and 2 | 99 | "side 1 or 2 only" |
+| 59 other than 0, 1 and 6 | 99 | "time in force 0, 1 or 6 only" |
+| 59=6 without 432, or 432 not a YYYYMMDD date | 99 | "ExpireDate required for GTD" |
+| 2362 not a positive `int64` | 99 | "SelfMatchPreventionID must be a positive integer" |
+
+The dictionary leaves 55, 38 and 44 optional, as FIX 4.4 does, so these are the backend's checks,
+not `validate()`'s.
 
 ### 5.2 OrderCancelRequest (35=F) → `OrderCancelRequest`
 
@@ -696,12 +734,12 @@ The archive's recorded position (§6.2) then means durable.
       decided 2026-10-15).
 14. ~~Unsolicited status after a restart~~ **Only when it changes what the client was told**
     (2026-10-09, §3.3).
-15. **An id collision** (found 2026-10-25, §3.2, §6.1). Artio's state wiped at `sequenceIndex` 0,
-    and a client starting again from MsgSeqNum 1, derive `clOrdId`s that rows already hold. The store
-    detects it on insert and writes nothing. Open, for `order-entry`'s inbound slice: what the client
-    sees (a reject, a 35=3, a Logout), and whether the session or the adapter stops until an operator
-    acts. Only rows still held collide, which covers every open order, because retention keeps
-    those.
+15. ~~**An id collision**~~ **Rejected, then a Logout; Logons refused until an operator resets the
+    session's sequence** (decided 2026-10-25, §3.3). Found 2026-10-25 (§3.2, §6.1): Artio's state
+    wiped at `sequenceIndex` 0, and a client starting again from MsgSeqNum 1, derive `clOrdId`s that
+    rows already hold. The store detects it on insert and writes nothing. Only rows still held
+    collide, which covers every open order, because retention keeps those. A wipe of all of Artio's
+    state is also refused at startup (§3.2).
 
 ## 9. Control and metrics
 

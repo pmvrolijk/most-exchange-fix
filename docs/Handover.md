@@ -175,3 +175,57 @@ between the torn record and the last one, and catches both weaker modes tried
 (`SkipAnyCorruptedRecords`, `TolerateCorruptedTailRecords`). The allocation
 test measured 0 bytes over 10,000 lookups and updates (`ThreadMXBean`, after a 20,000-cycle warm-up)
 on this laptop. That is a count of bytes, not a latency.
+
+### 2e. Order entry's inbound logic (slice 2a), 2026-10-25
+
+**The problem.** Slice 2 turns a FIX 35=D, 35=F or 35=G into a request on its way to the exchange,
+or an answer given here. Design §3.3 and §5.1 left four things open:
+- what a client sees on an id collision (§8.15);
+- what it sees when the SDK cannot send;
+- what a second cancel gets;
+- the codes for the §5.1 refusals.
+
+**Decided with the user** (each the recommendation, Design §3.2, §3.3):
+- **An id collision** is rejected (35=8 OrdRejReason 99, or 35=9 CxlRejReason 99, "session sequence
+  reset required"), then the session is logged out. Its Logons are refused until an operator
+  resets its sequence. Also refused: a start with a configured session Artio does not know while
+  the store holds rows for its participant.
+- **`NOT_READY` and `NO_GATEWAY` reject**, "exchange unavailable". Holding them with `ABORT` would
+  stall the library's poll for every order-entry session, heartbeats included, for as long as the
+  exchange is unreachable.
+- **A second cancel while one is pending** gets CxlRejReason 3.
+
+**Taken without asking**, written into Design §5.1 for review:
+- the refusal codes: 1 for the security, 13 for the quantity, 99 with a fixed Text otherwise;
+- `UNKNOWN_PARTICIPANT` is answered "participant not served";
+- a cancel whose OrderID, Side or security does not match its order gets CxlRejReason 1.
+
+**From the contract** (most-exchange Adapters.md §2): the engine does not check `clOrdId`. So the
+same request delivered again is forwarded only when this process's own send of it did not go out
+(`RequestRow.sendPending`, in memory only). A replay after a restart, and a PossDup resend, are
+dropped.
+
+**Built:** `nl.lamia.most.exchange.fixadapter.orderentry.inbound`:
+- `InboundOrders`;
+- `FixParse` (a positive `int64` and a LocalMktDate, read in place);
+- the ports `OrderVenue`, `SecurityLookup`, `ClientReplies`, and `Texts`.
+
+The store gained `sendPending` and `pendingCancel`. The second, an order's link to its pending
+cancel, is rebuilt at load.
+
+**The check.** `InboundOrdersTest`, 32 tests, against a model of the SDK's `SendResult`s, a
+directory model, and a reply recorder that can refuse as a back-pressured Artio does. Two failed on
+the first run:
+- a tag outside the dictionary passed `validate()`. Order-entry's test JVM lacked Artio's
+  `reject_unknown_field` switch; the test task now sets it;
+- the allocation test measured 72 bytes per order. That was the test's own directory model, which
+  builds a `String` per lookup. With a model that allocates nothing, the JVM still allocated in
+  rare bursts (640 bytes once in 10,000 orders), so the test now asserts that one window of 2,000
+  orders in five allocates 0 bytes. An allocation per order would show in every window.
+
+22 mutations, 21 caught. The one not caught (dropping `!order.acknowledged` from the OrderID
+match) is equivalent: an order not acknowledged has `exchangeOrderId` 0, which no parsed OrderID
+equals.
+
+**Not real yet:** nothing here has met Artio's `Session` or the SDK's `OrderEntrySession`. That is
+2b, with a real initiator. 35=H and 35=AF answer 35=j until slice 5.

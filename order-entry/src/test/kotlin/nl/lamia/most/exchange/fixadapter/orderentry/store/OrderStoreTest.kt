@@ -10,6 +10,7 @@ import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertSame
@@ -319,6 +320,30 @@ class OrderStoreTest {
         val inFlight = mutableSetOf<Pair<Long, Long>>()
         restart().forEachInFlight { row -> inFlight += row.participantId to row.clOrdId }
         assertEquals(setOf(P1 to 1L, P2 to 3L, P1 to 4L), inFlight)
+    }
+
+    @Test
+    fun `after a restart an order links to its pending cancel, parked or sent, never an answered one`() {
+        val s = open()
+        s.insert(s.order(P1, 1L, "ord-parked"))
+        s.insert(s.order(P1, 2L, "ord-sent") { acknowledged = true })
+        s.insert(s.order(P1, 3L, "ord-answered") { acknowledged = true })
+        s.insert(s.cancel(P1, 11L, "cxl-parked", origClOrdId = 1L) { cancelState = CancelState.PARKED })
+        s.insert(s.cancel(P1, 12L, "cxl-sent", origClOrdId = 2L))
+        s.insert(s.cancel(P1, 13L, "cxl-answered", origClOrdId = 3L) { cancelState = CancelState.ANSWERED })
+
+        val again = restart()
+        assertEquals(11L, again.find(P1, 1L)?.pendingCancel?.clOrdId)
+        assertEquals(12L, again.find(P1, 2L)?.pendingCancel?.clOrdId)
+        assertNull(again.find(P1, 3L)?.pendingCancel)
+    }
+
+    @Test
+    fun `whether a send is still owed is this process's alone, and is not stored`() {
+        val s = open()
+        s.insert(s.order(P1, 1L, "ORD-1") { sendPending = true })
+        assertTrue(s.find(P1, 1L)!!.sendPending)
+        assertFalse(restart().find(P1, 1L)!!.sendPending, "after a restart a stored request may have been sent")
     }
 
     // ---------------------------------------------------------------- meta: first missing, sequenceIndex

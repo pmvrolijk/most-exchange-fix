@@ -4,8 +4,9 @@ Where the adapter stands, what is open, and what to do next. **This is the sessi
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
 Last updated 2026-10-25. **`fix-session` is implemented: the acceptor (2026-10-15) and the FIX
-dictionary (2026-10-20). `order-entry` has its order store (2026-10-25, slice 1 of §3 item 5);
-the rest of it and `market-data` are still to build.** 2026-10-20: the dictionary is FIX 4.4's own,
+dictionary (2026-10-20). `order-entry` has its order store and its inbound logic (2026-10-25,
+slices 1 and 2a of §3 item 5), not yet wired to Artio or the SDK; the rest of it and `market-data`
+are still to build.** 2026-10-20: the dictionary is FIX 4.4's own,
 cut to the handled message types, and Artio was found not to validate application messages, so the
 backend must (CLAUDE.md non-negotiable 9, Design §5.4, Rationale §8).
 
@@ -14,6 +15,12 @@ Decided 2026-10-25 (Design §3.2, §6.1), each the recommendation:
   can change, and the `sequenceIndex` guard with it.
 - **A cancel has its own row,** pointing at its order. Parked is a state of that row.
 - **An ambiguous order is retained like an open one** until a report or an operator settles it.
+- **An id collision** (§8.15) is rejected, then the session is logged out, and its Logons are
+  refused until an operator resets its sequence. A configured session Artio does not know, while
+  the store holds rows for its participant, refuses the start.
+- **`NOT_READY` and `NO_GATEWAY` reject** a 35=D or 35=F, "exchange unavailable". They are not
+  held: a lasting `ABORT` stalls every order-entry session, heartbeats included.
+- **A second cancel while one is pending** is a 35=9, CxlRejReason 3.
 
 Decided 2026-10-09 (Design.md, Rationale §3–§7, CLAUDE.md non-negotiable 1 extended, 7–8 new):
 - **Goals:** low latency, stateful, guaranteed delivery of execution reports, the minimum that
@@ -67,7 +74,7 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 3 — `fix-session`, `order-entry`, `market-data`; packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 17 (16 the store's); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15 |
+| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 51 (the store 18, the inbound path 32); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -93,9 +100,7 @@ Each changes what gets built (`decision-fork`):
    - the media driver topology (§8.6);
    - ~~the `OrdStatusUnknown` tag number and the exact 2964 code set~~ **5001; 1 and 2 only, 3 a
      session reject** (2026-10-20, §5.4).
-   - **an id collision** (§8.15, found 2026-10-25): what the client sees when Artio's state was
-     wiped at `sequenceIndex` 0 and derived `clOrdId`s repeat. The store detects it; the policy is
-     slice 2's, below.
+   - ~~an id collision~~ **rejected, Logout, Logons refused until reset** (2026-10-25, §8.15).
    - ~~Unverified assumptions the design rests on~~ **All four hold** (spikes, 2026-10-15, §8.13).
      They left three decisions, all made:
      - ~~how the adapter finds its library's `RecordingPos`~~ **from Aeron's public counters**, by
@@ -162,7 +167,7 @@ parallel with item 2.
      with item 7.
 5. **`order-entry`**, in slices, each tested spec-first. The store first, because every other
    slice writes to it:
-   1. ~~**The order store**~~ **Done 2026-10-25**, uncommitted (Design §6.1, §3.2):
+   1. ~~**The order store**~~ **Done 2026-10-25** (`9304363`; Design §6.1, §3.2):
       `...orderentry.store`: `OrderStore` (RocksDB, `orders` and `meta` column families in one
       database, WAL unsynced, point-in-time recovery), `RequestRow` (pooled), `RowCodec`
       (version 1) and `ClOrdIdHasher`. 16 tests. Among them:
@@ -179,13 +184,33 @@ parallel with item 2.
       - **Not done here:** retention runs at `load` only. Dropping at the trading-date roll waits
         for the calendar (§3.6). Nothing reads Artio's `sequenceIndex` into the guard yet: that is
         the wiring, slice 2. `fix.*` has no store path yet: it joins the node file with slice 2.
-   2. **Inbound:** 35=D/35=F through `OrderEntrySession`, stamped with the session's participant.
-      Every message is decoded and `validate()`d first, a failure answered with 35=3. A message
-      type outside the dictionary gets 35=j, reason 3 (non-negotiable 9, Design §5.4). The insert
-      outcomes become FIX: duplicate → OrdRejReason 6; PossDup *same* → dropped; *same* after
-      back-pressure → resent; **id collision → decide §8.15 first**. Also 35=G rejected,
-      `BACK_PRESSURED` → `ABORT`, the parked cancel, the store path in the node file and the
-      `sequenceIndex` guard at library connect.
+   2. **Inbound**, in two parts:
+      - ~~**2a, the logic**~~ **Done 2026-10-25**, uncommitted (Design §3.3, §5.1, §5.2):
+        `...orderentry.inbound`: `InboundOrders` (a FIX message → a request on its way, or an
+        answer given here), `FixParse`, and the ports it is wired through, `OrderVenue`,
+        `SecurityLookup` and `ClientReplies`. The store gained two in-memory fields, `sendPending`
+        and `pendingCancel` (rebuilt at load). 32 tests, against a model of the SDK's `SendResult`s
+        and of the directory. Among them: every §5.1 refusal with its code and Text; the same
+        request sent once only, across back-pressure, PossDup and a restart; a reject Artio refuses
+        never leaving the client with both a reject and an order; the id collision; every cancel
+        case. One window of 2,000 orders decoded, validated, stored and sent allocates 0 bytes.
+        22 mutations, 21 caught. The one not caught is equivalent: an order not acknowledged has
+        `exchangeOrderId` 0, which no parsed OrderID equals.
+        - **Found:** order-entry's test JVM lacked `-Dfix.codecs.reject_unknown_field=true`, so a
+          tag outside the dictionary passed `validate()`. The adapter's JVM has it, because the
+          acceptor refuses to start without it; the test task now sets it too. Artio's `decode()`
+          does not reset a decoder, so the path resets before each one.
+        - **Not right yet:** 35=H and 35=AF get a 35=j "unsupported message type" until slice 5
+          answers them from the store. Design §3.3 says they are answered.
+      - **2b, the wiring.** `ClientReplies` on Artio's `Session`: the 35=3, 35=j, 35=8 and 35=9
+        encoders, ExecID `A<sequenceIndex>.<MsgSeqNum>` and OrderID for a local reject. The
+        order-entry library's `SessionHandler` calling `InboundOrders`. `OrderVenue` over one
+        `OrderEntrySession` per shard. `SecurityLookup` over `DirectoryClient`, with an
+        allocation-free byte index of symbols and ISINs (its own maps allocate a `String`). The
+        store path in the node file. The two guards: `requireSequenceIndex` at each claim, and the
+        startup refusal for a session Artio does not know (§3.2). The id collision's Logon refusal,
+        persisted. Tested against a real Artio initiator. The trading calendar (§3.6) is still to
+        build: the inbound path takes the trading date as a supplier.
    3. **Outbound:** `onReport` → 35=8/35=9 (§5.3), and the fates per CLAUDE.md non-negotiable 1.
       Also AvgPx from the 128-bit notional, the "missing from a completed mass status" rule
       (§3.4), and `restoreInFlight` from `OrderStore.forEachInFlight`.
