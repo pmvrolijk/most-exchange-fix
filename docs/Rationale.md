@@ -100,7 +100,9 @@ publication.
 
 **Why RocksDB need not be fsynced when the archive is.** Every RocksDB write is one of these:
 - a row the 35=D can rebuild, and Artio's archive holds the 35=D, found by the derived `clOrdId`
-  (R§5);
+  (R§5). **Not so, found 2026-10-26** (R§12, Design §8.20): the library handles a 35=D before
+  the archive has fsynced it, so a host crash can lose both. The rest of this argument stands;
+  this bullet holds only for a 35=D the archive had reached;
 - the durable `reportSeq`, which, if lost, goes *back*, and so means a resend and a duplicate the
   deterministic ExecID lets the client drop;
 - the `sequenceIndex` guard, which Artio's own state restates.
@@ -369,3 +371,60 @@ alternative, comparing them with the new connection's counter when it extends th
 rests on Aeron's recording extension keeping one position space, which no spike checked. Frozen
 until a restart, the error is a longer resend and more rows retained, never a report consumed
 unarchived.
+
+## 12. Recovery of lost rows: replayed by the startup request, rebuilt in flight
+
+Decided 2026-10-26, each the recommendation; Design §6.1, §8.17, §8.20. From Artio 0.182's source,
+then verified the same day by `RecoveryReplaySpikeTest` (f) and (g).
+
+**Why the startup `requestSession`, not `FixArchiveScanner`.** The adapter already requests every
+session offline before the bind (§6.3), and Artio's engine replays archived inbound messages to an
+offline session from any (`sequenceIndex`, MsgSeqNum) it is asked for. The messages arrive through
+the handler that already decodes them, and only those past the store's prefix are read. The scanner
+needs its own Aeron and archive clients and reads a recording from its start. It would also see the
+adapter's own answers, which the replay does not; the next paragraph is why that is not needed.
+Recovering lazily, per report naming an unknown `clOrdId`, needs the scanner anyway, and never finds
+a request that was sent and never answered: it would get no `restoreInFlight`, so no fate, which is an
+unknown status the client is never told.
+
+**Why rebuilt in flight, and a second reject accepted.** What the inbound path decides from the
+message and the store, it decides again the same way. What it decided from the directory or the
+gateway cannot be decided again: the directory is not there at startup, and what a gateway said is
+not in the inbound archive. Treating every such request as sent errs only one way. The fence settles
+a request the exchange never sequenced as a reject, and a sequenced one comes back with its reports,
+because the durable `reportSeq` is older than any row that is lost (RocksDB recovers a prefix, R§4).
+A request first rejected here then gets a second reject with the same ClOrdID, which a client can
+read as a duplicate. The other way, reading the adapter's answers back from the outbound archive,
+avoids that at the cost of the scanner and a matcher from replies to requests. Never resent, because
+the exchange does not check `clOrdId` uniqueness: a resent recovered order would be a second order.
+
+**A gap found in R§4, confirmed by spike (g).** R§4 says every row RocksDB can lose is rebuilt from the
+35=D in Artio's archive. That holds only if the archive has the 35=D before the order goes out. The
+library reads the engine's inbound stream directly, and nothing in Artio waits for the archive's
+fsync first. So a host crash after the send can lose the 35=D from the archive as well as the row.
+The client's next Logon finds a gap, its PossDup resend finds no row, and the order is sent a second
+time under the same `clOrdId`. Every candidate fix costs something: gating the send on the archive's
+position adds an fsync to every order; holding a PossDup with no row until its shard's resend has
+surfaced every sequenced `clOrdId` ties the client to the exchange's availability. So it was
+confirmed by a spike first, and is designed after. The spike found it is not a corner: at
+`fileSyncLevel=1`, every one of 500 35=Ds paced one at a time was handled before the archive's
+recorded position passed it.
+
+**The fix: send only once archived** (decided 2026-10-26, the recommendation; Design §6.1, §8.20).
+The adapter already waits for the archive before it consumes a report (R§4, R§11); this is the same
+rule for the other direction. A request reaches the exchange only once its 35=D or 35=F is fsynced,
+so R§4's first bullet holds again: a row a host crash takes is either rebuilt from the archive
+(§8.17) or belongs to a request that never left, which the client's resend may send. The send moves
+off the message callback into the duty cycle. Held in the callback with `ABORT`, each order would
+stall the library's whole inbound stream for one fsync, every session's heartbeats with it, and
+orders would go out one fsync apart. From the duty cycle they go out in arrival order, in batches,
+as far as the recorded position has reached. That also changes non-negotiable 2: a back-pressured
+send is retried from the row, not by Artio redelivering the message.
+
+The rejected options each cost more where it matters. An fsync of RocksDB per order blocks the
+library thread, every session behind it. The exchange checking `clOrdId` would put the guarantee
+where it arguably belongs, but adds state to the matching path and changes the contract (most-exchange
+Adapters.md §2). Fencing a PossDup with no row needs `restoreInFlight` after the SDK has started, and
+rejects a lawful resend of a request that never went out. What sending once archived costs is the
+archive's fsync on every order's path: not measured yet, and no figure is given without
+`perf-claim`.

@@ -2,9 +2,8 @@ package nl.lamia.most.exchange.fixadapter.orderentry.outbound
 
 import nl.lamia.most.exchange.client.OrderFate
 import nl.lamia.most.exchange.client.ReportAction
-import nl.lamia.most.exchange.client.SendResult
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.StatusUnknownText
-import nl.lamia.most.exchange.fixadapter.orderentry.inbound.OrderVenue
+import nl.lamia.most.exchange.fixadapter.orderentry.inbound.ArchivedSends
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.Texts
 import nl.lamia.most.exchange.fixadapter.orderentry.store.CancelState
 import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
@@ -24,8 +23,9 @@ import org.agrona.collections.Long2LongHashMap
  *
  * - **A report** is applied only once its 35=8 (or 35=9) was taken; refused, it is aborted and
  *   delivered again, with nothing changed (§6.2).
- * - **Fates, the mass status rule's restatements, and parked cancels** are owed on their rows and
- *   worked off in [doWork], so a refusal never undoes a report already taken.
+ * - **Fates, the mass status rule's restatements, refused sends, and parked cancels** are owed on
+ *   their rows and worked off in [doWork], so a refusal never undoes a report already taken. A
+ *   parked cancel let go is sent by [sends], once the archive has its 35=F (§6.1).
  * - **Behind the archive** (§6.2): a sequenced report's row is written at once, and [Delivery]
  *   holds its `reportSeq` back until the archive has the 35=8. Anything with no `reportSeq` has its
  *   row written only once the archive has it, since a crash before then could otherwise leave a
@@ -36,7 +36,7 @@ import org.agrona.collections.Long2LongHashMap
 class OutboundReports(
     private val store: OrderStore,
     private val clients: ClientReports,
-    private val venue: OrderVenue,
+    private val sends: ArchivedSends,
     private val delivery: Delivery,
     private val log: (String) -> Unit = {},
 ) {
@@ -277,6 +277,15 @@ class OutboundReports(
 
     // ------------------------------------------------------------------ fates and the mass status, §3.3, §3.4
 
+    /**
+     * A request the SDK would not send (§3.3, §6.1): its reject is owed on the row as a
+     * `NEVER_SEQUENCED` fate with [text], so it is no longer in flight. The Text is in memory only.
+     */
+    fun refuse(row: RequestRow, text: String) {
+        row.owedText = text
+        onSettled(row.participantId, row.clOrdId, OrderFate.NEVER_SEQUENCED)
+    }
+
     /** The SDK settled a request that had no report: its answer is owed on the row (§6.2). */
     fun onSettled(participantId: Long, clOrdId: Long, fate: OrderFate) {
         val row = store.find(participantId, clOrdId)
@@ -359,7 +368,7 @@ class OutboundReports(
                 e.ordRejReason = OTHER
                 e.cumQty = 0L
                 e.leavesQty = 0L
-                e.text(Texts.NOT_SEQUENCED_ORDER)
+                e.text(order.owedText ?: Texts.NOT_SEQUENCED_ORDER)
             }
             OrderFate.AMBIGUOUS -> restateUnknown(e, order)
         }
@@ -373,6 +382,7 @@ class OutboundReports(
             OrderFate.AMBIGUOUS -> order.ambiguous = true
         }
         order.owed = null
+        order.owedText = null
         // Stored still owing until the archive has the answer: a crash before then gives it again.
         delivery.writeWhenArchived(order, position)
         owePendingCancel(order)
@@ -394,7 +404,7 @@ class OutboundReports(
         r.reset(cancel, order)
         r.cxlRejReason = OTHER
         when (fate) {
-            OrderFate.NEVER_SEQUENCED -> r.text(Texts.NOT_SEQUENCED_CANCEL)
+            OrderFate.NEVER_SEQUENCED -> r.text(cancel.owedText ?: Texts.NOT_SEQUENCED_CANCEL)
             OrderFate.AMBIGUOUS -> {
                 r.statusUnknown = true
                 r.text(Texts.CANCEL_STATUS_UNKNOWN)
@@ -403,12 +413,14 @@ class OutboundReports(
         val position = clients.send(r)
         if (position <= 0L) return false
         cancel.owed = null
+        cancel.owedText = null
         answered(cancel, order, 0L, position)
         return true
     }
 
     /** A parked cancel whose order has had its first report (§3.3): sent, or answered here. */
     private fun actOnParked(cancel: RequestRow, order: RequestRow): Boolean {
+        if (cancel.sendPending) return true // queued once, on its way: the exchange answers it
         val r = cancelReject
         when {
             order.ambiguous -> {
@@ -425,23 +437,9 @@ class OutboundReports(
                 r.text(Texts.TOO_LATE)
             }
             !order.acknowledged -> return true // not yet: queued again by the order's first report
-            else -> return when (venue.cancel(cancel.participantId, cancel.clOrdId, order.clOrdId, order.exchangeOrderId, order.securityId, order.side)) {
-                SendResult.SENT -> {
-                    cancel.cancelState = CancelState.SENT
-                    store.update(cancel)
-                    true
-                }
-                SendResult.BACK_PRESSURED -> false
-                SendResult.NOT_READY, SendResult.NO_GATEWAY, SendResult.UNKNOWN_PARTICIPANT -> {
-                    if (!clients.canSend(cancel.participantId)) return false
-                    r.reset(cancel, order)
-                    r.cxlRejReason = OTHER
-                    r.text(Texts.EXCHANGE_UNAVAILABLE)
-                    val position = clients.send(r)
-                    if (position <= 0L) return false
-                    answered(cancel, order, 0L, position)
-                    true
-                }
+            else -> {
+                sends.send(cancel)
+                return true
             }
         }
         val position = clients.send(r)

@@ -88,7 +88,7 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 3 — `fix-session`, `order-entry`, `market-data`; packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 152 (the store 21, the inbound path 37, the outbound path 29, AvgPx 5, delivery 12, the report sessions 11, the directory index 7, the config 5, the backend end to end 24, SDK wiring 1); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15 |
+| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 164 (the store 21, the inbound path 44, the outbound path 34, AvgPx 5, delivery 12, the report sessions 11, the directory index 7, the config 5, the backend end to end 24, SDK wiring 1); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 3 on 2026-10-26 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -282,7 +282,7 @@ parallel with item 2.
       - **Not done here:** a client logged out still holds its gateway's whole report stream
         (`ABORT`) until slice 4. A row lost in a host crash is not recovered (§8.17). The 35=8's
         own allocation through Artio was not measured.
-   4. ~~**Delivery**~~ **Done 2026-10-25**, uncommitted (Design §6.1–§6.3, §8.18–§8.19; Rationale
+   4. ~~**Delivery**~~ **Done 2026-10-25** (`e80df98`; Design §6.1–§6.3, §8.18–§8.19; Rationale
       §11; CLAUDE.md non-negotiable 7). `delivery.ReportDelivery`, the lagging `SessionStore`, one
       view per shard: the stored first-missing is the lowest of the SDK's ceiling, the lowest
       `reportSeq` whose 35=8 the archive has not reached, and a library reconnect's floor.
@@ -307,9 +307,50 @@ parallel with item 2.
         dropped connection can still have a MsgSeqNum reused: counted, not prevented (§8.19). The
         35=8's allocation through Artio was not measured. A row lost in a host crash is still not
         recovered (§8.17), which is next.
-   - **Then recovery of lost rows** (Design §8.17): at startup, the archive's inbound 35=D/F past
-     the store's last row run through the inbound path without sending. A look at Artio's archive
-     scanning first.
+   - **Then recovery of lost rows** (Design §8.17, §8.20; Rationale §12). Shape decided
+     2026-10-26, each the recommendation: the startup offline `requestSession` replays from the
+     store's last row + 1; a replayed request is never sent or answered; one that passes validation
+     and has no row is rebuilt in flight and settled by the fence (a second reject is possible for a
+     request first rejected here); its shard resolved once the directory arrives.
+     **Spiked 2026-10-26** (`RecoveryReplaySpikeTest`, 3 tests): (f) the offline replay works as
+     read, across a 141=Y reset, acquired before its messages; (g) **the gap in R§4 is real**: all
+     500 35=Ds were handled before the fsynced archive had them, so after a host crash a client's
+     PossDup resend of a lost 35=D is sent to the exchange a second time (Design §8.20).
+     **Decided 2026-10-26: a request is sent only once the archive has its 35=D/F** (Design §6.1,
+     §8.20; R§12; CLAUDE.md non-negotiable 2 changed, 11 new). The send moves into the duty cycle,
+     from the row. Built in two parts:
+     - ~~**4b, send behind the archive**~~ **Done 2026-10-26**, uncommitted (Design §3.3, §6.1,
+       §8.20). `inbound.ArchivedSends`: rows to send, in arrival order, from the duty cycle, once
+       `artio.InboundRecording` (the `RecordingPos` of the engine's one inbound publication) has
+       passed the message's position; a back-pressured send holds those behind it; a refused one
+       goes to `OutboundReports.refuse`, a `NEVER_SEQUENCED` fate with the refusal's Text (in
+       memory). `InboundOrders` takes the position and no longer sends. A parked cancel goes through
+       the same queue at its own 35=F's position; one loaded at startup goes at once. Tests 164
+       (+13 new, 3 rewritten, 1 removed: a refused reject no longer aborts the 35=D). 14 mutations,
+       13 caught; the 14th was a guard that could never fire, now removed. Spike (f) also checks
+       the startup replay is complete when its reply is.
+       - **Not done here:** the latency it adds is not measured (`perf-claim`). most-exchange's
+         Adapters.md (line 49) still describes this adapter's back-pressure as `Action.ABORT`.
+         No end-to-end test can hold the archive back, so the gate is proven in unit tests and by
+         the mutations, and the wiring by orders still flowing end to end.
+     - **4c, recovery of lost rows** (§8.17). The plan, from the code as it stands:
+       - `requestAtStartup` replays from each participant's high-water + 1: the highest `clOrdId`
+         it has held, (`sequenceIndex`, MsgSeqNum). Retention drops rows, so a participant whose
+         rows were all dropped would otherwise replay its whole history: **to confirm**, the
+         highest `clOrdId` dropped kept in `meta` as a floor, written at `load` before the drops
+         (a prefix keeps it below the truth). `SEQUENCE_NUMBER_TOO_HIGH` (nothing past it) is a
+         success here, as after a disconnect.
+       - While a participant's startup request is out, its messages go to the inbound path in
+         recovery mode: never sent, never answered (a `ClientReplies` that swallows). Spike (f)
+         checks that the reply completes only after the replay.
+       - Recovery mode re-decides what the message and the store decide (`validate()`, §5.1's
+         field checks, a duplicate ClOrdID, the block, the cancel's order, its Side and OrderID).
+         The rest is rebuilt in flight: an order not acknowledged, a cancel *sent* whatever its
+         order's state, so a recovered request is never sent again.
+       - The security is resolved once the directory arrives, from a copy of the message kept in
+         memory, before the shard sessions are created and `restoreInFlight` runs. **To confirm**:
+         a recovered order whose security the directory does not know is refused, OrdRejReason
+         99 "unknown security", through `refuse`.
    5. **35=H and 35=AF** from the store (until then they get a 35=j, "unsupported message type",
       against Design §3.3). Then this repo's **e2e**, against most-exchange's real
       processes. That is the first test of `OrderEntrySession` through a real failover

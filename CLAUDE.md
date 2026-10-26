@@ -39,9 +39,10 @@ modules: `fix-session` (the acceptor, logon and routing by role), and `order-ent
    SDK never delivers it as a report. Only `NEVER_SEQUENCED` may become a reject or a resend.
    An ambiguous order is restated with its last status and OrdStatusUnknown=Y, never as rejected,
    cancelled, expired or Done for Day. (most-exchange Adapters.md §3–§4, Design.md §3.4) → R§6
-2. **Back-pressure is not loss.** `SendResult.BACK_PRESSURED` maps to Artio's `Action.ABORT`, so the
-   FIX message is redelivered and not consumed. Never drop it, and never spin on it on the library
-   thread.
+2. **Back-pressure is not loss.** A `SendResult.BACK_PRESSURED` request stays on its row, to send,
+   and the duty cycle tries it again; a FIX message is consumed only once its row is stored. A reply
+   Artio refuses aborts its inbound message (`Action.ABORT`), which is redelivered. Never drop
+   either, and never spin on it on the library thread. (Design.md §3.3, §6.1) → R§12
 3. **Prices and quantities are fixed-point `int64` with 8 implied decimals** on the exchange side.
    FIX decimals are converted with the SDK's `PriceCodec`, never through `Double`.
 4. **Exchange-facing logic lives in most-exchange's `client`**, never here. That covers connecting,
@@ -80,6 +81,11 @@ modules: `fix-session` (the acceptor, logon and routing by role), and `order-ent
     Both stop at the handler. And **reset an Artio encoder before every use**: its view, buffer and
     `byte[]` setters wrap the caller's bytes, and a later copying setter writes into them.
     (Design.md §3.3) → R§9
+11. **A request goes to the exchange only once the archive has its 35=D or 35=F.** The send is the
+    duty cycle's, from the row, once the `RecordingPos` of the engine's inbound stream has passed the
+    message's position. Never from the message callback: the library sees a 35=D before the archive
+    has fsynced it, and the exchange does not check `clOrdId`, so a host crash would turn the client's
+    PossDup resend into a second order. (Design.md §6.1, §8.20) → R§12
 
 ## Provenance
 

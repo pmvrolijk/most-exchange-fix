@@ -3,6 +3,11 @@ package nl.lamia.most.exchange.fixadapter.orderentry.inbound
 import io.aeron.logbuffer.ControlledFragmentHandler.Action
 import nl.lamia.most.exchange.client.SendResult
 import nl.lamia.most.exchange.fixadapter.codecs.Constants
+import nl.lamia.most.exchange.fixadapter.orderentry.outbound.ArchiveModel
+import nl.lamia.most.exchange.fixadapter.orderentry.outbound.OutboundReports
+import nl.lamia.most.exchange.fixadapter.orderentry.outbound.RecordingClient
+import nl.lamia.most.exchange.fixadapter.orderentry.outbound.Sent8
+import nl.lamia.most.exchange.fixadapter.orderentry.outbound.Sent9
 import nl.lamia.most.exchange.fixadapter.orderentry.store.CancelState
 import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
 import nl.lamia.most.exchange.fixadapter.orderentry.store.RequestRow
@@ -24,8 +29,10 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * Order entry's inbound path (Design.md §3.3, §5.1, §5.2, §5.4), against a model of the SDK's
- * session (most-exchange Adapters.md §2: its `SendResult`s) and of the directory.
+ * Order entry's inbound path (Design.md §3.3, §5.1, §5.2, §5.4) and its sends, made once the archive
+ * has the request's 35=D/F (§6.1, §8.20; CLAUDE.md non-negotiables 2 and 11), against a model of the
+ * SDK's session (most-exchange Adapters.md §2: its `SendResult`s) and of the directory. A refused
+ * send is answered by the outbound path, which runs here as it does in the adapter.
  */
 class InboundOrdersTest {
 
@@ -38,11 +45,26 @@ class InboundOrdersTest {
     private val securities = SecuritiesModel()
     private val collisions = mutableListOf<Long>()
     private lateinit var inbound: InboundOrders
+    private lateinit var sends: ArchivedSends
+    private lateinit var outbound: OutboundReports
+
+    /** What the outbound path sent the client: the answers to refused sends. */
+    private val client = RecordingClient()
+
+    /** The engine's inbound stream: each delivered message's position, and how far the archive has recorded it. */
+    private var position = 0L
+    private var recorded = -1L
 
     @BeforeTest
     fun open() {
         store = OrderStore.open(dir).also { it.load(TODAY) }
-        inbound = InboundOrders(store, venue, securities, { TODAY }, { collisions += it })
+        // A new process: a new inbound publication, its recording not yet found.
+        position = 0L
+        recorded = -1L
+        sends = ArchivedSends(store, venue, { recorded }) { row, text -> outbound.refuse(row, text) }
+        outbound = OutboundReports(store, client, sends, ArchiveModel(store))
+        outbound.recover()
+        inbound = InboundOrders(store, venue, securities, { TODAY }, sends, { collisions += it })
         venue.store = store
     }
 
@@ -55,9 +77,35 @@ class InboundOrdersTest {
         open()
     }
 
-    private fun deliver(type: String, seq: Int, fields: List<Pair<Int, String>>, possDup: Boolean = false, sequenceIndex: Int = 0): Action {
+    /** Delivers a message; with [archived], the archive then records it and a duty cycle runs. */
+    private fun deliver(
+        type: String, seq: Int, fields: List<Pair<Int, String>>, possDup: Boolean = false, sequenceIndex: Int = 0, archived: Boolean = true,
+    ): Action {
         val bytes = fix(type, seq, fields, possDup)
-        return inbound.onMessage(P, replies, sequenceIndex, MessageTypeEncoding.packMessageType(type), UnsafeBuffer(bytes), 0, bytes.size)
+        position += 256L
+        val action = inbound.onMessage(P, replies, sequenceIndex, MessageTypeEncoding.packMessageType(type), UnsafeBuffer(bytes), 0, bytes.size, position)
+        if (archived) archive()
+        return action
+    }
+
+    /** The archive records every message delivered so far, then a duty cycle runs. */
+    private fun archive() {
+        recorded = position
+        cycle()
+    }
+
+    private fun cycle() {
+        sends.doWork()
+        outbound.doWork()
+    }
+
+    /** What the outbound path answered, as (ClOrdID, OrdStatus or CxlRejReason, Text). */
+    private fun answered(): List<Triple<String, Any?, String?>> = client.sent.map {
+        when (it) {
+            is Sent8 -> Triple(it.clOrdId, it.ordStatus to it.ordRejReason, it.text)
+            is Sent9 -> Triple(it.clOrdId, it.cxlRejReason, it.text)
+            else -> error("$it")
+        }
     }
 
     /** [base] with each of [extra] replacing its tag's value, [OMIT] removing it, or appended. */
@@ -67,11 +115,12 @@ class InboundOrdersTest {
             extra.filter { (tag, value) -> base.none { it.first == tag } && value != OMIT }
     }
 
-    private fun order(seq: Int, clOrdId: String = "ORD-$seq", vararg extra: Pair<Int, String>, possDup: Boolean = false): Action =
-        deliver("D", seq, fields(listOf(11 to clOrdId, 55 to "ACME", 54 to "1", 60 to TIME, 38 to "10", 40 to "2", 44 to "100.25"), extra), possDup)
+    private fun order(seq: Int, clOrdId: String = "ORD-$seq", vararg extra: Pair<Int, String>, possDup: Boolean = false, archived: Boolean = true): Action =
+        deliver("D", seq, fields(listOf(11 to clOrdId, 55 to "ACME", 54 to "1", 60 to TIME, 38 to "10", 40 to "2", 44 to "100.25"), extra), possDup, archived = archived)
 
-    private fun cancel(seq: Int, origClOrdId: String, clOrdId: String = "CXL-$seq", vararg extra: Pair<Int, String>, possDup: Boolean = false): Action =
-        deliver("F", seq, fields(listOf(41 to origClOrdId, 11 to clOrdId, 55 to "ACME", 54 to "1", 60 to TIME), extra), possDup)
+    private fun cancel(
+        seq: Int, origClOrdId: String, clOrdId: String = "CXL-$seq", vararg extra: Pair<Int, String>, possDup: Boolean = false, archived: Boolean = true,
+    ): Action = deliver("F", seq, fields(listOf(41 to origClOrdId, 11 to clOrdId, 55 to "ACME", 54 to "1", 60 to TIME), extra), possDup, archived = archived)
 
     /** The exchange acknowledged the order: what slice 3's report handling will write. */
     private fun acknowledge(clOrdId: String, exchangeOrderId: Long = 9001L, status: Char = '0') {
@@ -226,15 +275,19 @@ class InboundOrdersTest {
     }
 
     @Test
-    fun `a back-pressured order is aborted, and sent once when Artio delivers it again`() {
+    fun `a back-pressured send stays on its row and the duty cycle tries it again, while Artio's message is consumed`() {
+        // Non-negotiable 2: back-pressure is not loss; the FIX message is consumed once its row is stored.
         venue.next(SendResult.BACK_PRESSURED)
-        assertEquals(Action.ABORT, order(1))
+        assertEquals(Action.CONTINUE, order(1))
         val row = assertNotNull(store.find(P, 1L), "the row is written before the send")
         assertTrue(row.sendPending)
-        assertEquals(Action.CONTINUE, order(1))
+        assertEquals(Action.CONTINUE, order(1, archived = false), "the same message again sends nothing itself")
+        assertEquals(listOf(SendResult.BACK_PRESSURED), venue.orders.map { it.result })
+        cycle()
         assertEquals(listOf(SendResult.BACK_PRESSURED, SendResult.SENT), venue.orders.map { it.result })
         assertFalse(row.sendPending)
         assertTrue(replies.sent.isEmpty())
+        assertTrue(client.sent.isEmpty())
     }
 
     @Test
@@ -271,11 +324,12 @@ class InboundOrdersTest {
             assertFalse(row.isInFlight, "$result: never sent, so nothing for the SDK to settle")
             assertFalse(row.sendPending)
         }
+        // From the duty cycle, through the outbound path (§6.1): 35=8 OrdStatus 8, OrdRejReason 99.
         assertEquals(
-            listOf<Reply>(Reply.OrderReject("ORD-1", 99, Texts.EXCHANGE_UNAVAILABLE), Reply.OrderReject("ORD-2", 99, Texts.EXCHANGE_UNAVAILABLE)),
-            replies.sent,
+            listOf(Triple("ORD-1", '8' to 99, Texts.EXCHANGE_UNAVAILABLE), Triple("ORD-2", '8' to 99, Texts.EXCHANGE_UNAVAILABLE)),
+            answered(),
         )
-        replies.sent.clear()
+        assertTrue(replies.sent.isEmpty())
         order(3, "ORD-1")
         assertEquals(listOf<Reply>(Reply.OrderReject("ORD-1", 6, Texts.DUPLICATE_CLORDID)), replies.sent, "a rejected order's ClOrdID is the day's")
     }
@@ -284,19 +338,33 @@ class InboundOrdersTest {
     fun `UNKNOWN_PARTICIPANT rejects the order, participant not served`() {
         venue.next(SendResult.UNKNOWN_PARTICIPANT)
         order(1)
-        assertEquals(listOf<Reply>(Reply.OrderReject("ORD-1", 99, Texts.PARTICIPANT_NOT_SERVED)), replies.sent)
+        assertEquals(listOf(Triple("ORD-1", '8' to 99, Texts.PARTICIPANT_NOT_SERVED)), answered())
     }
 
     @Test
-    fun `a reject Artio refuses aborts the order, and its redelivery may then be sent, never both`() {
-        venue.next(SendResult.NO_GATEWAY)
+    fun `an answer of the inbound path's own that Artio refuses aborts the message, and its redelivery answers it once`() {
+        // §3.3, "A reply Artio refuses": non-negotiable 2 for the adapter's own answers.
         replies.accepting = false
-        assertEquals(Action.ABORT, order(1))
+        assertEquals(Action.ABORT, order(1, extra = arrayOf(40 to "1")))
         replies.accepting = true
-        assertEquals(Action.CONTINUE, order(1))
-        assertEquals(listOf(SendResult.NO_GATEWAY, SendResult.SENT), venue.orders.map { it.result })
-        assertTrue(replies.sent.isEmpty(), "the reject never went out")
-        assertTrue(assertNotNull(store.find(P, 1L)).isInFlight)
+        assertEquals(Action.CONTINUE, order(1, extra = arrayOf(40 to "1")))
+        assertEquals(listOf<Reply>(Reply.OrderReject("ORD-1", 99, Texts.LIMIT_ORDERS_ONLY)), replies.sent)
+        assertNull(store.find(P, 1L))
+    }
+
+    @Test
+    fun `a refusal's reject the client cannot take yet is sent once it can, and the request is never sent after it`() {
+        venue.next(SendResult.NO_GATEWAY)
+        client.accepting = false
+        order(1)
+        order(1, archived = false)
+        cycle()
+        assertTrue(client.sent.isEmpty())
+        client.accepting = true
+        cycle()
+        assertEquals(listOf(Triple("ORD-1", '8' to 99, Texts.EXCHANGE_UNAVAILABLE)), answered())
+        assertEquals(listOf(SendResult.NO_GATEWAY), venue.orders.map { it.result }, "refused once, answered once, never both")
+        assertFalse(assertNotNull(store.find(P, 1L)).isInFlight)
     }
 
     // ================================================================ before the directory, §3.3
@@ -546,7 +614,7 @@ class InboundOrdersTest {
         acknowledge("ORD-1")
         venue.next(SendResult.NO_GATEWAY)
         cancel(2, "ORD-1")
-        assertEquals(listOf<Reply>(Reply.CancelReject("CXL-2", "ORD-1", 99, Texts.EXCHANGE_UNAVAILABLE)), replies.sent)
+        assertEquals(listOf(Triple("CXL-2", 99, Texts.EXCHANGE_UNAVAILABLE)), answered())
         assertEquals(CancelState.ANSWERED, store.find(P, 2L)?.cancelState)
         assertNull(store.find(P, 1L)?.pendingCancel)
         cancel(3, "ORD-1")
@@ -554,15 +622,84 @@ class InboundOrdersTest {
     }
 
     @Test
-    fun `a back-pressured cancel is aborted and sent once when delivered again, and a PossDup resend is dropped`() {
+    fun `a back-pressured cancel stays on its row and is sent once by the duty cycle, and a PossDup resend is dropped`() {
         order(1)
         acknowledge("ORD-1")
         venue.next(SendResult.BACK_PRESSURED)
-        assertEquals(Action.ABORT, cancel(2, "ORD-1"))
         assertEquals(Action.CONTINUE, cancel(2, "ORD-1"))
+        assertEquals(Action.CONTINUE, cancel(2, "ORD-1", archived = false))
         cancel(2, "ORD-1", possDup = true)
         assertEquals(listOf(SendResult.BACK_PRESSURED, SendResult.SENT), venue.cancels.map { it.result })
         assertTrue(replies.sent.isEmpty())
+    }
+
+    // ================================================================ sent once the archive has it, §6.1, §8.20
+
+    @Test
+    fun `a request is sent only once the archive has recorded its 35=D, and its message is consumed at once`() {
+        // CLAUDE.md non-negotiable 11: the library sees a 35=D before the archive has fsynced it.
+        assertEquals(Action.CONTINUE, order(1, archived = false))
+        val row = assertNotNull(store.find(P, 1L), "stored, to send")
+        assertTrue(row.sendPending)
+        recorded = position - 1L
+        cycle()
+        assertTrue(venue.orders.isEmpty(), "one byte short of the message")
+        recorded = position
+        cycle()
+        assertEquals(listOf(SendResult.SENT), venue.orders.map { it.result })
+        assertFalse(row.sendPending)
+    }
+
+    @Test
+    fun `requests go out in the order they came, as far as the archive has recorded`() {
+        order(1, archived = false)
+        val first = position
+        order(2, archived = false)
+        order(3, archived = false)
+        recorded = first + 256L
+        cycle()
+        assertEquals(listOf(1L, 2L), venue.orders.map { it.clOrdId })
+        archive()
+        assertEquals(listOf(1L, 2L, 3L), venue.orders.map { it.clOrdId })
+    }
+
+    @Test
+    fun `while the inbound stream's recording is not known nothing is sent`() {
+        order(1, archived = false)
+        recorded = -1L // LibraryRecording.UNKNOWN
+        cycle()
+        assertTrue(venue.orders.isEmpty())
+    }
+
+    @Test
+    fun `a back-pressured send holds the requests behind it, so they keep their order`() {
+        venue.next(SendResult.BACK_PRESSURED)
+        order(1, archived = false)
+        order(2, archived = false)
+        archive()
+        assertEquals(listOf(1L to SendResult.BACK_PRESSURED), venue.orders.map { it.clOrdId to it.result })
+        cycle()
+        assertEquals(listOf(1L to SendResult.BACK_PRESSURED, 1L to SendResult.SENT, 2L to SendResult.SENT), venue.orders.map { it.clOrdId to it.result })
+    }
+
+    @Test
+    fun `a cancel of an acknowledged order waits for its own 35=F to be archived`() {
+        order(1)
+        acknowledge("ORD-1")
+        cancel(2, "ORD-1", archived = false)
+        cycle()
+        assertTrue(venue.cancels.isEmpty())
+        archive()
+        assertEquals(listOf(2L), venue.cancels.map { it.clOrdId })
+    }
+
+    @Test
+    fun `a request stored but not yet archived when the process stops is never sent by the next one, the SDK settles it`() {
+        order(1, archived = false)
+        restart()
+        order(1) // the claim's replay
+        assertTrue(venue.orders.isEmpty())
+        assertTrue(assertNotNull(store.find(P, 1L)).isInFlight, "restored in flight, settled by the fence (§3.4)")
     }
 
     // ================================================================ 35=G, other types
@@ -588,13 +725,15 @@ class InboundOrdersTest {
     @Test
     fun `an order on its way to the exchange allocates nothing`() {
         val quiet = QuietVenue()
-        val hot = InboundOrders(store, quiet, QuietSecurities, { TODAY }, { })
+        val hotSends = ArchivedSends(store, quiet, { Long.MAX_VALUE }) { _, _ -> error("refused") }
+        val hot = InboundOrders(store, quiet, QuietSecurities, { TODAY }, hotSends, { })
         val count = 32_000
         val orders = (1..count).map { fix("D", it, listOf(11 to "O$it", 55 to "ACME", 54 to "1", 60 to TIME, 38 to "10", 40 to "2", 44 to "100.25")) }
         val buffers = orders.map { UnsafeBuffer(it) }
         fun run(from: Int, until: Int) {
             for (i in from until until) {
-                check(hot.onMessage(P, NoReplies, 0, Constants.NEW_ORDER_SINGLE_MESSAGE, buffers[i], 0, orders[i].size) == Action.CONTINUE)
+                check(hot.onMessage(P, NoReplies, 0, Constants.NEW_ORDER_SINGLE_MESSAGE, buffers[i], 0, orders[i].size, i + 1L) == Action.CONTINUE)
+                hotSends.doWork()
             }
         }
         // Rows come from the pool, and a store of live orders needs one per order: fill it first.

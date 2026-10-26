@@ -90,11 +90,20 @@ class RequestRow internal constructor() {
     // In memory only, never stored.
 
     /**
-     * This process wrote the row but its send did not go out (back-pressured, Design.md §3.3): the
-     * same request delivered again is sent. False after a restart, when a stored request may have
-     * been sent, and a request sent twice is two orders under one `clOrdId`.
+     * This process has the request to send, or on its way to be sent (Design.md §6.1): waiting for the
+     * archive, back-pressured, or a parked cancel let go. False after a restart, when a stored request
+     * may have been sent, and a request sent twice is two orders under one `clOrdId`.
      */
     var sendPending = false
+
+    /**
+     * The request's 35=D or 35=F's position on the engine's inbound stream, in this process; 0 if it
+     * came from the store. It is sent once the archive has recorded that far (§6.1, §8.20).
+     */
+    var sendAfter = 0L
+
+    /** A refused send's Text, for the reject owed as [owed] (§6.1); null for the fate's own. */
+    var owedText: String? = null
 
     /** An order's cancel parked or sent, and not yet answered (§3.3). Rebuilt by [OrderStore.load]. */
     var pendingCancel: RequestRow? = null
@@ -186,6 +195,8 @@ class RequestRow internal constructor() {
         cancelState = CancelState.SENT
         fixClOrdIdLength = 0
         sendPending = false
+        sendAfter = 0L
+        owedText = null
         pendingCancel = null
         statedAt = 0L
         hash = 0L

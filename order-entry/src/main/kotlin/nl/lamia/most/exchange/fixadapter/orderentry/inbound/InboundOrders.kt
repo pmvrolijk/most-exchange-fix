@@ -2,7 +2,6 @@ package nl.lamia.most.exchange.fixadapter.orderentry.inbound
 
 import io.aeron.logbuffer.ControlledFragmentHandler.Action
 import nl.lamia.most.exchange.client.PriceCodec
-import nl.lamia.most.exchange.client.SendResult
 import nl.lamia.most.exchange.fixadapter.codecs.Constants
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.HeaderDecoder
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.InstrumentDecoder
@@ -15,7 +14,6 @@ import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
 import nl.lamia.most.exchange.fixadapter.orderentry.store.RequestRow
 import nl.lamia.most.exchange.fixadapter.orderentry.store.RowKind
 import nl.lamia.most.exchange.sbe.Side
-import nl.lamia.most.exchange.sbe.SmpStrategy
 import org.agrona.AsciiSequenceView
 import org.agrona.DirectBuffer
 import uk.co.real_logic.artio.util.MutableAsciiBuffer
@@ -26,9 +24,11 @@ import java.util.function.IntSupplier
  * order-entry session, to a request on its way to the exchange, or an answer given here.
  *
  * Called on the order-entry library's thread (§3.5), for the session's own [participantId] (§2),
- * with Artio's `sequenceIndex` for the message. The returned [Action] is Artio's: [Action.ABORT]
- * has the message delivered again, and every path is safe to run again (§3.3). Allocation-free on
- * the way to the exchange, apart from a row the store's pool does not have.
+ * with Artio's `sequenceIndex` for the message and its position on the engine's inbound stream. A
+ * request is stored and handed to [sends], which sends it once the archive has the message (§6.1,
+ * §8.20); the message is then consumed. The returned [Action] is Artio's: [Action.ABORT], for an
+ * answer Artio refused, has the message delivered again, and every path is safe to run again
+ * (§3.3). Allocation-free on the way to the exchange, apart from a row the store's pool does not have.
  */
 class InboundOrders(
     private val store: OrderStore,
@@ -36,6 +36,7 @@ class InboundOrders(
     private val securities: SecurityLookup,
     /** The adapter's trading date, `YYYYMMDD` (§3.6). */
     private val tradingDate: IntSupplier,
+    private val sends: ArchivedSends,
     /** An id collision (§3.3, §8.15), after the store has blocked the session: for counting and logging. */
     private val onIdCollision: (participantId: Long) -> Unit,
 ) {
@@ -56,12 +57,16 @@ class InboundOrders(
     /** Blocked after an id collision until its session is reset (§3.3). The store keeps it. */
     fun isBlocked(participantId: Long): Boolean = store.isBlocked(participantId)
 
+    /** The message in hand's position on the engine's inbound stream. */
+    private var position = 0L
+
     @Suppress("LongParameterList")
     fun onMessage(
         participantId: Long, replies: ClientReplies, sequenceIndex: Int, messageType: Long,
-        buffer: DirectBuffer, offset: Int, length: Int,
+        buffer: DirectBuffer, offset: Int, length: Int, position: Long,
     ): Action {
         message.wrap(buffer)
+        this.position = position
         return when (messageType) {
             Constants.NEW_ORDER_SINGLE_MESSAGE -> onNewOrder(participantId, replies, sequenceIndex, offset, length)
             Constants.ORDER_CANCEL_REQUEST_MESSAGE -> onCancel(participantId, replies, sequenceIndex, offset, length)
@@ -88,8 +93,8 @@ class InboundOrders(
             if (!held.fixClOrdIdEquals(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)) {
                 return collision(participantId, sequenceIndex, replies.rejectOrder(d, OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies)
             }
-            // The same request again: sent only if this process's own send did not go out (§3.3).
-            return if (held.sendPending) sendOrder(held, d, replies) else Action.CONTINUE
+            // The same request again: already sent, on its way, or the SDK's to settle (§3.3).
+            return Action.CONTINUE
         }
         if (!securities.isReady) return answered(replies.rejectOrder(d, OTHER, Texts.EXCHANGE_UNAVAILABLE))
 
@@ -133,9 +138,12 @@ class InboundOrders(
         row.expireDate = expireDate
         row.smpId = smpId
         row.smpStrategy = if (d.hasSelfMatchPreventionInstruction()) d.selfMatchPreventionInstruction().toByte() else 0
-        row.sendPending = true
+        row.sendAfter = position
         return when (store.insert(row)) {
-            InsertResult.NEW -> sendOrder(row, d, replies)
+            InsertResult.NEW -> {
+                sends.send(row)
+                Action.CONTINUE
+            }
             InsertResult.DUPLICATE_CLORDID -> {
                 store.release(row)
                 if (isPossDup(d.header())) Action.CONTINUE
@@ -143,28 +151,6 @@ class InboundOrders(
             }
             // Ruled out by the lookup above; the store says so too if that ever changes.
             InsertResult.SAME, InsertResult.ID_COLLISION -> error("clOrdId $id held, yet not found")
-        }
-    }
-
-    private fun sendOrder(row: RequestRow, d: NewOrderSingleDecoder, replies: ClientReplies): Action {
-        val result = venue.newOrder(
-            row.participantId, row.clOrdId, row.securityId, row.side, row.price, row.origQty,
-            row.expireDate, row.smpId, if (row.smpStrategy.toInt() == 2) SmpStrategy.CANCEL_RESTING else SmpStrategy.CANCEL_AGGRESSOR,
-        )
-        return when (result) {
-            SendResult.SENT -> {
-                row.sendPending = false
-                Action.CONTINUE
-            }
-            SendResult.BACK_PRESSURED -> Action.ABORT
-            SendResult.NOT_READY, SendResult.NO_GATEWAY, SendResult.UNKNOWN_PARTICIPANT -> {
-                // The reply first: refused, the message comes again with the row still to send.
-                if (!replies.rejectOrder(d, OTHER, unavailable(result))) return Action.ABORT
-                row.sendPending = false
-                row.ordStatus = ORD_STATUS_REJECTED
-                store.update(row)
-                Action.CONTINUE
-            }
         }
     }
 
@@ -186,9 +172,7 @@ class InboundOrders(
             if (!held.fixClOrdIdEquals(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)) {
                 return collision(participantId, sequenceIndex, replies.rejectCancel(c, orderNamed(participantId), OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies)
             }
-            if (!held.sendPending) return Action.CONTINUE
-            val order = store.find(participantId, held.origClOrdId) ?: error("cancel ${held.clOrdId} without its order")
-            return sendCancel(held, order, c, replies)
+            return Action.CONTINUE
         }
         val order = orderNamed(participantId)
         if (!securities.isReady) return answered(replies.rejectCancel(c, order, OTHER, Texts.EXCHANGE_UNAVAILABLE))
@@ -208,11 +192,12 @@ class InboundOrders(
         row.shardId = order.shardId
         // Before the order's first report there is no exchangeOrderId to cancel by: parked (§3.3).
         row.cancelState = if (order.acknowledged) CancelState.SENT else CancelState.PARKED
-        row.sendPending = order.acknowledged
+        row.sendAfter = position
         return when (store.insert(row)) {
             InsertResult.NEW -> {
                 order.pendingCancel = row
-                if (row.cancelState == CancelState.PARKED) Action.CONTINUE else sendCancel(row, order, c, replies)
+                if (row.cancelState == CancelState.SENT) sends.send(row)
+                Action.CONTINUE
             }
             InsertResult.DUPLICATE_CLORDID -> {
                 store.release(row)
@@ -220,25 +205,6 @@ class InboundOrders(
                 else answered(replies.rejectCancel(c, order, DUPLICATE_CLORDID, Texts.DUPLICATE_CLORDID))
             }
             InsertResult.SAME, InsertResult.ID_COLLISION -> error("clOrdId $id held, yet not found")
-        }
-    }
-
-    private fun sendCancel(row: RequestRow, order: RequestRow, c: OrderCancelRequestDecoder, replies: ClientReplies): Action {
-        val result = venue.cancel(row.participantId, row.clOrdId, order.clOrdId, order.exchangeOrderId, order.securityId, order.side)
-        return when (result) {
-            SendResult.SENT -> {
-                row.sendPending = false
-                Action.CONTINUE
-            }
-            SendResult.BACK_PRESSURED -> Action.ABORT
-            SendResult.NOT_READY, SendResult.NO_GATEWAY, SendResult.UNKNOWN_PARTICIPANT -> {
-                if (!replies.rejectCancel(c, order, OTHER, unavailable(result))) return Action.ABORT
-                row.sendPending = false
-                row.cancelState = CancelState.ANSWERED
-                if (order.pendingCancel === row) order.pendingCancel = null
-                store.update(row)
-                Action.CONTINUE
-            }
         }
     }
 
@@ -321,14 +287,9 @@ class InboundOrders(
 
     private fun isPossDup(h: HeaderDecoder): Boolean = h.hasPossDupFlag() && h.possDupFlag()
 
-    private fun unavailable(result: SendResult): String =
-        if (result == SendResult.UNKNOWN_PARTICIPANT) Texts.PARTICIPANT_NOT_SERVED else Texts.EXCHANGE_UNAVAILABLE
-
     private companion object {
         /** Design.md §3.2. */
         fun derive(sequenceIndex: Int, msgSeqNum: Int): Long = (sequenceIndex.toLong() shl 32) or (msgSeqNum.toLong() and 0xffffffffL)
-
-        val ORD_STATUS_REJECTED = '8'.code.toByte()
 
         // OrdRejReason (103).
         const val UNKNOWN_SYMBOL = 1

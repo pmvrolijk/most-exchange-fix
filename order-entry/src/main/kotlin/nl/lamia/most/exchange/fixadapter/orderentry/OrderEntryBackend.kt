@@ -15,6 +15,7 @@ import nl.lamia.most.exchange.client.OrderEntrySession
 import nl.lamia.most.exchange.fixadapter.codecs.Constants
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReplies
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReports
+import nl.lamia.most.exchange.fixadapter.orderentry.artio.InboundRecording
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.LibraryRecording
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioSessions
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ReportSessions
@@ -24,6 +25,7 @@ import nl.lamia.most.exchange.sbe.ClientExecutionReportDecoder
 import nl.lamia.most.exchange.sbe.RequestStatus
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.DirectoryIndex
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.ShardVenue
+import nl.lamia.most.exchange.fixadapter.orderentry.inbound.ArchivedSends
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.InboundOrders
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.Texts
 import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
@@ -55,7 +57,8 @@ import java.util.function.IntSupplier
  * Reports and fates go to the client through the outbound path (§5.3), on each participant's session
  * online or offline (§6.3). Every session Artio knows is requested offline during construction, so it
  * must come before the acceptor binds. The durable `reportSeq` of each shard's SDK session advances
- * only behind the archive ([delivery], §6.2). [links] makes a gateway's link; tests may stand a model
+ * only behind the archive ([delivery], §6.2), and a request is sent only once the archive has its
+ * 35=D or 35=F ([sends], §6.1, §8.20). [links] makes a gateway's link; tests may stand a model
  * of the exchange in for Aeron's.
  */
 class OrderEntryBackend(
@@ -83,6 +86,7 @@ class OrderEntryBackend(
     private val reports = ArtioReports(index, sessions)
     private val directory = DirectoryClient()
     val inbound: InboundOrders
+    val sends: ArchivedSends
     val outbound: OutboundReports
     val delivery: ReportDelivery
     private val recording: LibraryRecording
@@ -105,9 +109,6 @@ class OrderEntryBackend(
         try {
             store.load(tradingDate.asInt)
             StartupGuards.check(acceptor.engine.allSessions(), acceptor.sessions, store)
-            inbound = InboundOrders(store, venue, index, tradingDate) { participantId ->
-                log("participant $participantId: id collision, session blocked until its sequence is reset (Design.md §3.3)")
-            }
             aeron = owned(Aeron.connect(Aeron.Context().aeronDirectoryName(acceptor.config.aeronDir)))
             val libraryConfiguration = acceptor.libraryConfiguration(claims()).apply {
                 libraryName("order-entry")
@@ -116,7 +117,13 @@ class OrderEntryBackend(
             }
             recording = LibraryRecording(aeron.countersReader(), libraryConfiguration)
             delivery = ReportDelivery(store, recording)
-            outbound = OutboundReports(store, reports, venue, delivery, log)
+            sends = ArchivedSends(store, venue, InboundRecording(aeron.countersReader(), libraryConfiguration.inboundLibraryStream())) { row, text ->
+                outbound.refuse(row, text)
+            }
+            inbound = InboundOrders(store, venue, index, tradingDate, sends) { participantId ->
+                log("participant $participantId: id collision, session blocked until its sequence is reset (Design.md §3.3)")
+            }
+            outbound = OutboundReports(store, reports, sends, delivery, log)
             outbound.recover()
             directorySubscription = owned(aeron.addSubscription(config.directoryChannel, config.directoryStreamId))
             library = owned(FixLibrary.connect(libraryConfiguration))
@@ -141,6 +148,7 @@ class OrderEntryBackend(
         }
         work += venue.doWork()
         work += outbound.doWork()
+        work += sends.doWork()
         work += delivery.doWork()
         return work
     }
@@ -294,7 +302,7 @@ class OrderEntryBackend(
             if (!messageInfo.isValid || isSessionMessage(messageType)) return Action.CONTINUE
             if (sequenceIndex > store.highestSequenceIndex(participantId)) store.recordSequenceIndex(participantId, sequenceIndex)
             replies.session = session
-            return inbound.onMessage(participantId, replies, sequenceIndex, messageType, buffer, offset, length)
+            return inbound.onMessage(participantId, replies, sequenceIndex, messageType, buffer, offset, length, position)
         }
 
         override fun onTimeout(libraryId: Int, session: Session) = Unit

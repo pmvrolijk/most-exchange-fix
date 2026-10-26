@@ -158,7 +158,9 @@ Decided 2026-10-15. Properties files, as the exchange's processes use.
 
 Decided by the exchange's contract, and therefore not open:
 - every exchange-facing rule comes from `OrderEntrySession`;
-- `BACK_PRESSURED` becomes `Action.ABORT`;
+- ~~`BACK_PRESSURED` becomes `Action.ABORT`~~ a `BACK_PRESSURED` send is retried, never dropped:
+  from its row, in the duty cycle, since a request is sent only once the archive has its 35=D/F
+  (decided 2026-10-26, §6.1, §8.20). Its FIX message is consumed once the row is stored;
 - `NEVER_SEQUENCED` becomes a reject or a resend, and `AMBIGUOUS` an unknown status, never a reject;
 - a mass status runs at startup and after every gateway reconnect (the SDK does it).
 
@@ -219,12 +221,12 @@ except a 35=j, which is never answered.
 
 | In | Handling |
 | --- | --- |
-| 35=D | Validated (§5.1), written to the order store, then `newOrder`. `BACK_PRESSURED` → `Action.ABORT` |
+| 35=D | Validated (§5.1) and written to the order store, *to send*. `newOrder` follows from the duty cycle once the archive has recorded the 35=D (§6.1, decided 2026-10-26). `BACK_PRESSURED` → retried from the row there |
 | 35=D, ClOrdID known | Another of the session's rows holds the ClOrdID: 35=8, OrdRejReason 6. With PossDup=Y it is dropped instead: a resend of a request already answered |
-| 35=D or 35=F, the same request again | Its derived `clOrdId` and its ClOrdID are already stored together (§6.1, *same*): a back-pressure redelivery, a PossDup resend, or a claim's replay (§2). **Sent again only if this process's own send of it did not go out**, back-pressured. Otherwise dropped. The engine does not check `clOrdId` (most-exchange Adapters.md §2): sent twice, it would be two orders under one id |
+| 35=D or 35=F, the same request again | Its derived `clOrdId` and its ClOrdID are already stored together (§6.1, *same*): a back-pressure redelivery, a PossDup resend, or a claim's replay (§2). Dropped: a row still to send is sent once, from the duty cycle (decided 2026-10-26; before, a redelivery sent a row whose own send had been back-pressured). The engine does not check `clOrdId` (most-exchange Adapters.md §2): sent twice, it would be two orders under one id |
 | 35=D or 35=F, an id collision | Another ClOrdID holds the derived `clOrdId` (§3.2, §6.1). **Decided 2026-10-25** (§8.15): answered locally, 35=8 OrdRejReason 99 or 35=9 CxlRejReason 99, Text "session sequence reset required", never sent. Then a Logout with that Text. The session's Logons are refused until an operator resets its sequence, which raises its `sequenceIndex` (§9.1). Its open orders are untouched. Counted, and alertable (§9.2). **How, decided 2026-10-25** (slice 2b): the block is stored per participant as the `sequenceIndex` it was found at (`meta`, §6.1), so it survives a restart. The engine still accepts the Logon (its check runs on the framer thread, away from the store); on acquiring the session, the order-entry library sends a Logout with the same Text and disconnects. A message replayed or arriving before that is rejected with the same Text. **The block lifts when the session comes back with a higher `sequenceIndex`**: an operator's reset, or the client's own Logon with 141=Y. Either makes the derived ids new, so the collision cannot recur |
 | 35=D or 35=F, before the directory | No complete directory has arrived yet, so no security can be resolved or routed (§3.5). The same reject as `NOT_READY` below, "exchange unavailable", never "unknown security" (2026-10-25, slice 2b) |
-| 35=D or 35=F, the SDK cannot send | `NOT_READY` (the opening mass status has not finished) or `NO_GATEWAY`. **Decided 2026-10-25: rejected**, 35=8 OrdRejReason 99 or 35=9 CxlRejReason 99, Text "exchange unavailable". Never sent, so the client may retry with a new ClOrdID. Not held: an `ABORT` that lasts stalls every order-entry session, heartbeats included. `UNKNOWN_PARTICIPANT`, a shard's session not holding the participant, is a configuration error: the same reject, Text "participant not served", and logged |
+| 35=D or 35=F, the SDK cannot send | `NOT_READY` (the opening mass status has not finished) or `NO_GATEWAY`. **Decided 2026-10-25: rejected**, 35=8 OrdRejReason 99 or 35=9 CxlRejReason 99, Text "exchange unavailable". Never sent, so the client may retry with a new ClOrdID. Not held: an `ABORT` that lasts stalls every order-entry session, heartbeats included. **Since 2026-10-26** the send is the duty cycle's (§6.1), so the reject is owed on the row and sent from there, through the outbound path, as a fate's is (§5.3). `UNKNOWN_PARTICIPANT`, a shard's session not holding the participant, is a configuration error: the same reject, Text "participant not served", and logged |
 | 35=F | Looked up by OrigClOrdID (41) in the store, then `cancel` with the stored `exchangeOrderId`, security and side. Unknown order, or 41 naming a cancel → 35=9, CxlRejReason 1. OrderID, Side or the security sent and not matching the order's → 35=9, CxlRejReason 1 |
 | 35=F before the order's first report | **Parked** (decided 2026-10-09): written to the store as a cancel row in state *parked* (§6.1), so it survives a restart, and sent when the first report brings `exchangeOrderId`. If that report is terminal, 35=9 with CxlRejReason 0, *too late* |
 | 35=F, a cancel already pending | **Decided 2026-10-25:** another cancel of the order is parked or sent → 35=9, CxlRejReason 3, *already pending*. The first stands. Once it is answered, a new cancel is accepted |
@@ -593,9 +595,33 @@ Decided 2026-10-09: **RocksDB, with the working set in memory.**
   survives a process crash but not a host crash. That is enough, because everything a host crash
   can lose from RocksDB can be rebuilt from Artio's fsynced archive, or errs toward re-delivery
   (R§4).
-  - **When:** the row is written **before** `newOrder`. If the send is back-pressured, the
-    redelivered message writes the same row again, which is harmless. The row is updated on every
-    report, on a parked cancel, and on a fate.
+  - **When:** the row is written **before** `newOrder`. ~~If the send is back-pressured, the
+    redelivered message writes the same row again, which is harmless.~~ **A request is sent only
+    once the archive has recorded its 35=D or 35=F** (decided 2026-10-26, §8.20, R§12). The inbound
+    path writes the row *to send*, with the message's position on the engine's inbound stream, and
+    consumes the message. The duty cycle sends rows to send in the order they came, each once the
+    `RecordingPos` of that stream has reached its position: at `fileSyncLevel=1`, once it is
+    fsynced (§6.4). A back-pressured send stays to send and is tried again in the next cycle; a
+    `NOT_READY`, `NO_GATEWAY` or `UNKNOWN_PARTICIPANT` owes its reject on the row (§3.3). The position
+    and *to send* are in memory only: a row loaded at startup and not acknowledged is restored in
+    flight (below), and the fence settles it, a reject if it never went out. The row is updated on
+    every report, on a parked cancel, and on a fate.
+    - **The stream's `RecordingPos`** is the engine's one inbound publication (Artio's
+      `inboundPublication`, stream `inboundLibraryStream`) in the adapter's driver, found from
+      Aeron's counters as for §6.2. Every message on it, replayed ones included, is in that one
+      publication's position space. While it is not found, nothing is sent.
+    - **A parked cancel** (§3.3) is sent the same way once its order's first report has come: put
+      behind the requests waiting, at its own 35=F's position. One loaded at startup has no position
+      in this process and goes at once. Its row is stored, so a resend of its 35=F finds it, and
+      nothing is sent twice.
+    - **A refused send** (`NOT_READY`, `NO_GATEWAY`, `UNKNOWN_PARTICIPANT`) is owed on its row as a
+      `NEVER_SEQUENCED` fate with the refusal's Text ("exchange unavailable", "participant not
+      served"), and answered by the outbound path (§5.3): a 35=8 OrdRejReason 99 or a 35=9
+      CxlRejReason 99, as §3.3 says. The Text is in memory: after a restart the fate's own Text is
+      sent. Owed, the row is no longer in flight, so a restart does not hand it to the SDK.
+    - **What it costs:** every order waits for the archive's fsync before it goes out. In the spike
+      the archive ran up to ~40 KB behind the library, on a laptop. The time is not measured, and no
+      latency figure is stated without `perf-claim`.
   - **Recovery mode: point-in-time** (`WALRecoveryMode.kPointInTimeRecovery`). After a crash,
     RocksDB recovers a **prefix** of its writes, never a set with holes. The durable `reportSeq`
     (§6.2) is written after the row updates it covers, so if it survived, they did too. The
@@ -632,8 +658,9 @@ Decided 2026-10-09: **RocksDB, with the working set in memory.**
   Not handed back: a parked cancel, which was never sent, and a request the SDK already settled
   (a fate's 35=8 owed, or sent: an order rejected or ambiguous). Restored, it could be settled
   again, an `AMBIGUOUS` order as `NEVER_SEQUENCED` by a startup resend that completes. Then the SDK's resend and mass status
-  reconcile them. **Not yet built** (§8.17): if a report names a `clOrdId` the store does not have (its row was lost in a
-  host crash), its 35=D is read back from Artio's archive by (`sequenceIndex`, MsgSeqNum).
+  reconcile them. **Not yet built** (§8.17, shape decided 2026-10-26): a row lost in a host crash
+  is rebuilt from Artio's archive before the bind, by replaying each session's inbound messages
+  past the store's last row for that participant.
 
 ### 6.2 Execution report delivery: consume a report only behind the archive
 
@@ -912,10 +939,37 @@ The archive's recorded position (§6.2) then means durable.
 17. **Rows lost in a host crash are not yet recovered** (decided 2026-10-25 to defer, slice 3). §6.1
     reads a lost row's 35=D back from Artio's archive. Until that is built, a report for a
     `clOrdId` with no row is logged, counted and consumed (§5.3), so the client misses that order's
-    reports. The intended shape, its own slice after delivery: at startup, before the SDK starts,
-    the archive's inbound 35=D and 35=F past the store's last row are run through the inbound path
-    without sending, so the rows are rebuilt and restored in flight. It needs a look at Artio's
-    archive scanning first.
+    reports. ~~The intended shape: at startup, before the SDK starts, the archive's inbound 35=D and
+    35=F past the store's last row are run through the inbound path without sending~~ **The shape,
+    decided 2026-10-26** (R§12), each the recommendation; read in Artio 0.182's source and
+    **verified** by spike (f), `RecoveryReplaySpikeTest` (2026-10-26): after a clean restart, an
+    offline `requestSession` from (0, D3) was answered `OK`, the session was acquired *before* its
+    replay arrived, then D3, D4, D5 and the client's Logout came, each `isValid()` true, at its own
+    MsgSeqNum. From (0, A2) across a 141=Y reset came A2, A3, the Logout at index 0, then the Logon,
+    B1, B2 and the Logout at index 1. Session messages are replayed too, so the handler's filter
+    (non-negotiable 10) applies. The session is then the offline session of §6.3: written on, and
+    the client's next Logon follows it. What a replayed message looks like to the handler is what a
+    live one does; it is told apart by its session being offline, which no live message can be:
+    - **Read back by the startup `requestSession` replay**, not `FixArchiveScanner` and not lazily per
+      report. The offline request each participant's session gets before the bind (§6.3) replays
+      from the store's last row for that participant, (`sequenceIndex`, MsgSeqNum) + 1, instead of
+      `NO_MESSAGE_REPLAY`. Artio's engine replays archived inbound messages to an offline session
+      too (`HandoverOfflineFixSession` → `CatchupReplayer`), across sequence indices, as
+      `CATCHUP_REPLAY`. It sees inbound messages only, not what the adapter answered.
+    - **A replayed request is never sent and never answered.** The engine does not check `clOrdId`
+      uniqueness (most-exchange Adapters.md §2), so sending it again would make a second order.
+    - **A replayed request that passes validation and has no row is rebuilt in flight**: an order
+      as sent and not acknowledged, a cancel as *sent*, then `restoreInFlight`, so the fence settles
+      it (§3.4). A sequenced one gets its reports from the resend: the durable `reportSeq` predates
+      them, because RocksDB recovered a prefix (§6.1). A never-sequenced one gets its reject. A
+      request first answered here, by a reject that needed the directory or the gateway ("exchange
+      unavailable", "unknown security"), can so get a second reject with the same ClOrdID: accepted.
+      It is never a reject of an order that may be live (non-negotiable 1).
+    - **The directory is not there at startup**, so recovery is not the inbound path as it runs live.
+      What is decided from the message alone (`validate()`, the §5.1 field checks) and from the
+      store (a duplicate ClOrdID, the block, a cancel's order) is decided again, the same way. The
+      security is kept as the message names it, and its shard is resolved once the directory
+      arrives, before that shard's `restoreInFlight`.
 18. **A library reconnect freezes the durable `reportSeq` until a restart** (as built 2026-10-25,
     §6.2). Positions taken on the old connection are never confirmed, so its lowest unconfirmed
     `reportSeq` stays a floor, and the rows waiting for the archive are answered again after the
@@ -932,6 +986,26 @@ The archive's recorded position (§6.2) then means durable.
     it: the session comes back online. It is detected, logged and counted when the session reaches
     the library (`ReportSessions.reusedSequence`), not prevented. Not reproduced; the window is the
     indexer's lag after a disconnect, against a client's reconnect and Logon round trip.
+20. **A 35=D the exchange has, lost from both the store and the archive** (found 2026-10-26 in
+    Artio 0.182's source; **confirmed** by spike (g), `RecoveryReplaySpikeTest`; R§12). R§4 assumes
+    the archive holds every 35=D whose row a host crash can lose. But the library receives an inbound
+    message from the engine's IPC stream, and nothing waits for the archive to fsync it first (Artio
+    waits for its recordings only at close, `RecordingCoordinator.awaitRecordingsCompletion`). In the
+    spike, at `fileSyncLevel=1`, with the library polling as the adapter's does, **all 500 35=Ds were
+    handled before the archive's `RecordingPos` had passed them**, by up to ~40 KB, on this laptop's
+    weaker `fsync` (§6.4). So every order is sent before its 35=D is durable.
+    **Decided 2026-10-26** (the recommendation): **a request is sent only once the archive has
+    recorded its 35=D/F** (§6.1, "When"). R§4 then holds as written: a host crash can lose a row only
+    of a request whose 35=D the archive has, which recovery (§8.17) rebuilds, or of one never sent,
+    which the client's resend may send. Rejected: fsyncing RocksDB per order (blocks the library
+    thread, every session with it); the exchange checking `clOrdId` (a contract change in the
+    matching path); fencing a PossDup with no row (an SDK change, and a lawful resend of a request
+    never sent would be rejected). The cost is the archive's fsync on every order, to be measured. A host crash can then take the 35=D from
+    both, after its order went to the exchange. The client sees a gap at its next Logon and resends
+    the 35=D as PossDup; the store has no row, so the adapter sends it again, and the exchange makes
+    a second order with the same `clOrdId`. **Decided 2026-10-26:** a spike in the recovery slice
+    first. The fix is designed once the spike confirms it, because every candidate changes a failure
+    mode or adds latency to every order.
 
 ## 9. Control and metrics
 

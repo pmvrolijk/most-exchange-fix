@@ -138,7 +138,12 @@ class Library(
     val name: String,
     private val claim: (remoteCompId: String) -> Boolean = { false },
     private val replayFrom: (logonReceivedSeqNum: Int) -> Int = { FixLibrary.NO_MESSAGE_REPLAY },
+    /** Called for every message, as it reaches the handler: what it was, at which index, valid or not. */
+    private val onReceived: (session: Session, message: FixMessage, sequenceIndex: Int, valid: Boolean) -> Unit = { _, _, _, _ -> },
 ) : AutoCloseable {
+    /** Acquisitions and messages, in the order the library saw them. */
+    val trace = mutableListOf<String>()
+
     val received = LinkedHashMap<Long, MutableList<FixMessage>>()
     val sessions = LinkedHashMap<Long, Session>()
     val announced = mutableListOf<String>()
@@ -153,7 +158,10 @@ class Library(
             buffer: DirectBuffer, offset: Int, length: Int, libraryId: Int, session: Session,
             sequenceIndex: Int, messageType: Long, timestampInNs: Long, position: Long, messageInfo: OnMessageInfo,
         ): Action {
-            received.getOrPut(session.id()) { mutableListOf() } += FixMessage.parse(buffer, offset, length, position)
+            val message = FixMessage.parse(buffer, offset, length, position)
+            received.getOrPut(session.id()) { mutableListOf() } += message
+            trace += "$message index=$sequenceIndex valid=${messageInfo.isValid}"
+            onReceived(session, message, sequenceIndex, messageInfo.isValid)
             return Action.CONTINUE
         }
 
@@ -175,6 +183,7 @@ class Library(
         errorHandlerFactory(PRINT_ERRORS)
         sessionAcquireHandler(SessionAcquireHandler { session: Session, _: SessionAcquiredInfo ->
             sessions[session.id()] = session
+            trace += "ACQUIRED ${session.id()} ${session.state()} index=${session.sequenceIndex()} lastReceived=${session.lastReceivedMsgSeqNum()}"
             handler
         })
         sessionExistsHandler(SessionExistsHandler { library, sessionId, _, _, _, remoteCompId, _, _, logonReceivedSeqNum, logonSequenceIndex ->

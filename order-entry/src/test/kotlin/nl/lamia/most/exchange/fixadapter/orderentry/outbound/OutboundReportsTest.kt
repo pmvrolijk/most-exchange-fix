@@ -3,6 +3,7 @@ package nl.lamia.most.exchange.fixadapter.orderentry.outbound
 import nl.lamia.most.exchange.client.OrderFate
 import nl.lamia.most.exchange.client.ReportAction
 import nl.lamia.most.exchange.client.SendResult
+import nl.lamia.most.exchange.fixadapter.orderentry.inbound.ArchivedSends
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.OrderVenue
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.Texts
 import nl.lamia.most.exchange.fixadapter.orderentry.store.CancelState
@@ -45,14 +46,25 @@ class OutboundReportsTest {
     private val client = RecordingClient()
     private val venue = CancelVenue()
     private lateinit var delivery: ArchiveModel
+    private lateinit var sends: ArchivedSends
     private lateinit var outbound: OutboundReports
+
+    /** How far the archive has recorded the engine's inbound stream (§6.1): all of it, unless a test says. */
+    private var recorded = Long.MAX_VALUE
 
     @BeforeTest
     fun open() {
         store = OrderStore.open(dir).also { it.load(TODAY) }
         delivery = ArchiveModel(store) // a new process: what waited for the archive is gone
-        outbound = OutboundReports(store, client, venue, delivery)
+        sends = ArchivedSends(store, venue, { recorded }) { row, text -> outbound.refuse(row, text) }
+        outbound = OutboundReports(store, client, sends, delivery)
         outbound.recover()
+    }
+
+    /** One duty cycle: what is owed, then what is to send. */
+    private fun cycle() {
+        outbound.doWork()
+        sends.doWork()
     }
 
     @AfterTest
@@ -489,10 +501,10 @@ class OutboundReportsTest {
         venue.next = SendResult.BACK_PRESSURED
         report(1, ExecType.NEW, exchangeOrderId = 777L)
         assertTrue(venue.cancels.isEmpty(), "not inside the report")
-        outbound.doWork()
+        cycle()
         assertEquals(CancelState.PARKED, row(2).cancelState)
         venue.next = SendResult.SENT
-        outbound.doWork()
+        cycle()
         assertEquals(listOf(SentCancel(2L, 1L, 777L)), venue.cancels.filter { it.result == SendResult.SENT }.map { it.copy(result = null) })
         assertEquals(CancelState.SENT, row(2).cancelState)
     }
@@ -529,8 +541,79 @@ class OutboundReportsTest {
         report(1, ExecType.NEW)
         restart()
         venue.next = SendResult.SENT
-        outbound.doWork()
-        assertEquals(CancelState.SENT, row(2).cancelState)
+        recorded = -1L // the new process has not found its inbound recording yet
+        cycle()
+        assertEquals(CancelState.SENT, row(2).cancelState, "loaded, it has no position in this process and goes at once (§6.1)")
+    }
+
+    @Test
+    fun `a parked cancel waits for its own 35=F to be archived, though its order's first report came first`() {
+        val o = order(1)
+        cancel(2, o, CancelState.PARKED).sendAfter = 5_000L // as the inbound path stores it
+        recorded = 4_999L
+        report(1, ExecType.NEW, exchangeOrderId = 777L)
+        cycle()
+        assertTrue(venue.cancels.isEmpty())
+        recorded = 5_000L
+        cycle()
+        assertEquals(listOf(SentCancel(2L, 1L, 777L, SendResult.SENT)), venue.cancels)
+    }
+
+    @Test
+    fun `a parked cancel on its way is sent once, and not answered here when its order turns ambiguous meanwhile`() {
+        val o = order(1)
+        cancel(2, o, CancelState.PARKED).sendAfter = 5_000L
+        recorded = 0L
+        report(1, ExecType.NEW, exchangeOrderId = 777L)
+        cycle()
+        outbound.onSettled(P, 1L, OrderFate.AMBIGUOUS) // the fate's answer owes the parked cancel again
+        cycle()
+        cycle()
+        assertTrue(sent9().isEmpty(), "on its way: the exchange answers it")
+        recorded = Long.MAX_VALUE
+        cycle()
+        assertEquals(listOf(SentCancel(2L, 1L, 777L, SendResult.SENT)), venue.cancels)
+    }
+
+    // ================================================================ refused sends, §3.3, §6.1
+
+    @Test
+    fun `a refused order is answered from its row, 35=8 OrdRejReason 99 with the refusal's Text, and is no longer in flight`() {
+        order(1)
+        outbound.refuse(row(1), Texts.EXCHANGE_UNAVAILABLE)
+        assertTrue(!row(1).isInFlight, "owed: a restart does not hand it to the SDK")
+        cycle()
+        val r = sent8().single()
+        assertEquals(Triple("ORD-1", '8', '8'), Triple(r.clOrdId, r.execType, r.ordStatus))
+        assertEquals(99 to Texts.EXCHANGE_UNAVAILABLE, r.ordRejReason to r.text)
+        assertEquals(0L to 0L, r.cumQty to r.leavesQty)
+        assertEquals('8'.code.toByte(), row(1).ordStatus)
+    }
+
+    @Test
+    fun `a refused cancel is answered 35=9 CxlRejReason 99 with the refusal's Text, and its order may be cancelled again`() {
+        val o = order(1)
+        report(1, ExecType.NEW, exchangeOrderId = 777L)
+        cancel(2, o)
+        outbound.refuse(row(2), Texts.PARTICIPANT_NOT_SERVED)
+        cycle()
+        assertEquals(Sent9("CXL-2", "ORD-1", 777L, '0', 99, Texts.PARTICIPANT_NOT_SERVED, false), sent9().single())
+        assertEquals(CancelState.ANSWERED, row(2).cancelState)
+        assertNull(row(1).pendingCancel)
+    }
+
+    @Test
+    fun `a refusal not yet answered when the process stops is answered after the restart, with the fate's own Text`() {
+        order(1)
+        client.accepting = false
+        outbound.refuse(row(1), Texts.EXCHANGE_UNAVAILABLE)
+        cycle()
+        restart()
+        client.accepting = true
+        cycle()
+        val r = sent8().single()
+        assertEquals('8' to 99, r.ordStatus to r.ordRejReason)
+        assertEquals(Texts.NOT_SEQUENCED_ORDER, r.text, "the Text is in memory only (§6.1)")
     }
 
     // ================================================================ the library thread
