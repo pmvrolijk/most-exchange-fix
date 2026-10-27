@@ -85,7 +85,9 @@ modules: `fix-session` (the acceptor, logon and routing by role), and `order-ent
     duty cycle's, from the row, once the `RecordingPos` of the engine's inbound stream has passed the
     message's position. Never from the message callback: the library sees a 35=D before the archive
     has fsynced it, and the exchange does not check `clOrdId`, so a host crash would turn the client's
-    PossDup resend into a second order. (Design.md §6.1, §8.20) → R§12
+    PossDup resend into a second order. And **a request replayed from the archive at startup is never
+    sent, nor answered**: it may be at the exchange already. It is rebuilt in flight for the fence
+    to settle. (Design.md §6.1, §8.17, §8.20) → R§12
 
 ## Provenance
 

@@ -5,6 +5,8 @@ import nl.lamia.most.exchange.fixadapter.codecs.Constants
 import nl.lamia.most.exchange.fixadapter.codecs.builder.NewOrderSingleEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderCancelReplaceRequestEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderCancelRequestEncoder
+import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderMassStatusRequestEncoder
+import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderStatusRequestEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.TestRequestEncoder
 import nl.lamia.most.exchange.fixadapter.orderentry.OrderEntryRig.Companion.shard
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.DirectoryBroadcast
@@ -406,6 +408,78 @@ class OrderEntryBackendTest {
         assertEquals(null, ack[31], "no LastPx on an acknowledgement")
     }
 
+    // ================================================================ 35=H and 35=AF, §3.3
+
+    private fun statusOf(clOrdId: String, reqId: String) = OrderStatusRequestEncoder().apply {
+        clOrdID(clOrdId)
+        ordStatusReqID(reqId)
+        side('1')
+        instrument().symbol("ACME")
+    }
+
+    private fun massStatus(reqId: String) = OrderMassStatusRequestEncoder().apply {
+        massStatusReqID(reqId)
+        massStatusReqType(7)
+    }
+
+    @Test
+    fun `a 35=H is answered from the store, an order known or not, as FIX 4_4 writes it`() {
+        val adapter = start()
+        adapter.awaitExchange()
+        val session = adapter.logon()
+        adapter.send(session, order("ORD-1"))
+        pollUntil(*adapter.all(), what = "the order at the gateway") { adapter.gateway(0).orders.size == 1 }
+        val o = adapter.gateway(0).orders.single()
+        adapter.gateway(0).report(1001L, o.clOrdId, ExecType.NEW, 5001L, price = o.price, leavesQty = o.qty, origQty = o.qty)
+        pollUntil(*adapter.all(), what = "the acknowledgement") { adapter.reports(session).size == 1 }
+
+        adapter.send(session, statusOf("ORD-1", "Q-1"))
+        val known = adapter.awaitReply(session, "the status") { it.msgType == "8" && it[790] == "Q-1" }
+        assertEquals("I" to "0", known[150] to known[39])
+        assertEquals("ORD-1" to "5001", known[11] to known[37])
+        assertEquals("ACME" to "42", known[55] to known[48])
+        assertDecimal("10", known[151], "LeavesQty")
+        assertTrue(assertNotNull(known[17]).startsWith("A"), "the adapter's own ExecID")
+
+        adapter.send(session, statusOf("NOWHERE", "Q-2"))
+        val unknown = adapter.awaitReply(session, "the unknown order's status") { it.msgType == "8" && it[790] == "Q-2" }
+        assertEquals(Triple("I", "8", "5"), Triple(unknown[150], unknown[39], unknown[103]))
+        assertEquals("NOWHERE" to "NONE", unknown[11] to unknown[37])
+        assertEquals(Texts.UNKNOWN_ORDER, unknown[58])
+        assertEquals(1, adapter.gateway(0).orders.size, "nothing sent for either")
+    }
+
+    @Test
+    fun `after a 141=Y Logon a 35=AF states the session's open orders, as the client recovers by itself`() {
+        // §2: a reset discards the resend; the client asks, and is answered from the store.
+        val adapter = start()
+        adapter.awaitExchange()
+        val first = adapter.logon()
+        adapter.send(first, order("ORD-1"))
+        adapter.send(first, order("ORD-2"))
+        pollUntil(*adapter.all(), what = "the orders at the gateway") { adapter.gateway(0).orders.size == 2 }
+        pollUntil(*adapter.all(), what = "logout sent") { first.startLogout() > 0 }
+        pollUntil(*adapter.all(), what = "logged out") { !first.isConnected }
+
+        val reset = adapter.logon(reset = true)
+        adapter.send(reset, massStatus("MS-1"))
+        pollUntil(*adapter.all(), what = "both statuses") { reset.messages().count { it[584] == "MS-1" } == 2 }
+        val answers = reset.messages().filter { it[584] == "MS-1" }
+        assertEquals(listOf("ORD-1", "ORD-2"), answers.map { it[11] })
+        assertTrue(answers.all { it.msgType == "8" && it[150] == "I" && it[39] == "A" && it[911] == "2" })
+        assertEquals(listOf("N", "Y"), answers.map { it[912] })
+    }
+
+    @Test
+    fun `a 35=AF with no open order is a 35=j, no open orders`() {
+        val adapter = start()
+        adapter.awaitExchange()
+        val session = adapter.logon()
+        adapter.send(session, massStatus("MS-1"))
+        val j = adapter.awaitReply(session, "the 35=j") { it.msgType == "j" }
+        assertEquals(Triple("AF", "0", Texts.NO_OPEN_ORDERS), Triple(j[372], j[380], j[58]))
+    }
+
     @Test
     fun `a cancel goes to the exchange with the order's ids, and its CANCELED comes back naming both`() {
         val adapter = start()
@@ -470,6 +544,91 @@ class OrderEntryBackendTest {
             assertEquals(1, adapter.rig.log.count { "requests restored in flight" in it }, "on its own shard only: ${adapter.rig.log}")
             pollFor(300, *adapter.all())
             assertEquals(1, session.messages().count { it.seqNum > received && it[11] == "ORD-1" && it[150] == "8" }, "settled once")
+        }
+    }
+
+    /**
+     * ORD-1 sent to the gateway, the client logged out, the adapter stopped; then the row lost, as a
+     * host crash loses it from the unsynced WAL while the archive has the 35=D (§6.1, §8.20). Returns
+     * the client's last sent and received MsgSeqNums, and the lost row's `clOrdId`.
+     */
+    private fun sentThenLost(): Triple<Int, Int, Long> {
+        val (sent, received) = start().use { adapter ->
+            adapter.awaitExchange()
+            val session = adapter.logon()
+            adapter.send(session, order("ORD-1"))
+            pollUntil(*adapter.all(), what = "the order at the gateway") { adapter.gateway(0).orders.size == 1 }
+            pollUntil(*adapter.all(), what = "logout sent") { session.startLogout() > 0 }
+            pollUntil(*adapter.all(), what = "logged out") { !session.isConnected }
+            session.lastSentMsgSeqNum() to session.lastReceivedMsgSeqNum()
+        }
+        val clOrdId = OrderStore.open(OrderEntryRig.storeDir(adapterDir)).use { store ->
+            store.load(OrderEntryRig.TODAY)
+            var lost = 0L
+            store.forEach { if (it.kind == RowKind.ORDER) lost = it.clOrdId }
+            store.loseForTest(1001L, lost)
+            lost
+        }
+        return Triple(sent, received, clOrdId)
+    }
+
+    @Test
+    fun `a 35=D whose row a host crash lost is rebuilt from the archive before the bind, never sent again, and settled by the fence`() {
+        // Design.md §8.17.
+        val (sent, received, clOrdId) = sentThenLost()
+        start().use { adapter ->
+            val row = assertNotNull(adapter.rig.backend.store.find(1001L, clOrdId), "rebuilt before the bind: ${adapter.rig.log}")
+            assertEquals("ORD-1", row.fixClOrdIdAsString())
+            adapter.awaitExchange()
+            val session = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
+            // The gateway never answered it: the fence settles it never sequenced (§3.4).
+            val reject = adapter.awaitReply(session, "the reject") { it.msgType == "8" && it.seqNum > received }
+            assertEquals("ORD-1", reject[11])
+            assertEquals(Texts.NOT_SEQUENCED_ORDER, reject[58])
+            assertEquals("ACME", reject[55], "its security resolved once the directory came")
+            pollFor(300, *adapter.all())
+            assertTrue(adapter.gateway(0).orders.isEmpty(), "never sent again: the exchange does not check clOrdId")
+            assertEquals(1, session.messages().count { it.seqNum > received && it[11] == "ORD-1" }, "answered once")
+            assertTrue(adapter.rig.log.any { "1 requests rebuilt from the archive" in it }, "${adapter.rig.log}")
+        }
+    }
+
+    @Test
+    fun `a recovered order whose security the directory no longer lists is refused unknown security, stating no security`() {
+        // §8.17, confirmed 2026-10-27: OrdRejReason 99, "unknown security", and no 48.
+        val (sent, received, _) = sentThenLost()
+        start(broadcast = DirectoryBroadcast(1, TWO_SHARDS.shards, listOf(BETA))).use { adapter ->
+            adapter.awaitExchange()
+            val session = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
+            val reject = adapter.awaitReply(session, "the reject") { it.msgType == "8" && it.seqNum > received }
+            assertEquals("ORD-1", reject[11])
+            assertEquals("8" to "8", reject[150] to reject[39])
+            assertEquals("99", reject[103])
+            assertEquals(Texts.UNKNOWN_SECURITY, reject[58])
+            assertEquals(null to null, reject[48] to reject[55], "no securityId to state")
+            pollFor(300, *adapter.all())
+            assertTrue(adapter.exchange.gateways.values.all { it.orders.isEmpty() })
+        }
+    }
+
+    @Test
+    fun `a request rejected here is not replayed at a clean restart, so it is never rejected twice`() {
+        // §8.17: the reject raised the high-water. "exchange unavailable" needed the directory, so a
+        // replay would decide it again, as sent.
+        val (sent, received) = start(broadcast = null).use { adapter ->
+            val session = adapter.logon()
+            adapter.send(session, order("ORD-1"))
+            adapter.awaitReply(session, "the reject") { it[11] == "ORD-1" && it[58] == Texts.EXCHANGE_UNAVAILABLE }
+            pollUntil(*adapter.all(), what = "logout sent") { session.startLogout() > 0 }
+            pollUntil(*adapter.all(), what = "logged out") { !session.isConnected }
+            session.lastSentMsgSeqNum() to session.lastReceivedMsgSeqNum()
+        }
+        start().use { adapter ->
+            assertEquals(0, adapter.rig.backend.store.size, "nothing rebuilt: ${adapter.rig.log}")
+            adapter.awaitExchange()
+            val session = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
+            pollFor(300, *adapter.all())
+            assertTrue(session.messages().none { it.seqNum > received && it[11] == "ORD-1" }, "${session.messages()}")
         }
     }
 

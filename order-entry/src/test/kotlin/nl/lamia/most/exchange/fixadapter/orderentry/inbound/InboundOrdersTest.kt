@@ -26,6 +26,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
+import kotlin.test.assertSame
 import kotlin.test.assertTrue
 
 /**
@@ -702,6 +703,387 @@ class InboundOrdersTest {
         assertTrue(assertNotNull(store.find(P, 1L)).isInFlight, "restored in flight, settled by the fence (§3.4)")
     }
 
+    // ================================================================ recovery of lost rows, §8.17
+
+    /** The archive replays a message at startup, before the directory has come. */
+    private fun replay(type: String, seq: Int, fields: List<Pair<Int, String>>, possDup: Boolean = false, sequenceIndex: Int = 0): Action {
+        securities.isReady = false
+        val bytes = fix(type, seq, fields, possDup)
+        return inbound.onReplayed(P, sequenceIndex, MessageTypeEncoding.packMessageType(type), UnsafeBuffer(bytes), 0, bytes.size)
+    }
+
+    private fun replayOrder(seq: Int, clOrdId: String = "ORD-$seq", vararg extra: Pair<Int, String>, possDup: Boolean = false): Action =
+        replay("D", seq, fields(listOf(11 to clOrdId, 55 to "ACME", 54 to "1", 60 to TIME, 38 to "10", 40 to "2", 44 to "100.25"), extra), possDup)
+
+    private fun replayCancel(seq: Int, origClOrdId: String, clOrdId: String = "CXL-$seq", vararg extra: Pair<Int, String>): Action =
+        replay("F", seq, fields(listOf(41 to origClOrdId, 11 to clOrdId, 55 to "ACME", 54 to "1", 60 to TIME), extra))
+
+    /** The directory arrives: what recovery rebuilt is resolved, refusals answered by the outbound path. */
+    private fun directoryArrives(): Int {
+        securities.isReady = true
+        return inbound.resolveRecovered { row, text -> outbound.refuse(row, text) }.also { archive() }
+    }
+
+    @Test
+    fun `a replayed 35=D with no row is rebuilt in flight, never sent and never answered, its shard resolved once the directory arrives`() {
+        assertEquals(Action.CONTINUE, replayOrder(7, extra = arrayOf(59 to "1")))
+        archive()
+        val row = assertNotNull(store.find(P, 7L))
+        assertTrue(row.isUnresolved, "the directory is not there yet")
+        assertEquals(RequestRow.NO_SHARD, row.shardId)
+        assertFalse(row.acknowledged)
+        assertTrue(row.isInFlight, "the fence settles it (§3.4): a reject if never sequenced, its reports if it was")
+        assertEquals(10_00000000L, row.origQty)
+        assertEquals('1'.code.toByte(), row.timeInForce)
+        assertEquals(1L, inbound.rebuilt)
+
+        assertEquals(1, directoryArrives())
+        assertEquals(ACME, row.securityId)
+        assertEquals(2, row.shardId, "its security's shard, before that shard's restoreInFlight")
+        assertTrue(row.isInFlight)
+        assertEquals(ACME, restartedRow(7L).securityId, "stored resolved")
+        assertTrue(venue.orders.isEmpty(), "the exchange does not check clOrdId: sent again, it is a second order")
+        assertTrue(replies.sent.isEmpty() && client.sent.isEmpty(), "never answered")
+    }
+
+    private fun restartedRow(clOrdId: Long): RequestRow {
+        restart()
+        return assertNotNull(store.find(P, clOrdId))
+    }
+
+    @Test
+    fun `what the message decides is decided again in recovery, and answered by no one`() {
+        replay("D", 1, listOf(11 to "BAD-1", 55 to "ACME", 54 to "1", 60 to TIME, 38 to "10", 40 to "2", 44 to "1", 9999 to "x"))
+        replayOrder(2, extra = arrayOf(38 to "0"))
+        replayOrder(3, extra = arrayOf(40 to "1"))
+        replayOrder(4, extra = arrayOf(59 to "6"))
+        archive()
+        assertEquals(0, store.size)
+        assertTrue(replies.sent.isEmpty(), "${replies.sent}")
+        assertEquals(0, directoryArrives())
+    }
+
+    @Test
+    fun `a replayed request at or below the high-water with no row was handled already, and is skipped`() {
+        store.handled(P, 5L)
+        replayOrder(4)
+        replayOrder(5)
+        replayOrder(6)
+        assertEquals(listOf(6L), listOf(4L, 5L, 6L).filter { store.find(P, it) != null })
+    }
+
+    @Test
+    fun `a replayed duplicate ClOrdID is not rebuilt, PossDup or not`() {
+        order(1, clOrdId = "ORD-A")
+        venue.orders.clear()
+        replayOrder(2, clOrdId = "ORD-A")
+        replayOrder(3, clOrdId = "ORD-A", possDup = true)
+        assertNull(store.find(P, 2L))
+        assertNull(store.find(P, 3L))
+        assertTrue(replies.sent.isEmpty())
+    }
+
+    @Test
+    fun `a blocked session's replayed request is not rebuilt`() {
+        store.block(P, 0)
+        replayOrder(1)
+        assertNull(store.find(P, 1L))
+    }
+
+    @Test
+    fun `a recovered order whose security the directory does not know is refused, OrdRejReason 99 unknown security`() {
+        replayOrder(1, extra = arrayOf(55 to "NOPE"))
+        directoryArrives()
+        assertEquals(listOf(Triple("ORD-1", '8' to 99, Texts.UNKNOWN_SECURITY)), answered())
+        val row = assertNotNull(store.find(P, 1L))
+        assertEquals(RequestRow.NO_SECURITY, row.securityId, "stated with no 48")
+        assertFalse(row.isInFlight)
+        assertFalse(row.isUnresolved)
+        assertTrue(venue.orders.isEmpty())
+    }
+
+    @Test
+    fun `a recovery that stops before the directory loses nothing, the next start replays the unresolved row and resolves it`() {
+        replayOrder(3)
+        replayOrder(4)
+        restart()
+        assertEquals(3L, store.replayFrom(P), "no later than its lowest unresolved row")
+        replayOrder(3)
+        replayOrder(4)
+        assertEquals(0L, inbound.rebuilt, "held already: the same request again")
+        assertEquals(2, directoryArrives(), "their copies kept again")
+        assertEquals(listOf(2, 2), listOf(3L, 4L).map { store.find(P, it)!!.shardId })
+        assertEquals(5L, store.replayFrom(P))
+    }
+
+    @Test
+    fun `a replayed cancel is rebuilt sent whatever its order's state, so it is never sent again`() {
+        order(1)
+        order(2)
+        acknowledge("ORD-2")
+        venue.orders.clear()
+        replayCancel(3, "ORD-1")
+        replayCancel(4, "ORD-2")
+        val parkedLive = assertNotNull(store.find(P, 3L))
+        val sentLive = assertNotNull(store.find(P, 4L))
+        assertEquals(CancelState.SENT, parkedLive.cancelState, "parked live, or sent: a write lost after it may have acknowledged its order")
+        assertEquals(CancelState.SENT, sentLive.cancelState)
+        assertSame(parkedLive, store.find(P, 1L)?.pendingCancel)
+        assertEquals(2, directoryArrives())
+        assertEquals(listOf(2, 2), listOf(parkedLive.shardId, sentLive.shardId))
+        assertTrue(parkedLive.isInFlight && sentLive.isInFlight)
+        assertTrue(venue.cancels.isEmpty())
+        assertTrue(client.sent.isEmpty())
+    }
+
+    @Test
+    fun `a replayed cancel of an ambiguous order, or of one with a cancel pending, is rebuilt, since a lost write may have changed either`() {
+        order(1)
+        order(2)
+        store.find(P, 1L)!!.ambiguous = true
+        cancel(3, "ORD-2")
+        replayCancel(4, "ORD-1")
+        replayCancel(5, "ORD-2")
+        assertNotNull(store.find(P, 4L))
+        assertNotNull(store.find(P, 5L))
+        assertEquals(3L, store.find(P, 2L)?.pendingCancel?.clOrdId, "the first stays the pending one")
+    }
+
+    @Test
+    fun `a replayed cancel of a terminal order is too late again, and is not rebuilt`() {
+        order(1)
+        acknowledge("ORD-1", status = '2')
+        replayCancel(2, "ORD-1")
+        assertNull(store.find(P, 2L))
+    }
+
+    @Test
+    fun `in recovery a cancel's OrderID is checked only against an order the store has acknowledged`() {
+        order(1)
+        order(2)
+        acknowledge("ORD-2", exchangeOrderId = 9002L)
+        replayCancel(3, "ORD-1", extra = arrayOf(37 to "9001"))
+        replayCancel(4, "ORD-2", extra = arrayOf(37 to "1234"))
+        assertNotNull(store.find(P, 3L), "its acknowledgement may be a write the crash lost")
+        assertNull(store.find(P, 4L), "acknowledged with another OrderID: it was not this order's")
+    }
+
+    @Test
+    fun `a recovered cancel naming another security than its order's is refused once the directory can tell`() {
+        order(1)
+        acknowledge("ORD-1")
+        replayCancel(2, "ORD-1", extra = arrayOf(55 to "OTHER"))
+        assertNotNull(store.find(P, 2L), "the directory is not there to compare")
+        directoryArrives()
+        assertEquals(listOf(Triple("CXL-2", 99, Texts.ORDER_MISMATCH)), answered())
+        assertFalse(store.find(P, 2L)!!.isInFlight)
+    }
+
+    @Test
+    fun `a recovered cancel of a recovered order the directory does not know is refused with its order`() {
+        replayOrder(1, extra = arrayOf(55 to "NOPE"))
+        replayCancel(2, "ORD-1")
+        directoryArrives()
+        assertEquals(
+            listOf(Triple("ORD-1", '8' to 99, Texts.UNKNOWN_SECURITY), Triple("CXL-2", 99, Texts.UNKNOWN_SECURITY)),
+            answered(),
+        )
+    }
+
+    @Test
+    fun `a 35=D or 35=F rejected here raises the high-water once Artio took the reject, so a restart does not replay it`() {
+        order(1, extra = arrayOf(38 to "0"))
+        assertEquals(1L, store.highWater(P))
+        cancel(2, "NOWHERE")
+        assertEquals(2L, store.highWater(P))
+        replies.accepting = false
+        assertEquals(Action.ABORT, order(3, extra = arrayOf(38 to "0")))
+        assertEquals(2L, store.highWater(P), "refused, it is delivered again: not handled yet")
+        replies.accepting = true
+        securities.isReady = false
+        order(4)
+        assertEquals(4L, store.highWater(P), "exchange unavailable: decided from the directory, so it must not be decided again")
+        restart()
+        assertEquals(5L, store.replayFrom(P))
+    }
+
+    // ================================================================ 35=H and 35=AF, from the store, §3.3
+
+    private fun statusRequest(seq: Int, clOrdId: String, vararg extra: Pair<Int, String>): Action =
+        deliver("H", seq, fields(listOf(11 to clOrdId, 55 to "ACME", 54 to "1"), extra))
+
+    private fun massStatusRequest(seq: Int, reqId: String = "MS-$seq", type: String = "7", vararg extra: Pair<Int, String>): Action =
+        deliver("AF", seq, fields(listOf(584 to reqId, 585 to type), extra))
+
+    private fun statuses() = replies.sent.filterIsInstance<Reply.Status>()
+
+    /** The order's fills, as the outbound path would have stored them: [cum] at [price], AvgPx their notional over CumQty. */
+    private fun filled(clOrdId: String, cum: Long, price: Long = 100_25000000L) {
+        val row = assertNotNull(store.findByFix(clOrdId))
+        row.cumQty = cum
+        row.leavesQty = row.origQty - cum
+        val n = nl.lamia.most.exchange.fixadapter.orderentry.outbound.Notional().apply { add(price, cum) }
+        row.notionalHi = n.hi
+        row.notionalLo = n.lo
+        store.update(row)
+    }
+
+    @Test
+    fun `a 35=H is answered from the store with a 35=8 ExecType I, pending new before any report, its OrdStatusReqID echoed`() {
+        order(1)
+        assertEquals(Action.CONTINUE, statusRequest(2, "ORD-1", 790 to "Q-1"))
+        val s = statuses().single()
+        assertEquals("ORD-1", s.clOrdId)
+        assertEquals('A', s.ordStatus, "OrdStatus A before any status was sent (§3.4)")
+        assertEquals(0L, s.orderId, "OrderID NONE until acknowledged")
+        assertEquals(0L to 10_00000000L, s.cumQty to s.leavesQty, "0 and OrderQty, as entered")
+        assertEquals("Q-1", s.ordStatusReqId)
+        assertNull(s.massStatusReqId)
+        assertEquals(1, venue.orders.size, "nothing sent for it")
+    }
+
+    @Test
+    fun `a 35=H states what the client was last told, AvgPx over the fills known`() {
+        order(1)
+        acknowledge("ORD-1", exchangeOrderId = 9001L, status = '1')
+        filled("ORD-1", cum = 4_00000000L)
+        statusRequest(2, "ORD-1")
+        val s = statuses().single()
+        assertEquals('1', s.ordStatus)
+        assertEquals(9001L, s.orderId)
+        assertEquals(4_00000000L to 6_00000000L, s.cumQty to s.leavesQty)
+        assertEquals(100_25000000L, s.avgPx)
+        assertFalse(s.statusUnknown)
+        assertNull(s.ordStatusReqId, "790 absent, none echoed")
+    }
+
+    @Test
+    fun `a 35=H for an ambiguous order says so, with OrdStatusUnknown and §3_4's Text, never a terminal status`() {
+        order(1)
+        acknowledge("ORD-1", status = '0')
+        store.findByFix("ORD-1")!!.ambiguous = true
+        statusRequest(2, "ORD-1")
+        val s = statuses().single()
+        assertEquals('0', s.ordStatus)
+        assertTrue(s.statusUnknown)
+        assertTrue(s.text!!.startsWith("STATUS UNKNOWN"), s.text)
+    }
+
+    @Test
+    fun `a 35=H naming a ClOrdID the store does not hold gets FIX 4_4's unknown-order answer`() {
+        statusRequest(1, "NOWHERE", 790 to "Q-9", 54 to "2")
+        assertEquals(listOf<Reply>(Reply.UnknownOrderStatus("NOWHERE", '2', "Q-9")), replies.sent)
+    }
+
+    @Test
+    fun `a 35=H naming a cancel's ClOrdID gets its order's status, 11 the cancel's and 41 the order's`() {
+        order(1)
+        acknowledge("ORD-1")
+        cancel(2, "ORD-1")
+        statusRequest(3, "CXL-2")
+        val s = statuses().single()
+        assertEquals("CXL-2" to "ORD-1", s.clOrdId to s.origClOrdId)
+        assertEquals('0', s.ordStatus)
+    }
+
+    @Test
+    fun `a 35=H whose answer Artio refuses is delivered again`() {
+        order(1)
+        replies.accepting = false
+        assertEquals(Action.ABORT, statusRequest(2, "ORD-1"))
+    }
+
+    @Test
+    fun `a 35=AF of type 7 states every open order of the session, in the order they came, the last with LastRptRequested`() {
+        order(1)
+        order(2)
+        order(3)
+        order(4)
+        acknowledge("ORD-2", status = '2') // filled: terminal, not open
+        acknowledge("ORD-3", status = '1')
+        store.findByFix("ORD-4")!!.ambiguous = true
+        store.insert(store.newRow().apply { // another participant's
+            kind = RowKind.ORDER; participantId = P + 1; clOrdId = 1L; fixClOrdId("THEIRS"); securityId = ACME; shardId = 2
+        })
+        replies.sent.clear()
+        assertEquals(Action.CONTINUE, massStatusRequest(5, "MS-1"))
+        val s = statuses()
+        assertEquals(listOf("ORD-1", "ORD-3", "ORD-4"), s.map { it.clOrdId })
+        assertEquals(listOf('A', '1', 'A'), s.map { it.ordStatus })
+        assertEquals(listOf(false, false, true), s.map { it.statusUnknown }, "an ambiguous order is open, and says so")
+        assertTrue(s.all { it.massStatusReqId == "MS-1" && it.totNumReports == 3 })
+        assertEquals(listOf(false, false, true), s.map { it.lastRptRequested })
+    }
+
+    @Test
+    fun `a 35=AF of type 1 states one security's open orders, and Side narrows either type`() {
+        order(1)
+        order(2, extra = arrayOf(55 to "OTHER"))
+        order(3, extra = arrayOf(54 to "2"))
+        massStatusRequest(4, "BY-SEC", "1", 55 to "ACME")
+        massStatusRequest(5, "BY-ISIN", "1", 48 to "NL0000000002", 22 to "4")
+        massStatusRequest(6, "SELLS", "7", 54 to "2")
+        val by = statuses().groupBy({ it.massStatusReqId }, { it.clOrdId })
+        assertEquals(listOf("ORD-1", "ORD-3"), by["BY-SEC"])
+        assertEquals(listOf("ORD-2"), by["BY-ISIN"])
+        assertEquals(listOf("ORD-3"), by["SELLS"])
+    }
+
+    @Test
+    fun `a 35=AF with no open order matching is a 35=j, reason 0, no open orders`() {
+        order(1)
+        acknowledge("ORD-1", status = '4')
+        massStatusRequest(2)
+        assertEquals(listOf<Reply>(Reply.BusinessReject(2, "AF", 0, Texts.NO_OPEN_ORDERS)), replies.sent)
+    }
+
+    @Test
+    fun `a 35=AF of type 1 with no security, one unknown, or before the directory is a 35=j saying which`() {
+        order(1)
+        massStatusRequest(2, type = "1")
+        massStatusRequest(3, type = "1", extra = arrayOf(55 to "NOPE"))
+        securities.isReady = false
+        massStatusRequest(4, type = "1", extra = arrayOf(55 to "ACME"))
+        assertEquals(
+            listOf<Reply>(
+                Reply.BusinessReject(2, "AF", 5, Texts.SECURITY_REQUIRED),
+                Reply.BusinessReject(3, "AF", 2, Texts.UNKNOWN_SECURITY),
+                Reply.BusinessReject(4, "AF", 4, Texts.EXCHANGE_UNAVAILABLE),
+            ),
+            replies.sent,
+        )
+    }
+
+    @Test
+    fun `a 35=AF of any other MassStatusReqType is refused by the dictionary, a 35=3 with SessionRejectReason 5`() {
+        massStatusRequest(1, type = "8")
+        assertEquals(listOf<Reply>(Reply.SessionReject(1, "AF", 585, 5)), replies.sent)
+    }
+
+    @Test
+    fun `a 35=AF answer Artio refuses part way goes on from the next order when delivered again, nothing twice`() {
+        for (seq in 1..4) order(seq)
+        replies.acceptOnly = 2
+        assertEquals(Action.ABORT, massStatusRequest(5, "MS-5"))
+        replies.acceptOnly = null
+        assertEquals(Action.CONTINUE, massStatusRequest(5, "MS-5"))
+        val s = statuses()
+        assertEquals(listOf("ORD-1", "ORD-2", "ORD-3", "ORD-4"), s.map { it.clOrdId })
+        assertTrue(s.all { it.totNumReports == 4 })
+        assertEquals(listOf(false, false, false, true), s.map { it.lastRptRequested })
+
+        massStatusRequest(6, "MS-6")
+        assertEquals(4, statuses().count { it.massStatusReqId == "MS-6" }, "a new request starts over")
+    }
+
+    @Test
+    fun `a 35=H or 35=AF replayed from the archive is answered by no one`() {
+        order(1)
+        replay("H", 2, listOf(11 to "ORD-1", 55 to "ACME", 54 to "1"))
+        replay("AF", 3, listOf(584 to "MS", 585 to "7"))
+        assertTrue(replies.sent.isEmpty())
+    }
+
     // ================================================================ 35=G, other types
 
     @Test
@@ -753,6 +1135,26 @@ class InboundOrdersTest {
         }
         assertEquals(count, quiet.sent)
         assertTrue(0L in windows, "bytes allocated per window of 2,000 orders decoded, validated, stored and sent: $windows")
+    }
+
+    @Test
+    fun `a 35=H answered from the store allocates nothing`() {
+        order(1)
+        acknowledge("ORD-1", status = '1')
+        store.findByFix("ORD-1")!!.ambiguous = true // the longest answer: §3.4's Text
+        val request = fix("H", 2, listOf(11 to "ORD-1", 790 to "Q-1", 55 to "ACME", 54 to "1"))
+        val buffer = UnsafeBuffer(request)
+        fun run(times: Int) = repeat(times) {
+            check(inbound.onMessage(P, NoReplies, 0, Constants.ORDER_STATUS_REQUEST_MESSAGE, buffer, 0, request.size, 0L) == Action.CONTINUE)
+        }
+        run(20_000)
+        val threads = ManagementFactory.getThreadMXBean() as com.sun.management.ThreadMXBean
+        val windows = (0 until 5).map {
+            val before = threads.currentThreadAllocatedBytes
+            run(2_000)
+            threads.currentThreadAllocatedBytes - before
+        }
+        assertTrue(0L in windows, "bytes allocated per window of 2,000 35=H answered: $windows")
     }
 
     // ================================================================ models

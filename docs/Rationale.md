@@ -428,3 +428,28 @@ Adapters.md §2). Fencing a PossDup with no row needs `restoreInFlight` after th
 rejects a lawful resend of a request that never went out. What sending once archived costs is the
 archive's fsync on every order's path: not measured yet, and no figure is given without
 `perf-claim`.
+
+**As built (2026-10-27, slice 4c): where the replay starts, and what it may not decide again.**
+The replay starts at the participant's high-water + 1, and that is complete only because rows are
+inserted in `clOrdId` order. Artio hands the library no message ahead of a gap (`isValid()` false;
+the handler drops it, and the client resends it in order), and RocksDB recovers a prefix (R§4). So
+every row a crash takes lies above every row it leaves. Retention breaks that, because it removes
+rows from below; so the floor records the highest one it dropped, in the same batch as the drop.
+A request rejected here raises the high-water too. Without that, the requests a client sent last,
+rejected for a reason that needed the directory ("exchange unavailable" before it came), would be
+replayed at every clean restart. They would be rebuilt, fenced, and rejected a second time. The
+second reject was accepted for a host crash, not as the cost of every restart. The write is on
+the reject path only.
+
+Recovery decides again only what cannot have changed since the message was handled. That is the
+message itself, and the store's state that only moves forward: a ClOrdID held, an order terminal,
+an order's acknowledged OrderID. The store after a crash is a prefix of an earlier time, so a
+write the crash lost can have acknowledged an order, cleared its ambiguity, or answered a cancel
+that was pending. A check that reads any of those is skipped, so recovery errs towards *sent*,
+which the fence turns into a reject if it was wrong. It never errs towards a request that is not
+held, which would leave the exchange's reports for it with no row.
+
+The row of a request rebuilt before the directory came is stored *unresolved*. At the next start
+the replay begins no later than the lowest such row, so a stop before the directory comes loses
+nothing. Holding the security in the row instead would change the row's format for a state that
+lasts only until the first directory.

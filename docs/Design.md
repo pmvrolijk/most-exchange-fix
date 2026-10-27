@@ -233,8 +233,17 @@ except a 35=j, which is never answered.
 | 35=F, the order terminal | 35=9, CxlRejReason 0, *too late*, answered locally |
 | 35=F, the order ambiguous | Answered locally (§3.4) |
 | 35=G | **Rejected:** 35=9 with CxlRejResponseTo 2 and CxlRejReason 2, Text "replace not supported" (decided 2026-10-09: the exchange has no replace, and the adapter does minimum) |
-| 35=H | Answered from the order store with a 35=8, ExecType I. The exchange has no per-order status query |
-| 35=AF | Answered from the order store: one 35=8 ExecType I per open order, with MassStatusReqID, TotNumReports and LastRptRequested. The store is exact, because it is reconciled by the SDK's own mass status at startup and after each reconnect |
+| 35=H | Answered from the order store with a 35=8, ExecType I. The exchange has no per-order status query. Looked up by ClOrdID (11) alone. The 35=8 states what the client was last told (below), with OrdStatusReqID (790) echoed. **Decided 2026-10-27** (the recommendation): a ClOrdID the store does not hold (never seen, or dropped by retention) gets FIX 4.4's answer for an unknown order. That is a 35=8 with ExecType I, OrdStatus 8, OrdRejReason 5 and Text "unknown order", OrderID `NONE`, and ClOrdID, Side and the security echoed from the request. A cancel's ClOrdID gets its order's status, 11 the cancel's and 41 the order's, as a cancel's report does |
+| 35=AF | Answered from the order store: one 35=8 ExecType I per open order, with MassStatusReqID, TotNumReports and LastRptRequested. The store is exact, because it is reconciled by the SDK's own mass status at startup and after each reconnect. **Decided 2026-10-27**, each the recommendation. **MassStatusReqType 7**, all the session's orders, **and 1**, one security, named and resolved as in a 35=D (§5.1); Side (54) narrows either. The dictionary cuts 585 to those two (§5.4), so any other is a 35=3. Type 1 with no security named is a 35=j, BusinessRejectReason 5; with one the directory does not know, reason 2, Text "unknown security"; before the directory, reason 4, Text "exchange unavailable". **No matching open order** is a 35=j, BusinessRejectReason 0, Text "no open orders": it invents no fields, as a 35=8 would have to (Side). **A reply Artio refuses part way** aborts the 35=AF as usual. Its progress is kept in memory, so the redelivery goes on from the next order, with no duplicate and the same TotNumReports. A process crash loses the rest, and the client asks again |
+
+**What a status states** (35=H, 35=AF; decided 2026-10-27, from §3.4 and §5.3). It is the order's
+row as the client was last told it. OrdStatus is the last sent, `A` before any. CumQty and
+LeavesQty are as stored: 0 and OrderQty before the first report. AvgPx is over the fills known,
+and OrderID is `NONE` until acknowledged. ExecID is the adapter's own (§5.3). An ambiguous order has
+OrdStatusUnknown=Y and §3.4's Text. *Open*, for 35=AF, is every order not in a terminal state,
+whether pending new, still to send, or ambiguous. The answer does not wait for the SDK's own mass
+status: what changes after it reaches the client unsolicited (§5.3). Allocation: a 35=H allocates
+nothing; a 35=AF lists the session's open orders once.
 
 - **A reply Artio refuses** (back-pressured) aborts the inbound message (`Action.ABORT`), which
   Artio delivers again. Every path is safe to run again: state changes only after the reply that
@@ -473,8 +482,9 @@ not `validate()`'s.
   - **An order's row:** its 35=8, 11 its ClOrdID and no 41. An unsolicited CANCELED carries the
     RejectReason's name as Text when it is not NONE.
   - **No row** (decided 2026-10-25): its row was lost in a host crash (§6.1). Logged, counted, and
-    consumed, until recovery from Artio's archive is built (§8.17). The client misses that order's
-    reports until then.
+    consumed. Since recovery was built (2026-10-27, §8.17) the row of every request that reached
+    the exchange is rebuilt from the archive before the first report, so this is left for a request
+    the archive does not have, which never reached the exchange either (§8.20).
 - **Each report's 35=8** has the fields of the table above. 55 is the security's Symbol from the
   directory, with 48 its `securityId` and 22=8; 2362 and 2964 are echoed as sent. LastPx and LastQty
   on a TRADE only. **AvgPx** is the stored notional over CumQty, rounded half up at 8 decimals.
@@ -525,6 +535,9 @@ Decided 2026-10-20. **FIX 4.4, only the message types the adapter handles, plus 
   2026-10-20).
 - **5001 OrdStatusUnknown**, Boolean, user-defined, on 35=8 and 35=9 (§3.4; number decided
   2026-10-20).
+- **585 MassStatusReqType cut to 1 and 7** (decided 2026-10-27, §3.3), the one FIX 4.4 code set
+  the script cuts (`CODE_SET_CUTS`). Any other value is refused by the decoder, a 35=3 with
+  SessionRejectReason 5, as a 2964 of 3 is.
 
 **Artio generates the codecs** at build time (`CodecGenerationTool`, the Gradle task
 `generateFixCodecs`), into `nl.lamia.most.exchange.fixadapter.codecs`. The engine's
@@ -636,8 +649,9 @@ Decided 2026-10-09: **RocksDB, with the working set in memory.**
       cumulative notional (128-bit), the ambiguous flag, and room for §5.5's fields. A cancel: its
       order's `clOrdId`, and its state, *parked*, *sent* or *answered*;
     - `meta`: per participant and shard, the durable first-missing `reportSeq`; per participant,
-      the highest `sequenceIndex`, and an id collision's block, as the `sequenceIndex` it was
-      found at (§3.3; deleted when the block lifts). **Per shard** (found 2026-10-25, slice 4):
+      the highest `sequenceIndex`, an id collision's block, as the `sequenceIndex` it was
+      found at (§3.3; deleted when the block lifts), and the high-water floor: the highest
+      `clOrdId` dropped by retention or answered here with no row (§8.17, added 2026-10-27). **Per shard** (found 2026-10-25, slice 4):
       each shard's engine numbers a participant's reports on its own (most-exchange
       `MatchingEngineService`), and each shard has its own `OrderEntrySession`. One value per
       participant would have resumed one shard from another's sequence.
@@ -658,9 +672,10 @@ Decided 2026-10-09: **RocksDB, with the working set in memory.**
   Not handed back: a parked cancel, which was never sent, and a request the SDK already settled
   (a fate's 35=8 owed, or sent: an order rejected or ambiguous). Restored, it could be settled
   again, an `AMBIGUOUS` order as `NEVER_SEQUENCED` by a startup resend that completes. Then the SDK's resend and mass status
-  reconcile them. **Not yet built** (§8.17, shape decided 2026-10-26): a row lost in a host crash
-  is rebuilt from Artio's archive before the bind, by replaying each session's inbound messages
-  past the store's last row for that participant.
+  reconcile them. **Built 2026-10-27** (§8.17): a row lost in a host crash is rebuilt from
+  Artio's archive before the bind, by replaying each session's inbound messages past the
+  participant's high-water. A recovered order's security, and so its shard, is resolved when the
+  directory arrives, before `restoreInFlight`.
 
 ### 6.2 Execution report delivery: consume a report only behind the archive
 
@@ -970,6 +985,52 @@ The archive's recorded position (§6.2) then means durable.
       store (a duplicate ClOrdID, the block, a cancel's order) is decided again, the same way. The
       security is kept as the message names it, and its shard is resolved once the directory
       arrives, before that shard's `restoreInFlight`.
+
+    **Built 2026-10-27** (slice 4c). The two points left open were confirmed, each the
+    recommendation: the floor in `meta`, and an unknown security refused. Two more were found while
+    building it, and are marked *as built*:
+    - **Where the replay starts: the participant's high-water + 1.** The high-water is the highest
+      `clOrdId` the store has handled for the participant: a row it holds, a row retention dropped,
+      or a request answered here (below). Rows are inserted in `clOrdId` order, and RocksDB recovers a
+      prefix (§6.1), so every row a crash can take is above it. They are in order because Artio
+      hands the library no message ahead of a gap: such a message is `isValid()` false (Artio
+      0.182 `Session.requestResend`), and the client resends it in order. The replay starts no lower
+      than (stored `sequenceIndex`, 1), because the stored index is written after every row of a
+      lower one. A replay from past the last message of an old index brings the next index's
+      messages (spike (f), 2026-10-27). `SEQUENCE_NUMBER_TOO_HIGH`, nothing past it, is a success.
+    - **The floor** (confirmed 2026-10-27): the highest `clOrdId` retention dropped, per participant
+      in `meta`, written in the batch that drops the rows. Without it, a participant whose rows were
+      all dropped would replay its whole history.
+    - **A request answered here raises the high-water** (as built 2026-10-27), in the same `meta`
+      entry. This covers a 35=D or 35=F rejected here, once Artio has taken the reject. Without
+      it, every restart, crash or not, would replay the last requests rejected here. A reject that
+      needed the directory would be decided again, and the client would get a second reject. It
+      costs one RocksDB write, not fsynced, on the reject path only.
+    - **Recovery mode.** It runs while the participant's startup request is out, and only for an
+      offline session, so a live message is never taken for a replayed one. Nothing is sent and
+      nothing is answered. A message at or below the high-water with no row was handled already,
+      and is skipped. These are decided again, the same way:
+      - `validate()` and the §5.1 field checks;
+      - a duplicate ClOrdID;
+      - the block, which a message at a higher `sequenceIndex` lifts, as its Logon did;
+      - a cancel's order, its Side, and its OrderID, the last only if the store has the order
+        acknowledged;
+      - *too late*, if the store has the order terminal.
+
+      Some state a write lost after the request may have changed: the order's acknowledgement, its
+      ambiguity, and a cancel already pending. Those checks are skipped, so the request is
+      rebuilt: an order not acknowledged, a cancel *sent*. The startup waits until every startup
+      request has completed with its session held, and refuses to start after its timeout.
+    - **The security, once the directory arrives.** It is resolved from a copy of the message kept
+      in memory, before any shard's session is created. Until then the row is stored with its
+      security *unresolved*, and at a start the participant's replay begins no later than its
+      lowest unresolved row. A stop before the directory arrives so loses nothing: the replay brings
+      the message back, and its copy is kept again.
+      - **An unknown security** (confirmed 2026-10-27) is refused through the outbound path: a 35=8
+        with OrdRejReason 99, "unknown security", and no 48, since there is none to state.
+      - **A recovered cancel** that names a security other than its order's is refused, "does not
+        match the order". One whose order has no shard (refused, or never routed) is refused with
+        its order's Text, or "exchange unavailable".
 18. **A library reconnect freezes the durable `reportSeq` until a restart** (as built 2026-10-25,
     §6.2). Positions taken on the old connection are never confirmed, so its lowest unconfirmed
     `reportSeq` stays a floor, and the rows waiting for the archive are answered again after the

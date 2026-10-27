@@ -2,7 +2,6 @@ package nl.lamia.most.exchange.fixadapter.orderentry.artio
 
 import org.agrona.concurrent.CachedEpochClock
 import uk.co.real_logic.artio.Reply
-import uk.co.real_logic.artio.library.FixLibrary
 import uk.co.real_logic.artio.messages.SessionReplyStatus
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -69,17 +68,46 @@ class ReportSessionsTest {
     }
 
     @Test
-    fun `at startup each session Artio knows is requested offline with nothing replayed, and written to once handed over`() {
-        sessions.requestAtStartup(P, ID)
-        assertEquals(listOf(ID to (FixLibrary.NO_MESSAGE_REPLAY to FixLibrary.NO_MESSAGE_REPLAY)), handover.requests.map { it.sessionId to (it.replayFrom to it.replayIndex) })
+    fun `at startup each session Artio knows is requested offline replaying its archive from where recovery asks, and written to once handed over`() {
+        // §8.17: from the participant's high-water + 1, here (sequenceIndex 2, MsgSeqNum 8).
+        sessions.requestAtStartup(P, ID, replayFrom = 8, replayIndex = 2)
+        assertEquals(listOf(ID to (8 to 2)), handover.requests.map { it.sessionId to (it.replayFrom to it.replayIndex) })
         assertNull(sessions.session(P), "not before the handover")
         assertTrue(sessions.isRequesting)
-        val offline = Model(ID, active = false, lastSent = 4)
-        sessions.acquired(P, offline)
+        assertTrue(sessions.isReplaying(P), "the replay is under way until the request completes")
+        val offline = Model(ID, active = false, sequenceIndex = 2, lastSent = 4)
+        sessions.acquired(P, offline) // Artio hands the session over before its replay (spike (f))
+        assertTrue(sessions.isReplaying(P), "acquired, its replay still to come")
         handover.requests.single().reply.complete(SessionReplyStatus.OK)
         sessions.doWork()
         assertSame(offline, sessions.session(P))
         assertTrue(!sessions.isRequesting)
+        assertTrue(!sessions.isReplaying(P) && !sessions.isAnyReplaying)
+    }
+
+    @Test
+    fun `nothing past the replay's start is a success, the session handed over all the same`() {
+        sessions.requestAtStartup(P, ID, replayFrom = 8, replayIndex = 0)
+        val offline = Model(ID, active = false, lastSent = 4, lastReceived = 7)
+        sessions.acquired(P, offline)
+        handover.requests.single().reply.complete(SessionReplyStatus.SEQUENCE_NUMBER_TOO_HIGH)
+        sessions.doWork()
+        assertSame(offline, sessions.session(P))
+        assertTrue(!sessions.isAnyReplaying)
+        assertEquals(1, handover.requests.size, "not requested again")
+    }
+
+    @Test
+    fun `a startup request that fails is still replaying, and is made again with the same replay`() {
+        // The startup waits for every replay (§8.17): a failed one must not look finished.
+        sessions.requestAtStartup(P, ID, replayFrom = 8, replayIndex = 2)
+        handover.requests.single().reply.complete(SessionReplyStatus.OTHER_SESSION_OWNER)
+        sessions.doWork()
+        assertTrue(!sessions.isRequesting)
+        assertTrue(sessions.isReplaying(P) && sessions.isAnyReplaying)
+        clock.advance(100L)
+        sessions.doWork()
+        assertEquals(listOf(8 to 2, 8 to 2), handover.requests.map { it.replayFrom to it.replayIndex })
     }
 
     @Test
@@ -108,7 +136,7 @@ class ReportSessionsTest {
     @Test
     fun `an offline session whose client logs on is not written to once its logout is under way`() {
         val offline = Model(ID, active = false, lastSent = 4)
-        sessions.requestAtStartup(P, ID)
+        sessions.requestAtStartup(P, ID, replayFrom = 1, replayIndex = 0)
         sessions.acquired(P, offline)
         assertSame(offline, sessions.session(P), "offline: written to, archived, resent at the Logon")
         offline.active = true // the client logged on

@@ -56,7 +56,8 @@ import java.util.function.IntSupplier
  *
  * Reports and fates go to the client through the outbound path (§5.3), on each participant's session
  * online or offline (§6.3). Every session Artio knows is requested offline during construction, so it
- * must come before the acceptor binds. The durable `reportSeq` of each shard's SDK session advances
+ * must come before the acceptor binds. That request replays the session's archived inbound messages
+ * past what the store has handled, and rows a host crash lost are rebuilt from them (§8.17). The durable `reportSeq` of each shard's SDK session advances
  * only behind the archive ([delivery], §6.2), and a request is sent only once the archive has its
  * 35=D or 35=F ([sends], §6.1, §8.20). [links] makes a gateway's link; tests may stand a model
  * of the exchange in for Aeron's.
@@ -81,7 +82,7 @@ class OrderEntryBackend(
     val store: OrderStore = owned(OrderStore.open(config.storeDir))
     private val index = DirectoryIndex()
     private val venue = ShardVenue()
-    private val replies = ArtioReplies()
+    private val replies = ArtioReplies(index)
     val sessions = ReportSessions(ArtioSessions, log)
     private val reports = ArtioReports(index, sessions)
     private val directory = DirectoryClient()
@@ -165,8 +166,9 @@ class OrderEntryBackend(
     /**
      * Every configured order-entry session Artio knows, requested offline before the acceptor binds,
      * so a report for a client not logged on is written to its session and resent at its Logon
-     * (Design.md §6.3). Waits for the replies: until the bind no client can log on, which is why
-     * nothing need be replayed.
+     * (Design.md §6.3). Each replays its archived inbound messages from the participant's high-water
+     * + 1, and the inbound path rebuilds the rows a host crash lost (§8.17). Waits until every replay
+     * is complete with its session held: until the bind no client can log on.
      */
     private fun acquireOffline() {
         val deadline = System.nanoTime() + STARTUP_TIMEOUT_NS
@@ -178,12 +180,19 @@ class OrderEntryBackend(
             val key = info.sessionKey() ?: continue
             val configured = acceptor.sessions.find(senderCompId = key.localCompId(), targetCompId = key.remoteCompId()) ?: continue
             if (configured.role != Role.ORDER_ENTRY) continue
-            sessions.requestAtStartup(checkNotNull(configured.participantId), info.sessionId())
+            val participantId = checkNotNull(configured.participantId)
+            val from = store.replayFrom(participantId)
+            sessions.requestAtStartup(participantId, info.sessionId(), replayFrom = (from and 0xffffffffL).toInt(), replayIndex = (from ushr 32).toInt())
         }
-        while (sessions.isRequesting) {
-            check(System.nanoTime() < deadline) { "order entry: the offline sessions were not handed over within ${STARTUP_TIMEOUT_NS / 1_000_000_000L} s" }
+        while (sessions.isRequesting || sessions.isAnyReplaying) {
+            check(System.nanoTime() < deadline) {
+                "order entry: the offline sessions were not handed over, their archives replayed, within ${STARTUP_TIMEOUT_NS / 1_000_000_000L} s"
+            }
             library.poll(FRAGMENT_LIMIT)
             sessions.doWork()
+        }
+        if (inbound.rebuilt > 0) {
+            log("order entry: ${inbound.rebuilt} requests rebuilt from the archive, in flight once the directory names their shards (Design.md §8.17)")
         }
     }
 
@@ -205,6 +214,14 @@ class OrderEntryBackend(
 
     private fun onDirectory() {
         venue.learn(directory.securities)
+        // Before any shard's session, so the requests recovery rebuilt are restored with the rest (§8.17).
+        if (inbound.awaitingDirectory > 0) {
+            val resolved = inbound.resolveRecovered { row, text ->
+                log("order entry: participant ${row.participantId}: recovered request ${row.clOrdId} refused, $text (Design.md §8.17)")
+                outbound.refuse(row, text)
+            }
+            log("order entry: $resolved recovered requests resolved against the directory")
+        }
         for (route in directory.shards) {
             val listed = venue.endpoints(route.shardId)
             if (listed == null) {
@@ -301,6 +318,12 @@ class OrderEntryBackend(
         ): Action {
             if (!messageInfo.isValid || isSessionMessage(messageType)) return Action.CONTINUE
             if (sequenceIndex > store.highestSequenceIndex(participantId)) store.recordSequenceIndex(participantId, sequenceIndex)
+            // The archive's, replayed at startup (§8.17): no live message comes on an offline session.
+            if (sessions.isReplaying(participantId) && !session.isActive) {
+                // Past a block's index, its Logon came, and lifted it (§3.3); Logons are not replayed to here.
+                store.liftBlock(participantId, sequenceIndex)
+                return inbound.onReplayed(participantId, sequenceIndex, messageType, buffer, offset, length)
+            }
             replies.session = session
             return inbound.onMessage(participantId, replies, sequenceIndex, messageType, buffer, offset, length, position)
         }

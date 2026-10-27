@@ -183,11 +183,11 @@ class OutboundReports(
             notional.set(order.notionalHi, order.notionalLo)
             e.avgPx = notional.average(order.cumQty) // the fills known (§5.3)
             if (cum > order.cumQty) {
-                var at = e.text.putAscii(0, LOST_FILLS_HEAD)
+                var at = e.text.putStringWithoutLengthAscii(0, LOST_FILLS_HEAD)
                 at += StatusUnknownText.putDecimal(e.text, at, order.cumQty)
-                at += e.text.putAscii(at, " to ")
+                at += e.text.putStringWithoutLengthAscii(at, " to ")
                 at += StatusUnknownText.putDecimal(e.text, at, cum)
-                at += e.text.putAscii(at, LOST_FILLS_TAIL)
+                at += e.text.putStringWithoutLengthAscii(at, LOST_FILLS_TAIL)
                 e.textLength = at
             }
             val position = clients.send(e)

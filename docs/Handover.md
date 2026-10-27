@@ -403,3 +403,78 @@ another one restore and one reject. And the backend's call marking a held sessio
 closed a window no test could force: `ReportSessions` now notices a session become active itself,
 and that is tested (R7). Two were rewritten, one that did not compile and one whose text did not
 match. The 35=8's allocation through Artio was not measured.
+
+### 2i. Send behind the archive, and recovery of lost rows (slices 4b, 4c), 2026-10-26–27
+
+**Found by reading Artio 0.182, confirmed by spike (g):** the library handles an inbound 35=D
+before the fsynced archive has it (500 of 500, up to ~40 KB ahead). R§4 assumed the archive holds
+every 35=D whose row a host crash can lose. It did not, so a client's PossDup resend of a lost
+35=D would have been a second order. **Decided** (the recommendation, R§12): a request is sent only
+once the archive's `RecordingPos` on the engine's inbound stream has passed its 35=D/F.
+
+**Slice 4b, committed `6cf4adb`:** `inbound.ArchivedSends` sends rows in arrival order from the
+duty cycle. `artio.InboundRecording` finds the inbound stream's `RecordingPos`. A back-pressured
+send is retried from the row, and a refused one is answered by `OutboundReports.refuse`.
+Non-negotiable 2 changed, 11 new.
+
+**Slice 4c, recovery (Design §8.17), decided 2026-10-26 and confirmed 2026-10-27:** the startup
+offline `requestSession` replays each session's archive from the participant's high-water + 1. A
+replayed request is never sent or answered, and one that passes is rebuilt in flight for the fence
+to settle. Its security is resolved when the directory arrives, and an unknown one is refused,
+OrdRejReason 99 "unknown security". The floor of dropped rows is kept in `meta`.
+
+**Found while building, and built (as built, Design §8.17):**
+- **A local reject must raise the high-water.** Otherwise every clean restart replays the last
+  requests rejected here, and "exchange unavailable" before the directory is decided again as
+  sent, then rejected twice. It shares the floor's `meta` entry.
+- **A rebuilt row's security must survive a stop before the directory.** It is stored
+  *unresolved*, and the next replay starts no later than it.
+- **Recovery cannot decide again what a lost write may have changed**: an acknowledgement, an
+  ambiguity, a pending cancel. Those checks are skipped, so it errs towards *sent*.
+- **The replay must be over before the bind.** A failed startup request kept the old loop
+  finished; it now waits for every replay to complete with its session held.
+- Spike (f) gained a case: a replay from past the end of an old `sequenceIndex` brings the next
+  index's messages.
+
+**The check.** 186 tests in order-entry, 22 of them new and 1 rewritten:
+- the store +3: the high-water, the floor across a drop, where the replay starts;
+- the inbound path +14: recovery's decisions, resolution, local rejects raising the high-water;
+- the report sessions +2: the replay lasts until the session is held, and a failed one retries;
+- end to end +3: a lost 35=D rebuilt, never sent again, rejected by the fence; a recovered order
+  whose security is gone refused with no 48; a clean restart rejects nothing twice.
+
+20 mutations, all caught (one first written so it did not compile, then rewritten). `./gradlew
+build` green, the recovery spike 4 of 4. Not tested: a lost 35=F's row end to end, and a block
+lifted during a replay.
+
+### 2j. 35=H and 35=AF from the store (slice 5), 2026-10-27
+
+**Decided with the user** (each the recommendation; Design §3.3, §5.4):
+- a 35=H naming a ClOrdID not held is FIX 4.4's unknown-order 35=8: ExecType I, OrdStatus 8,
+  OrdRejReason 5. A cancel's ClOrdID gets its order's status, 11 the cancel's and 41 the order's;
+- 35=AF serves MassStatusReqType 7 and 1, with Side narrowing either. `extract_fix44.py` cuts 585 to
+  those two, so the decoder answers any other with a 35=3, as for 2964=3;
+- no matching open order gets a 35=j, reason 0, "no open orders", which invents no Side;
+- an answer Artio refuses part way aborts the 35=AF and resumes from the next order on
+  redelivery, so nothing is sent twice.
+
+**Built:**
+- `InboundOrders.onStatusRequest` and `onMassStatusRequest`. A status states the row as the client
+  was last told it (§3.3, "What a status states"). The ambiguous flag and §3.4's Text come from the
+  same code as the outbound restatement.
+- `artio.ExecutionReportWriter`: the 35=8 encoding from an `OutgoingExecution`, moved out of
+  `ArtioReports` so `ArtioReplies` writes the same 35=8, plus 790, 584, 911 and 912.
+- The dictionary was regenerated from the verified FIX 4.4 repository jar. The script reproduced
+  the committed XML byte for byte before the cut.
+
+**Found:** Artio 0.182's `MutableAsciiBuffer.putAscii(String)` calls `String.getBytes`, so every
+Text written with it allocated: §3.4's status Text (128 bytes), the fates' Texts, the reject
+replies. The new 35=H allocation test found it. All 14 uses in `order-entry` now use Agrona's
+`putStringWithoutLengthAscii`.
+
+**The check.** 203 tests in order-entry, 17 of them new:
+- 14 in the inbound path, one of them that a 35=H allocates nothing;
+- 3 end to end through a real initiator: a 35=H for an order known and unknown, a 35=AF after a
+  141=Y Logon, and a 35=AF with nothing open.
+
+16 mutations, all caught, the dictionary's cut of 585 among them. `./gradlew build` green.

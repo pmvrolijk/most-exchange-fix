@@ -45,7 +45,10 @@ object ArtioSessions : SessionView<Session> {
  * archives without sending, and Artio's own resend delivers at the next Logon.
  *
  * - **At startup**, before the acceptor binds, every configured session Artio knows is requested
- *   offline ([requestAtStartup]). No client can be logged on yet, so nothing is replayed.
+ *   offline ([requestAtStartup]), replaying the archived inbound messages past what the store has
+ *   handled: recovery of lost rows (Design.md §8.17). No client can be logged on yet. Until the
+ *   request has completed with the session held, the participant [isReplaying]: its messages are
+ *   the archive's. Artio replays them before it completes the request (spike (f)).
  * - **Once a logged-on session stops being active** (its logout under way, or its disconnect not yet
  *   seen), nothing is written to it: [session] is null. Written then, a report is numbered by the
  *   library on a session the engine is taking back (found 2026-10-25, below).
@@ -89,6 +92,9 @@ class ReportSessions<S : Any>(
         var replayIndex = FixLibrary.NO_MESSAGE_REPLAY
         var retryAtMs = NO_RETRY
 
+        /** The startup request, replaying the archive, has not yet completed with the session held (§8.17). */
+        var replaying = false
+
         /** The last MsgSeqNum the library wrote on the session, at its `sequenceIndex`, as last seen. */
         var lastSent = 0
         var lastSentIndex = -1
@@ -123,6 +129,16 @@ class ReportSessions<S : Any>(
         }
         return if (h.online) null else session
     }
+
+    /** The participant's startup replay is under way: a message on its offline session is the archive's (§8.17). */
+    fun isReplaying(participantId: Long): Boolean = byParticipant.get(participantId)?.replaying ?: false
+
+    /** Any participant's startup replay still under way, retries included. */
+    val isAnyReplaying: Boolean
+        get() {
+            for (i in 0 until all.size) if (all[i].replaying) return true
+            return false
+        }
 
     /** Any request or release still waiting for its reply. */
     val isRequesting: Boolean
@@ -162,12 +178,17 @@ class ReportSessions<S : Any>(
         h.online = active
     }
 
-    /** Requests [sessionId] offline, before the acceptor binds (Design.md §6.3). */
-    fun requestAtStartup(participantId: Long, sessionId: Long) {
+    /**
+     * Requests [sessionId] offline before the acceptor binds (Design.md §6.3), replaying its archived
+     * inbound messages from ([replayIndex], [replayFrom]) (§8.17). `SEQUENCE_NUMBER_TOO_HIGH`, nothing
+     * past it, hands the session over all the same, and is a success.
+     */
+    fun requestAtStartup(participantId: Long, sessionId: Long, replayFrom: Int, replayIndex: Int) {
         val h = held(participantId)
         if (h.session != null) return
         h.sessionId = sessionId
-        request(h, FixLibrary.NO_MESSAGE_REPLAY, FixLibrary.NO_MESSAGE_REPLAY)
+        h.replaying = true
+        request(h, replayFrom, replayIndex)
     }
 
     /** The engine took [session] back. Reports wait until it is requested back. */
@@ -228,7 +249,9 @@ class ReportSessions<S : Any>(
                 if (request.isExecuting) continue
                 h.request = null
                 work++
-                if (h.session == null) {
+                if (h.session != null) {
+                    h.replaying = false
+                } else {
                     log(
                         "order entry: participant ${h.participantId}: requestSession ${h.sessionId} -> " +
                             "${request.state()} ${request.resultIfPresent() ?: request.error() ?: ""}; reports wait, retried in $retryMs ms",

@@ -4,6 +4,8 @@ import nl.lamia.most.exchange.client.SendResult
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.NewOrderSingleDecoder
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.OrderCancelReplaceRequestDecoder
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.OrderCancelRequestDecoder
+import nl.lamia.most.exchange.fixadapter.codecs.decoder.OrderStatusRequestDecoder
+import nl.lamia.most.exchange.fixadapter.orderentry.outbound.OutgoingExecution
 import nl.lamia.most.exchange.fixadapter.orderentry.store.RequestRow
 import nl.lamia.most.exchange.sbe.Side
 import nl.lamia.most.exchange.sbe.SmpStrategy
@@ -75,6 +77,15 @@ interface ClientReplies {
     /** 35=9, CxlRejResponseTo 2 (§3.3). */
     fun rejectReplace(replace: OrderCancelReplaceRequestDecoder, order: RequestRow?, cxlRejReason: Int, text: String): Boolean
 
+    /** 35=8, ExecType I: an order's status, to a 35=H or one of a 35=AF's answers (§3.3), from [status] and its row. */
+    fun status(status: OutgoingExecution): Boolean
+
+    /**
+     * 35=8, ExecType I, OrdStatus 8, OrdRejReason 5, Text "unknown order", OrderID `NONE`: to a 35=H
+     * naming a ClOrdID the store does not hold. ClOrdID, Side, the security and 790 from the request.
+     */
+    fun unknownOrderStatus(request: OrderStatusRequestDecoder): Boolean
+
     /** A Logout with [text], then the disconnect. */
     fun logout(text: String)
 }
@@ -104,4 +115,6 @@ object Texts {
     const val NOT_SEQUENCED_ORDER = "not sequenced (gateway failover)"
     const val NOT_SEQUENCED_CANCEL = "not sequenced"
     const val CANCEL_STATUS_UNKNOWN = "cancel status unknown"
+    const val NO_OPEN_ORDERS = "no open orders"
+    const val SECURITY_REQUIRED = "security required for MassStatusReqType 1"
 }

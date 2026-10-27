@@ -7,7 +7,11 @@ import nl.lamia.most.exchange.fixadapter.codecs.builder.RejectEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.NewOrderSingleDecoder
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.OrderCancelReplaceRequestDecoder
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.OrderCancelRequestDecoder
+import nl.lamia.most.exchange.fixadapter.codecs.decoder.OrderStatusRequestDecoder
+import nl.lamia.most.exchange.fixadapter.orderentry.exchange.DirectoryIndex
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.ClientReplies
+import nl.lamia.most.exchange.fixadapter.orderentry.inbound.Texts
+import nl.lamia.most.exchange.fixadapter.orderentry.outbound.OutgoingExecution
 import nl.lamia.most.exchange.fixadapter.orderentry.store.RequestRow
 import org.agrona.AsciiSequenceView
 import org.agrona.concurrent.EpochClock
@@ -27,8 +31,10 @@ import uk.co.real_logic.artio.util.MutableAsciiBuffer
  * copy them, and a reset points every field back at the encoder's own buffer. Allocation-free once
  * each [logout] Text has been seen.
  */
-class ArtioReplies(private val clock: EpochClock = SystemEpochClock.INSTANCE) : ClientReplies {
+class ArtioReplies(directory: DirectoryIndex, private val clock: EpochClock = SystemEpochClock.INSTANCE) : ClientReplies {
     lateinit var session: Session
+
+    private val statuses = ExecutionReportWriter(directory, clock)
 
     private val reject = RejectEncoder()
     private val businessReject = BusinessMessageRejectEncoder()
@@ -54,7 +60,7 @@ class ArtioReplies(private val clock: EpochClock = SystemEpochClock.INSTANCE) : 
         val b = businessReject
         b.reset()
         b.refSeqNum(refSeqNum).refMsgType(refMsgType).businessRejectReason(reason)
-        b.text(this.text, 0, this.text.putAscii(0, text))
+        b.text(this.text, 0, this.text.putStringWithoutLengthAscii(0, text))
         return send(b)
     }
 
@@ -64,7 +70,7 @@ class ArtioReplies(private val clock: EpochClock = SystemEpochClock.INSTANCE) : 
         e.orderID(NONE, 0, NONE.capacity())
         e.execID(execId, 0, nextExecId())
         e.execType(REJECTED).ordStatus(REJECTED).ordRejReason(ordRejReason)
-        e.text(this.text, 0, this.text.putAscii(0, text))
+        e.text(this.text, 0, this.text.putStringWithoutLengthAscii(0, text))
         e.leavesQty(0L, 0).cumQty(0L, 0).avgPx(0L, 0)
         e.clOrdID(order.clOrdID(view))
         e.side(order.side())
@@ -90,7 +96,7 @@ class ArtioReplies(private val clock: EpochClock = SystemEpochClock.INSTANCE) : 
             c.ordStatusUnknown(true)
             c.text(this.text, 0, StatusUnknownText.write(this.text, 0, order.cumQty))
         } else {
-            c.text(this.text, 0, this.text.putAscii(0, text))
+            c.text(this.text, 0, this.text.putStringWithoutLengthAscii(0, text))
         }
         return send(c)
     }
@@ -99,8 +105,29 @@ class ArtioReplies(private val clock: EpochClock = SystemEpochClock.INSTANCE) : 
         val c = startCancelReject(order, cxlRejReason, REPLACE)
         c.clOrdID(replace.clOrdID(view))
         c.origClOrdID(replace.origClOrdID(view))
-        c.text(this.text, 0, this.text.putAscii(0, text))
+        c.text(this.text, 0, this.text.putStringWithoutLengthAscii(0, text))
         return send(c)
+    }
+
+    override fun status(status: OutgoingExecution): Boolean = send(statuses.encode(status, session))
+
+    override fun unknownOrderStatus(request: OrderStatusRequestDecoder): Boolean {
+        val e = execution
+        e.reset()
+        e.orderID(NONE, 0, NONE.capacity())
+        e.execID(execId, 0, nextExecId())
+        e.execType(ORDER_STATUS).ordStatus(REJECTED).ordRejReason(UNKNOWN_ORDER_REASON)
+        e.text(this.text, 0, this.text.putStringWithoutLengthAscii(0, Texts.UNKNOWN_ORDER))
+        e.leavesQty(0L, 0).cumQty(0L, 0).avgPx(0L, 0)
+        e.clOrdID(request.clOrdID(view))
+        if (request.hasOrdStatusReqID()) e.ordStatusReqID(request.ordStatusReqID(view))
+        e.side(request.side())
+        val instrument = e.instrument()
+        if (request.hasSymbol()) instrument.symbol(request.symbol(view))
+        if (request.hasSecurityID()) instrument.securityID(request.securityID(view))
+        if (request.hasSecurityIDSource()) instrument.securityIDSource(request.securityIDSource(view))
+        e.transactTime(transactTime.buffer(), transactTime.encode(clock.time()))
+        return send(e)
     }
 
     override fun logout(text: String) {
@@ -144,6 +171,10 @@ class ArtioReplies(private val clock: EpochClock = SystemEpochClock.INSTANCE) : 
     private companion object {
         val NONE = UnsafeBuffer("NONE".toByteArray(Charsets.US_ASCII))
         const val REJECTED = '8'
+        const val ORDER_STATUS = 'I'
+
+        /** OrdRejReason 5, unknown order. */
+        const val UNKNOWN_ORDER_REASON = 5
         const val PENDING_NEW = 'A'
         const val CANCEL = '1'
         const val REPLACE = '2'
@@ -161,9 +192,9 @@ object StatusUnknownText {
 
     /** Writes it at [offset]; returns its length. [cumQty] is fixed-point, 8 implied decimals. */
     fun write(buffer: MutableAsciiBuffer, offset: Int, cumQty: Long): Int {
-        var at = offset + buffer.putAscii(offset, HEAD)
+        var at = offset + buffer.putStringWithoutLengthAscii(offset, HEAD)
         at += putDecimal(buffer, at, cumQty)
-        at += buffer.putAscii(at, TAIL)
+        at += buffer.putStringWithoutLengthAscii(at, TAIL)
         return at - offset
     }
 

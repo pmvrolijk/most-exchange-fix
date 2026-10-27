@@ -1,6 +1,7 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.outbound
 
 import nl.lamia.most.exchange.fixadapter.orderentry.store.RequestRow
+import org.agrona.DirectBuffer
 import uk.co.real_logic.artio.util.MutableAsciiBuffer
 
 /**
@@ -76,6 +77,32 @@ class OutgoingExecution {
     /** 0: no Text. */
     var textLength = 0
 
+    /** OrdStatusReqID (790) of the 35=H answered, echoed; [ordStatusReqIdLength] 0 when none (§3.3). */
+    var ordStatusReqId = MutableAsciiBuffer(ByteArray(REQ_ID_CAPACITY))
+        private set
+    var ordStatusReqIdLength = 0
+        private set
+
+    /** MassStatusReqID (584) of the 35=AF answered, echoed with [totNumReports] and [lastRptRequested]; 0 when none. */
+    var massStatusReqId = MutableAsciiBuffer(ByteArray(REQ_ID_CAPACITY))
+        private set
+    var massStatusReqIdLength = 0
+        private set
+    var totNumReports = 0
+    var lastRptRequested = false
+
+    fun ordStatusReqId(id: DirectBuffer, offset: Int, length: Int) {
+        if (length > ordStatusReqId.capacity()) ordStatusReqId = MutableAsciiBuffer(ByteArray(length))
+        ordStatusReqId.putBytes(0, id, offset, length)
+        ordStatusReqIdLength = length
+    }
+
+    fun massStatusReqId(id: DirectBuffer, offset: Int, length: Int) {
+        if (length > massStatusReqId.capacity()) massStatusReqId = MutableAsciiBuffer(ByteArray(length))
+        massStatusReqId.putBytes(0, id, offset, length)
+        massStatusReqIdLength = length
+    }
+
     fun reset(order: RequestRow) {
         this.order = order
         cancel = null
@@ -91,15 +118,20 @@ class OutgoingExecution {
         ordRejReason = NO_REASON
         statusUnknown = false
         textLength = 0
+        ordStatusReqIdLength = 0
+        massStatusReqIdLength = 0
+        totNumReports = 0
+        lastRptRequested = false
     }
 
     fun text(value: String) {
-        textLength = text.putAscii(0, value)
+        textLength = text.putStringWithoutLengthAscii(0, value)
     }
 
     companion object {
         const val NO_REASON = -1
         const val TEXT_CAPACITY = 256
+        private const val REQ_ID_CAPACITY = 64
     }
 }
 
@@ -127,6 +159,6 @@ class OutgoingCancelReject {
     }
 
     fun text(value: String) {
-        textLength = text.putAscii(0, value)
+        textLength = text.putStringWithoutLengthAscii(0, value)
     }
 }

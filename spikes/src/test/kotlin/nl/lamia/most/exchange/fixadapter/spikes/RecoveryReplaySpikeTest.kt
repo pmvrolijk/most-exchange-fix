@@ -103,6 +103,44 @@ class RecoveryReplaySpikeTest {
         }
     }
 
+    /**
+     * Recovery replays from the store's high-water + 1 (Design §8.17). After a 141=Y reset that can be
+     * past the last message of the old `sequenceIndex`: the replay must still bring the new index's.
+     */
+    @Test
+    fun `(f) a replay from past the end of an old sequenceIndex brings the next index's messages`() {
+        FixNode(File(dir, "initiator"), fileSyncLevel = 0).use { initiator ->
+            Library(initiator, "clients").use { clients ->
+                pollUntil(clients, what = "client library") { clients.library.isConnected }
+
+                var lastAtZero = 0
+                val (_, after) = firstLife(clients) { client, all ->
+                    val a = sendOrders(client, all, "A", 2)
+                    logout(client, *all)
+                    lastAtZero = client.lastSentMsgSeqNum() // the client's Logout, the last at index 0
+                    val reset = clients.library.initiate(
+                        SessionConfiguration.builder().address("localhost", port).senderCompId("OE1")
+                            .targetCompId(Messages.ACCEPTOR_COMP_ID).credentials("OE1", "secret")
+                            .sequenceNumbersPersistent(true).resetSeqNum(true).build(),
+                    )
+                    val again = await(reset, *all, what = "the 141=Y logon")
+                    listOf(a, sendOrders(again, all, "B", 2))
+                }
+
+                secondLife(clients, replayIndex = 0, replayFrom = lastAtZero + 1) { oe, status, _ ->
+                    println("FINDING (f, past the end): requestSession from (0, ${lastAtZero + 1}) -> $status")
+                    println("FINDING (f, past the end): the library saw, in order:\n  " + oe.trace.joinToString("\n  "))
+                    val orders = oe.trace.filter { it.startsWith("35=D") }
+                    assertEquals(
+                        listOf("B1" to 1, "B2" to 1),
+                        orders.map { Regex("11=(\\S+)").find(it)!!.groupValues[1] to Regex("index=(\\d+)").find(it)!!.groupValues[1].toInt() },
+                        "the next index's orders ($after)",
+                    )
+                }
+            }
+        }
+    }
+
     @Test
     fun `(g) the library handles an inbound 35=D before the fsynced archive has recorded it`() {
         FixNode(acceptorDir, port, fileSyncLevel = 1).use { acceptor ->

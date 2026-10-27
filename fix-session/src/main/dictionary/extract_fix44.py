@@ -14,7 +14,8 @@ What it keeps (decided 2026-10-20, Design.md §5.4):
 - only the application messages the adapter handles, each with its complete FIX 4.4 structure,
   so that a standard field the adapter does not read is accepted and ignored (§5.1);
 - only the fields, components and code sets those reach.
-Then it adds the adapter's own tags (ADDITIONS below). Nothing else differs from FIX 4.4.
+Then it adds the adapter's own tags (ADDITIONS below), and cuts the code sets in CODE_SET_CUTS to
+the values the adapter serves. Nothing else differs from FIX 4.4.
 
 Run it again, never edit its output, when the set of messages or the additions change.
 """
@@ -50,6 +51,13 @@ ADDITIONS_BY_MSG_TYPE = {
     "D": [(2362, False), (2964, False)],
     "8": [(2362, False), (2964, False), (5001, False)],
     "9": [(5001, False)],
+}
+
+# FIX 4.4 code sets cut to what the adapter serves, so that decoder validation answers any other value
+# with a 35=3, SessionRejectReason 5, as for 2964 above.
+CODE_SET_CUTS = {
+    # MassStatusReqType: 1 one security, 7 all orders (decided 2026-10-27, Design.md §3.3).
+    585: {"1", "7"},
 }
 
 HEADER_ID = "1024"
@@ -179,7 +187,7 @@ class Writer:
             values = []
             if type_name in repo.code_sets:
                 type_name, codes = repo.code_sets[type_name]
-                values = [(v, upper_snake(n)) for v, n in codes]
+                values = [(v, upper_snake(n)) for v, n in codes if number not in CODE_SET_CUTS or v in CODE_SET_CUTS[number]]
             lines.extend(field_lines(number, name, type_name.upper(), values))
         for number, name, type_name, values in ADDITIONAL_FIELDS:
             lines.extend(field_lines(number, name, type_name, values))

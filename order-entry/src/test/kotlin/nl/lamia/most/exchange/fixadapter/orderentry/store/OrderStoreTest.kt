@@ -416,7 +416,7 @@ class OrderStoreTest {
     }
 
     @Test
-    fun `the store holds state for a participant with a row, a sequenceIndex, a first-missing or a block`() {
+    fun `the store holds state for a participant with a row, a sequenceIndex, a first-missing, a block or a floor`() {
         // Design.md §3.2, "Where the guards run": what makes a session Artio does not know a wipe.
         val s = open()
         s.recordSequenceIndex(P1, 0) // not stored: 0 is where every session starts
@@ -426,9 +426,58 @@ class OrderStoreTest {
         s.saveFirstMissing(P2, 1, 5L)
         s.block(P3, 0)
         assertEquals(InsertResult.NEW, s.insert(s.order(P4, 7L, "ORD-7")))
+        s.handled(P6, 3L)
         val again = restart()
-        for (p in listOf(P1, P2, P3, P4)) assertTrue(again.holdsState(p), "participant $p")
+        for (p in listOf(P1, P2, P3, P4, P6)) assertTrue(again.holdsState(p), "participant $p")
         assertFalse(again.holdsState(P5))
+    }
+
+    // ---------------------------------------------------------------- recovery's high-water, §8.17
+
+    @Test
+    fun `the high-water is the highest clOrdId handled, a row held or a request answered with no row, and survives a restart`() {
+        val s = open()
+        assertEquals(0L, s.highWater(P1))
+        s.insert(s.order(P1, id(0, 3), "ORD-3"))
+        s.insert(s.cancel(P1, id(0, 5), "CXL-5", origClOrdId = id(0, 3)))
+        assertEquals(id(0, 5), s.highWater(P1), "a cancel's row counts as an order's does")
+        s.handled(P1, id(0, 4))
+        assertEquals(id(0, 5), s.highWater(P1), "never lowered")
+        s.handled(P1, id(0, 9))
+        assertEquals(id(0, 9), s.highWater(P1), "answered here with no row: a restart must not replay it")
+        assertEquals(0L, s.highWater(P2), "per participant")
+        assertEquals(id(0, 9), restart().highWater(P1))
+    }
+
+    @Test
+    fun `rows retention drops leave their highest clOrdId as the participant's floor, across restarts`() {
+        val s = open(tradingDate = YESTERDAY)
+        s.saveFirstMissing(P1, 0, 100L)
+        for (seq in 1..3) {
+            s.insert(s.order(P1, id(0, seq), "OLD-$seq", entered = YESTERDAY) {
+                acknowledged = true; ordStatus = '2'.code.toByte(); lastReportSeq = 50L
+            })
+        }
+        val today = restart(TODAY)
+        assertEquals(0, today.size, "all dropped")
+        assertEquals(id(0, 3), today.highWater(P1), "else the replay would bring the participant's whole history")
+        assertEquals(id(0, 3), restart(TODAY).highWater(P1), "kept in meta, the rows gone")
+        assertEquals(id(0, 4), restart(TODAY).replayFrom(P1))
+    }
+
+    @Test
+    fun `the replay starts past the high-water, at no lower sequenceIndex than the stored one, and no later than an unresolved row`() {
+        val s = open()
+        assertEquals(id(0, 1), s.replayFrom(P1), "nothing handled: from the start")
+        s.insert(s.order(P1, id(0, 7), "ORD-7"))
+        assertEquals(id(0, 8), s.replayFrom(P1))
+        s.recordSequenceIndex(P1, 2)
+        assertEquals(id(2, 1), s.replayFrom(P1), "the stored index is written after every row of a lower one")
+
+        s.insert(s.order(P2, id(1, 5), "REC-5") { securityId = RequestRow.UNRESOLVED_SECURITY; shardId = RequestRow.NO_SHARD })
+        s.insert(s.order(P2, id(1, 9), "ORD-9"))
+        assertTrue(s.find(P2, id(1, 5))!!.isUnresolved)
+        assertEquals(id(1, 5), restart().replayFrom(P2), "its message brought back, to resolve against the directory")
     }
 
     // ---------------------------------------------------------------- refusals at load
@@ -511,6 +560,7 @@ class OrderStoreTest {
         const val P3 = 1003L
         const val P4 = 1004L
         const val P5 = 1005L
+        const val P6 = 1006L
         const val TODAY = 20261026
         const val YESTERDAY = 20261023
 

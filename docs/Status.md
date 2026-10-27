@@ -3,14 +3,26 @@
 Where the adapter stands, what is open, and what to do next. **This is the session entry point** —
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
-Last updated 2026-10-25. **`fix-session` is implemented: the acceptor (2026-10-15) and the FIX
+Last updated 2026-10-27. **`fix-session` is implemented: the acceptor (2026-10-15) and the FIX
 dictionary (2026-10-20). `order-entry` has its order store, its inbound path, its outbound path and
 durable delivery (2026-10-25, slices 1–4 of §3 item 5): a client's 35=D reaches its shard's gateway
 over Aeron, the exchange's reports and fates come back as 35=8 and 35=9, logged on or not, and a
-`reportSeq` is consumed only once the archive has its 35=8. Recovery of lost rows, 35=H/AF (slice
-5) and `market-data` are still to build, and there is no runnable adapter yet (no `main`).** 2026-10-20: the dictionary is FIX 4.4's own,
+`reportSeq` is consumed only once the archive has its 35=8. Since 2026-10-27 a request goes out only
+once the archive has its 35=D/F (4b), rows a host crash lost are rebuilt from the archive at
+startup (4c), and 35=H and 35=AF are answered from the store (slice 5). `market-data` is still to
+build, and there is no runnable adapter yet (no `main`).** 2026-10-20: the dictionary is FIX 4.4's own,
 cut to the handled message types, and Artio was found not to validate application messages, so the
 backend must (CLAUDE.md non-negotiable 9, Design §5.4, Rationale §8).
+
+Decided 2026-10-26–27 (Design §6.1, §8.17, §8.20; Rationale §12), each the recommendation:
+- **A request is sent only once the archive has its 35=D/F** (CLAUDE.md non-negotiables 2, 11).
+- **Lost rows are read back by the startup `requestSession` replay** from the participant's
+  high-water + 1. A replayed request is never sent or answered; one that passes is rebuilt in flight.
+- **A floor in `meta`**: the highest `clOrdId` retention dropped (confirmed 2026-10-27).
+- **A recovered order whose security the directory does not know** is refused, OrdRejReason 99
+  "unknown security", with no 48 (confirmed 2026-10-27).
+- As built 2026-10-27: a request rejected here raises the high-water, so a clean restart replays
+  nothing already answered; a rebuilt row is stored *unresolved* until the directory comes.
 
 Decided 2026-10-25 (Design §3.2, §6.1), each the recommendation:
 - **The store is keyed by `participantId`,** not Artio's session id, which a wipe of Artio's state
@@ -28,8 +40,9 @@ Decided 2026-10-25 (Design §3.2, §6.1), each the recommendation:
   shard needs. An endpoint that moves later is logged, not followed (Design §3.5).
 - **The collision's block** is stored, the Logon accepted and then logged out by the library, and
   lifted by any reset that raises the `sequenceIndex`, the client's 141=Y included (Design §3.3).
-- **A report for a row the store lost** (a host crash) is logged, counted and consumed until
-  recovery from Artio's archive is built (Design §8.17, Rationale §10).
+- **A report for a row the store lost** (a host crash) is logged, counted and consumed (Design
+  §5.3, Rationale §10). Since recovery (2026-10-27) that is left for a request the archive does not
+  have, which never reached the exchange either.
 - **Fills a mass status reveals** are a 35=8 ExecType I with the new CumQty, AvgPx over the fills
   known, and a Text saying what is missing (Design §5.3).
 - **An answer with no `reportSeq`** (a fate, a restatement, a parked cancel's answer, a gateway's
@@ -88,7 +101,7 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 3 — `fix-session`, `order-entry`, `market-data`; packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 164 (the store 21, the inbound path 44, the outbound path 34, AvgPx 5, delivery 12, the report sessions 11, the directory index 7, the config 5, the backend end to end 24, SDK wiring 1); `market-data` 1. `./gradlew build` green 2026-10-25. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 3 on 2026-10-26 |
+| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 203 (the store 24, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the directory index 7, the config 5, the backend end to end 30, SDK wiring 1); `market-data` 1. `./gradlew build` green 2026-10-27. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -319,7 +332,7 @@ parallel with item 2.
      **Decided 2026-10-26: a request is sent only once the archive has its 35=D/F** (Design §6.1,
      §8.20; R§12; CLAUDE.md non-negotiable 2 changed, 11 new). The send moves into the duty cycle,
      from the row. Built in two parts:
-     - ~~**4b, send behind the archive**~~ **Done 2026-10-26**, uncommitted (Design §3.3, §6.1,
+     - ~~**4b, send behind the archive**~~ **Done 2026-10-26**, committed `6cf4adb` (Design §3.3, §6.1,
        §8.20). `inbound.ArchivedSends`: rows to send, in arrival order, from the duty cycle, once
        `artio.InboundRecording` (the `RecordingPos` of the engine's one inbound publication) has
        passed the message's position; a back-pressured send holds those behind it; a refused one
@@ -333,10 +346,33 @@ parallel with item 2.
          Adapters.md (line 49) still describes this adapter's back-pressure as `Action.ABORT`.
          No end-to-end test can hold the archive back, so the gate is proven in unit tests and by
          the mutations, and the wiring by orders still flowing end to end.
-     - **4c, recovery of lost rows** (§8.17). The plan, from the code as it stands:
+     - ~~**4c, recovery of lost rows**~~ **Done 2026-10-27**, uncommitted (Design §6.1, §8.17;
+       Rationale §12; non-negotiable 11 extended). Both points to confirm were confirmed. As built:
+       - `OrderStore`: the high-water per participant (rows, the floor of dropped rows written in
+         their drop batch, and requests rejected here), `replayFrom`, the floor in `holdsState`.
+       - `ReportSessions.requestAtStartup` replays from it; `isReplaying` until the request has
+         completed with the session held; the backend waits for every replay before the bind.
+       - `InboundOrders.onReplayed`: recovery mode, never sent or answered. It skips what lies at or
+         below the high-water with no row, decides again only what a lost write cannot have changed,
+         and rebuilds the rest *unresolved*. `resolveRecovered` runs at the first directory, before
+         any shard's session: an unknown security, a cancel's mismatched security, a cancel of an
+         order with no shard, each refused through the outbound path.
+       - The backend routes a message on an offline session during the replay to recovery, lifting
+         a block a higher `sequenceIndex` shows was lifted. A 35=8 for a security unknown states no 48.
+       - Spike (f) gained a case: a replay from past the end of index 0 brings index 1's messages.
+       - Tests 186 in order-entry (+22, 1 rewritten): store +3, inbound +14, report sessions +2,
+         end to end +3 (a lost 35=D rebuilt, never sent again, rejected by the fence; a recovered
+         order whose security is gone refused, no 48; a clean restart rejects nothing twice).
+         20 mutations, all caught; one first did not compile and was rewritten. `./gradlew build`
+         green; `RecoveryReplaySpikeTest` 4 of 4.
+       - **Not done here:** no end-to-end test loses a 35=F's row, or replays across a block's
+         lift (the lift in the handler is untested). The startup gives up after 10 s, so a replay
+         from a high-water of 0, a wiped store beside Artio's state, could refuse the start. The four
+         restart tests take ~37 s each, as before 4c: the SDK's fence, not looked into.
+     - *(The plan as it stood before building, kept for the record:)*
        - `requestAtStartup` replays from each participant's high-water + 1: the highest `clOrdId`
          it has held, (`sequenceIndex`, MsgSeqNum). Retention drops rows, so a participant whose
-         rows were all dropped would otherwise replay its whole history: **to confirm**, the
+         rows were all dropped would otherwise replay its whole history: **confirmed 2026-10-27**, the
          highest `clOrdId` dropped kept in `meta` as a floor, written at `load` before the drops
          (a prefix keeps it below the truth). `SEQUENCE_NUMBER_TOO_HIGH` (nothing past it) is a
          success here, as after a disconnect.
@@ -348,11 +384,31 @@ parallel with item 2.
          The rest is rebuilt in flight: an order not acknowledged, a cancel *sent* whatever its
          order's state, so a recovered request is never sent again.
        - The security is resolved once the directory arrives, from a copy of the message kept in
-         memory, before the shard sessions are created and `restoreInFlight` runs. **To confirm**:
+         memory, before the shard sessions are created and `restoreInFlight` runs. **Confirmed 2026-10-27**:
          a recovered order whose security the directory does not know is refused, OrdRejReason
          99 "unknown security", through `refuse`.
-   5. **35=H and 35=AF** from the store (until then they get a 35=j, "unsupported message type",
-      against Design §3.3). Then this repo's **e2e**, against most-exchange's real
+   5. ~~**35=H and 35=AF** from the store~~ **Done 2026-10-27**, uncommitted (Design §3.3, §5.4).
+      Decided with the user, each the recommendation:
+      - a 35=H for a ClOrdID not held gets FIX 4.4's unknown-order 35=8 (I, 8, OrdRejReason 5);
+      - 35=AF serves MassStatusReqType 7 and 1, with Side as a filter. 585 is cut in
+        `extract_fix44.py`, so any other type is a 35=3;
+      - no matching order gets a 35=j, "no open orders";
+      - a refused answer resumes where it stopped.
+
+      Built:
+      - `InboundOrders` answers both from the store;
+      - `artio.ExecutionReportWriter` is the 35=8 encoding, now shared by `ArtioReports` and
+        `ArtioReplies`;
+      - `OutgoingExecution` echoes 790 and 584/911/912.
+
+      **Found:** Artio's `MutableAsciiBuffer.putAscii(String)` allocates a byte array. Every Text,
+      §3.4's included, allocated on the path that claimed to allocate nothing; now
+      `putStringWithoutLengthAscii`. Tests 203 in order-entry (+17): inbound +14, one of them that a
+      35=H allocates nothing; end to end +3. 16 mutations, all caught, the dictionary's cut
+      among them. `./gradlew build` green.
+      - **Not done here:** the outbound path's own allocation is still not measured; a 35=AF
+        lists the session's orders through `store.forEach`, which allocates.
+   6. **This repo's e2e**, against most-exchange's real
       processes. That is the first test of `OrderEntrySession` through a real failover
       (most-exchange Status §3, item 13(a)).
 6. **Tooling** (Design §10): the paced FIX sender and the HTML latency report, with service and

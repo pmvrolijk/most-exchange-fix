@@ -75,6 +75,12 @@ class OrderStore private constructor(
 
         /** The `sequenceIndex` an id collision was found at, or [NOT_BLOCKED] (§3.3). */
         var blockedAt = NOT_BLOCKED
+
+        /** The highest `clOrdId` handled: a row held, a row dropped, or a request answered with no row (§8.17). */
+        var highWater = 0L
+
+        /** The part of [highWater] that no row held shows: stored in `meta`. */
+        var floor = 0L
     }
 
     /**
@@ -86,6 +92,7 @@ class OrderStore private constructor(
         loaded = true
         loadMeta()
         val drop = WriteBatch()
+        val dropped = Long2LongHashMap(0L)
         try {
             db.newIterator(orders).use { rows ->
                 rows.seekToFirst()
@@ -100,6 +107,7 @@ class OrderStore private constructor(
                     RowCodec.decode(UnsafeBuffer(v), v.size, row)
                     if (isDroppable(row, tradingDate)) {
                         drop.delete(orders, k)
+                        if (row.clOrdId > dropped.get(row.participantId)) dropped.put(row.participantId, row.clOrdId)
                         release(row)
                     } else {
                         index(rowsOf(row.participantId), row)
@@ -107,6 +115,15 @@ class OrderStore private constructor(
                     rows.next()
                 }
                 rows.status()
+            }
+            // The floor goes in the batch that drops the rows: a crash keeps both or neither (§8.17).
+            dropped.forEach { participantId, clOrdId ->
+                val p = rowsOf(participantId)
+                if (clOrdId > p.floor) {
+                    drop.put(meta, metaKeyOf(META_FLOOR, participantId), longValue(clOrdId))
+                    p.floor = clOrdId
+                    p.highWater = maxOf(p.highWater, clOrdId)
+                }
             }
             if (drop.count() > 0) db.write(writeOptions, drop)
         } finally {
@@ -140,6 +157,10 @@ class OrderStore private constructor(
                     }
                     META_SEQUENCE_INDEX -> p.highestSequenceIndex = v.getInt(0, ByteOrder.LITTLE_ENDIAN)
                     META_BLOCKED -> p.blockedAt = v.getInt(0, ByteOrder.LITTLE_ENDIAN)
+                    META_FLOOR -> {
+                        p.floor = v.getLong(0, ByteOrder.LITTLE_ENDIAN)
+                        p.highWater = maxOf(p.highWater, p.floor)
+                    }
                     else -> error("order store meta entry of type $type")
                 }
                 entries.next()
@@ -220,6 +241,7 @@ class OrderStore private constructor(
         row.nextSameHash = p.byFixHash.get(row.hash)
         p.byFixHash.put(row.hash, row)
         p.byClOrdId.put(row.clOrdId, row)
+        if (row.clOrdId > p.highWater) p.highWater = row.clOrdId
         row.stored = true
         size++
     }
@@ -312,13 +334,46 @@ class OrderStore private constructor(
     }
 
     /**
+     * The highest `clOrdId` handled for the participant (Design.md §8.17): a row held, a row
+     * retention dropped, or a request answered here with no row. 0 if none.
+     */
+    fun highWater(participantId: Long): Long = participants.get(participantId)?.highWater ?: 0L
+
+    /**
+     * A request answered here with no row, once Artio took the answer (§8.17): raises the stored
+     * floor if [clOrdId] is above the high-water, so a restart does not replay it.
+     */
+    fun handled(participantId: Long, clOrdId: Long) {
+        val p = rowsOf(participantId)
+        if (clOrdId <= p.highWater) return
+        metaValue.putLong(0, clOrdId, ByteOrder.LITTLE_ENDIAN)
+        putMeta(META_FLOOR, participantId, Long.SIZE_BYTES)
+        p.floor = clOrdId
+        p.highWater = clOrdId
+    }
+
+    /**
+     * The derived `clOrdId` the startup replay starts at (Design.md §8.17): the high-water + 1, no
+     * lower than the stored `sequenceIndex`'s MsgSeqNum 1, and no higher than the participant's
+     * lowest row whose security is still unresolved. Allocates: for startup.
+     */
+    fun replayFrom(participantId: Long): Long {
+        val p = participants.get(participantId) ?: return 1L
+        var from = maxOf(p.highWater + 1L, (p.highestSequenceIndex.toLong() shl 32) or 1L)
+        for (row in p.byClOrdId.values) {
+            if (row.isUnresolved && row.clOrdId < from) from = row.clOrdId
+        }
+        return from
+    }
+
+    /**
      * Whether anything is stored for the participant: a row, a `sequenceIndex` above 0, a durable
-     * first-missing above 1, or a block. A configured session Artio does not know while this holds
+     * first-missing above 1, a block, or a floor. A configured session Artio does not know while this holds
      * means Artio's state was wiped (Design.md §3.2).
      */
     fun holdsState(participantId: Long): Boolean {
         val p = participants.get(participantId) ?: return false
-        return !p.byClOrdId.isEmpty() || p.highestSequenceIndex > 0 || p.blockedAt != NOT_BLOCKED ||
+        return !p.byClOrdId.isEmpty() || p.highestSequenceIndex > 0 || p.blockedAt != NOT_BLOCKED || p.floor > 0L ||
             p.firstMissing.values.any { it > 1L }
     }
 
@@ -330,6 +385,21 @@ class OrderStore private constructor(
 
     private fun rowsOf(participantId: Long): ParticipantRows =
         participants.get(participantId) ?: ParticipantRows().also { participants.put(participantId, it) }
+
+    private fun metaKeyOf(type: Byte, participantId: Long): ByteArray =
+        ByteArray(META_KEY_LENGTH).also { UnsafeBuffer(it).apply { putByte(0, type); putLong(1, participantId, ByteOrder.BIG_ENDIAN) } }
+
+    private fun longValue(value: Long): ByteArray =
+        ByteArray(Long.SIZE_BYTES).also { UnsafeBuffer(it).putLong(0, value, ByteOrder.LITTLE_ENDIAN) }
+
+    /** Deletes a row from RocksDB alone, as a host crash loses it: for recovery's tests (§8.17). */
+    internal fun loseForTest(participantId: Long, clOrdId: Long) {
+        key.putLong(0, participantId, ByteOrder.BIG_ENDIAN)
+        key.putLong(Long.SIZE_BYTES, clOrdId, ByteOrder.BIG_ENDIAN)
+        val k = ByteArray(ORDER_KEY_LENGTH)
+        key.getBytes(0, k)
+        db.delete(orders, writeOptions, k)
+    }
 
     /** Writes [row] with its version byte replaced: how a row from a later adapter looks to this one. */
     internal fun corruptVersionForTest(row: RequestRow, version: Int) {
@@ -356,6 +426,7 @@ class OrderStore private constructor(
         private const val META_FIRST_MISSING: Byte = 1
         private const val META_SEQUENCE_INDEX: Byte = 2
         private const val META_BLOCKED: Byte = 3
+        private const val META_FLOOR: Byte = 4
         private const val NOT_BLOCKED = -1
 
         /** Rationale §4: a crash leaves a prefix. Never relax this without rereading that section. */

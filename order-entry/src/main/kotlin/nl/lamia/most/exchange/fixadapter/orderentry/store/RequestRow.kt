@@ -150,6 +150,12 @@ class RequestRow internal constructor() {
     /** Allocates. */
     fun fixClOrdIdAsString(): String = String(fixId, 0, fixClOrdIdLength, Charsets.US_ASCII)
 
+    /**
+     * A row recovery rebuilt before the directory arrived (Design.md §8.17): its security, an order's,
+     * or the check of the one a cancel names, waits for the directory.
+     */
+    val isUnresolved: Boolean get() = securityId == UNRESOLVED_SECURITY
+
     /** In a state no report will change: an order terminal and not ambiguous, a cancel answered. */
     val isFinished: Boolean
         get() = when (kind) {
@@ -210,6 +216,12 @@ class RequestRow internal constructor() {
 
         /** A request that reached no shard: refused before it was sent. */
         const val NO_SHARD = -1
+
+        /** [securityId] of a recovered request whose security waits for the directory (§8.17). */
+        const val UNRESOLVED_SECURITY = -2
+
+        /** [securityId] of a recovered order the directory does not know: refused, and stated with no 48. */
+        const val NO_SECURITY = -1
         private const val INITIAL_CLORDID_CAPACITY = 32
 
         /** OrdStatus filled, canceled, expired, rejected. */
