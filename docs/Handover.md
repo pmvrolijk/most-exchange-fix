@@ -478,3 +478,44 @@ replies. The new 35=H allocation test found it. All 14 uses in `order-entry` now
   141=Y Logon, and a 35=AF with nothing open.
 
 16 mutations, all caught, the dictionary's cut of 585 among them. `./gradlew build` green.
+
+### 2k. The first end-to-end run against most-exchange's processes, 2026-10-27
+
+**Decided with the user** (each the recommendation): the FIX client is a first cut of Design §10.1
+in a new `tools` module, driven by bash like most-exchange's `run-failover.sh`; the trading date is
+§3.6's calendar, built now; the `main` lives in a new `adapter` module.
+
+**Built:**
+- `orderentry.TradingCalendar` (§3.6, "As built"): zone, roll time, weekdays and a holiday file, read
+  without allocating between rolls. 15 tests, 6 mutations caught (one only after a zone ahead of
+  UTC was added: the first tests could not tell the UTC date from the local one).
+- `adapter`: `Adapter` and `main`. The backend runs on an `AgentRunner`, and the acceptor binds
+  only after it is constructed. 4 tests, one of them a real initiator's 35=D refused "exchange
+  unavailable" before the directory, which shows the duty cycle runs on its own thread.
+- `tools`: `bin/fix` (`send`, `cancel`, `status`, `mass-status`, `listen`, `load`). No unit tests;
+  the e2e drives it.
+- `e2e/run-e2e.sh`: one member, an independent gateway and discovery from `../most-exchange`'s
+  installs, then the adapter over UDP, its own driver (§3.5). Discovery and the gateway's reports
+  are on dynamic multi-destination channels, so the adapter and `most` both subscribe.
+  `E2E_PAUSE_ON_FAIL=SECONDS` keeps the processes up to inspect them.
+- The backend logs "shard N ready" when its SDK session has finished the opening mass status.
+
+**Passes, steps 1–7:** a 35=D rests; a cross trades both sides, and the maker's fill reaches it at
+its next Logon; 35=H for known and unknown ClOrdIDs; 35=F; 35=AF with nothing open (35=j); an
+unknown symbol; a clean restart keeps the store, and a new order rests after it.
+
+**Found:**
+- **Artio's monitoring files are host-wide by default** (`$TMPDIR/fix-engine/monitoring`): any
+  other Artio engine replaced the adapter's as it started, and two starting together failed. Now in
+  `fix.logDir`, one per engine and library (`ArtioFilesTest`, seen failing first). The test
+  fixture's `Initiator` and the CLI too.
+- **After a SIGKILL, a restart is refused until the archive's mark file ages out** (~10 s, as §6.4
+  said). The script retries, as `run-failover.sh` does for a member.
+- **Step 8 fails: after a crash the adapter reuses a MsgSeqNum the client has seen** (Design §8.21,
+  to decide). One order per client was lost with it, and in one run ~170, probably for the same
+  cause. Read from the archives with Artio's `FixArchivePrinter --offline-archive-dir`.
+- Two bugs in the client, not the adapter, on the way: its disconnect flag was never cleared after a
+  reconnect, and the script's cleanup killed `fix`'s shell wrapper, not its JVM.
+
+**The check.** `./gradlew build` green: fix-session 35 (+1), order-entry 218 (+15), adapter 4,
+market-data 1. `e2e/run-e2e.sh` passes steps 1–7, and fails step 8 on §8.21.

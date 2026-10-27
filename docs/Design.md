@@ -40,7 +40,10 @@ contract is `../most-exchange/docs/Adapters.md`, and this document does not repe
   - `order-entry` and `market-data` are the backends, and each depends on `fix-session` and on the
     SDK;
   - `tools` holds the test sender and the latency report (§10). It uses the same engine code and
-    dictionary as the adapter.
+    dictionary as the adapter;
+  - `adapter` is the process (decided 2026-10-27): it reads the node file, starts the acceptor and
+    each backend's duty cycle on its own thread, and binds last. `installDist` gives
+    `bin/adapter <node file>`. The backends stay libraries.
 - **The adapter is outside the exchange's determinism.** Nothing here is replicated. It may hold
   state, persist it, and restart; what it must not do is lose track of an order or a report.
 - **What the exchange provides** comes through most-exchange's `client` SDK, pulled from
@@ -122,6 +125,8 @@ Decided 2026-10-15. Properties files, as the exchange's processes use.
   | `fix.storeDir` | The order store (§6.1). Required for order entry, durable, never deleted at start |
   | `fix.directoryChannel`, `fix.directoryStreamId` | Where the exchange broadcasts its directory (most-exchange Design.md §7). Required for order entry |
   | `fix.shard.<id>.gateway.<n>.orderEntryChannel`, `…orderEntryStreamId`, `…executionReportChannel`, `…executionReportStreamId` | Optional: a shard's gateways, `n` from 0, in the order the SDK tries them. Listed, they replace the directory's one endpoint for that shard (§3.5) |
+  | `fix.calendar.zone`, `fix.calendar.rollTime`, `fix.calendar.weekdays`, `fix.calendar.holidaysFile` | The trading calendar (§3.6). The first two required for order entry |
+  | `fix.idleStrategy` | The library threads' idle strategy (§7): `busyspin`, the default, `yielding`, `backoff` or `sleeping` |
 
 - **The sessions file** has one block of `session.<name>.*` keys per session. The name is only a
   label:
@@ -151,6 +156,10 @@ Decided 2026-10-15. Properties files, as the exchange's processes use.
   synced at `fileSyncLevel`, with `catalogFileSyncLevel` the same (§6.4). Sequence numbers are
   `alwaysPersistent`, and sessions are accepted engine-owned. FIX is not encrypted by Artio: the
   554 crosses the network as sent. TLS, if needed, is terminated in front of the adapter.
+- **Artio's monitoring files** (counters and the error log), the engine's and each library's, are
+  in `fix.logDir` (found 2026-10-27 by the e2e run). Artio's default is one path in the system's
+  temp directory for every engine on the host: another Artio process replaced the adapter's file
+  as it started, and two starting at once failed (`ArtioFilesTest`).
 - *To specify* (§8.2): the session schedule. Until then a configured session may log on at any
   time.
 
@@ -357,6 +366,26 @@ only: the `expireDate` of a day order (59=0 or absent).
   if today is a trading day. After it, the date is the next trading day. The roll time belongs
   **inside the exchange's closed window**, between the close and the next pre-open. Orders are
   refused `MARKET_CLOSED` there anyway, so the date the adapter stamps cannot matter there.
+- **As built** (2026-10-27, decided with the user; it mirrors most-exchange's `SessionSchedule`:
+  a zone, trading weekdays, and holidays as exceptions to them). The node file's keys:
+
+  | Key | Meaning |
+  | --- | --- |
+  | `fix.calendar.zone` | An IANA zone, such as `Europe/Amsterdam`. Required |
+  | `fix.calendar.rollTime` | `HH:mm`, local to the zone. Required |
+  | `fix.calendar.weekdays` | The trading weekdays, such as `MON,TUE,WED,THU,FRI`, the default |
+  | `fix.calendar.holidaysFile` | Optional. One ISO date (`2026-12-25`) per line, then optional words describing it; `#` starts a comment |
+
+  - **The rule:** at a local date `d` and time `t`, the trading date is the first trading day on or
+    after `d` if `t` is before the roll, and the first after `d` otherwise. A day is a trading day
+    when it is one of the weekdays and not a holiday. So a Saturday morning, before the roll, names
+    Monday, and the roll itself already names the next day. A roll time that a clock change skips
+    is moved forward by the gap, as `java.time` does.
+  - **Read without allocating:** the date is recomputed only once the wall clock passes the next
+    roll, and otherwise read from a field.
+  - The adapter refuses to start on a malformed key or holiday line, on no trading weekday, or if
+    no trading day falls within a year.
+  - Not built yet: `POST /trading-date` and `/status` (§9.1), and the `ORDER_EXPIRED` counter (§9.2).
 - **When it disagrees with the engine:**
   - **behind** (adapter D−1, engine D): day orders are rejected `ORDER_EXPIRED`. That is visible,
     and safe;
@@ -1067,6 +1096,30 @@ The archive's recorded position (§6.2) then means durable.
     a second order with the same `clOrdId`. **Decided 2026-10-26:** a spike in the recovery slice
     first. The fix is designed once the spike confirms it, because every candidate changes a failure
     mode or adds latency to every order.
+21. **After a crash, the adapter reuses a MsgSeqNum the client has already seen** (found 2026-10-27
+    by `e2e/run-e2e.sh` step 8, against most-exchange's real processes; to decide). Archiving is
+    off the 35=8's send path (§6.4): Artio's framer writes a message to the socket while the
+    archiver records it, independently. A SIGKILL between the two leaves the client with a message
+    the archive never had. The report itself is not lost: its `reportSeq` was not consumed (§6.2),
+    so the exchange delivers it again and it is written under a new number. But the restarted
+    engine numbers from the archive, so its next message, the Logon, reuses that MsgSeqNum.
+    - **Seen** (CLIENT2, archives read with Artio's `FixArchivePrinter`): the client had received
+      392 before the kill; the adapter's archive ended at 391. The restarted adapter's Logon was 392.
+      The client logged out, "MsgSeqNum too low, expecting 393 but received 392".
+    - **And a request was lost with it:** the client's last 35=D before the kill (212, K2-204) had
+      not reached the adapter. The adapter asked for it (ResendRequest 7=212) in the session the
+      client then ended. At the next Logon the engine expected 215, as it had counted the Logon and
+      Logout at 213 and 214. The gap was forgotten: K2-204 was never resent, sent or answered. A
+      client that asks with a 35=H gets "unknown order" (§3.3); one that waits gets nothing. Whether
+      Artio should keep the gap is not yet checked in its source.
+    - In one of three crash runs, ~170 orders per client sent after the reconnect went unanswered.
+      This is probably the same cause, with messages held behind a gap never filled (non-negotiable
+      10 drops a message Artio marks invalid), but its archive was not kept, so it is not
+      confirmed.
+    - **What the spikes did not cover:** §8.13's crash spikes showed that *archived* reports come
+      back. None sent a 35=8 that reached the client and not the archive.
+    - **Not affected:** a clean stop and restart (step 7 passes), and the gap fills seen at
+      resend, which were a Logout and a Logon (administrative messages are resent as gap fills).
 
 ## 9. Control and metrics
 
@@ -1118,6 +1171,13 @@ management address only.
 Decided 2026-10-09 as written here.
 
 ### 10.1 The FIX test sender
+
+**First cut built 2026-10-27** (decided with the user): `tools`' `bin/fix`, an Artio initiator on
+the adapter's dictionary that the e2e scripts drive. `send`, `cancel`, `status` (35=H),
+`mass-status` (35=AF), `listen`, and `load`, which paces new orders and cancels, logs on again
+after a drop (`--reconnect`), and prints each order's outcome as the client last heard it. Its
+MsgSeqNum persists in `--state`, so a later run continues the session. It records no latencies:
+the rest of this section is still to build.
 
 - An Artio **initiator**, built from the same dictionary and engine code as the adapter. One or more
   sessions.

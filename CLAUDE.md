@@ -16,9 +16,9 @@ Do not change a rule without reading its section there.
 same commit when the design changes.
 
 This is the **FIX adapter** for most-exchange, AGPL-3.0-or-later like the exchange: an Artio acceptor in front of the exchange's order
-entry gateways and market data feeds. Kotlin, packages `nl.lamia.most.exchange.fixadapter.*`. Three
-modules: `fix-session` (the acceptor, logon and routing by role), and `order-entry` and
-`market-data`, still scaffolds.
+entry gateways and market data feeds. Kotlin, packages `nl.lamia.most.exchange.fixadapter.*`. Modules:
+`fix-session` (the acceptor, logon and routing by role), the backends `order-entry` and
+`market-data` (still a scaffold), `adapter` (the process) and `tools` (`bin/fix`, the e2e's client).
 
 ## Commands
 
@@ -26,6 +26,7 @@ modules: `fix-session` (the acceptor, logon and routing by role), and `order-ent
 ./gradlew build                              # the SDK from most-exchange's GitHub Packages
 ./gradlew build -PmostExchange.local=true    # the SDK built from ../most-exchange instead
 ./gradlew :fix-session:test                  # one module
+./e2e/run-e2e.sh                             # against ../most-exchange's installs; see its header
 ```
 
 - **The SDK comes from the registry by default.** That needs `githubUser` and a `read:packages`

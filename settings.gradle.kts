@@ -53,5 +53,7 @@ include(
     "fix-session",  // Artio acceptor, logon, session persistence: shared by both backends
     "order-entry",  // FIX orders and cancels <-> SBE, through the SDK's OrderEntrySession
     "market-data",  // L1/L2 from the SDK's DepthFeedAssembler -> FIX market data
+    "adapter",      // the process: the node file in, the acceptor and its backends running
+    "tools",        // Design.md §10: the FIX client the e2e scripts drive. Not shipped
     "spikes",       // Design.md §8.13: what Artio 0.182 really does, against a real initiator. Not shipped
 )

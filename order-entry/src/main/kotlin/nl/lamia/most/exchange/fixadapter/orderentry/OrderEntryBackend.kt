@@ -271,6 +271,7 @@ class OrderEntryBackend(
 
         override fun onReady() {
             readyShards++
+            log("order entry: shard $shardId ready")
         }
     }
 

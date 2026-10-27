@@ -100,8 +100,8 @@ There is no remote yet.
 | --- | --- |
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
-| Modules | 3 — `fix-session`, `order-entry`, `market-data`; packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 34, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 203 (the store 24, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the directory index 7, the config 5, the backend end to end 30, SDK wiring 1); `market-data` 1. `./gradlew build` green 2026-10-27. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27 |
+| Modules | 5 — `fix-session`, `order-entry`, `market-data`, `adapter` (the process), `tools` (`bin/fix`); packages `nl.lamia.most.exchange.fixadapter.*` |
+| Tests | `fix-session` 35, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 218 (the store 24, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the directory index 7, the config 5, the calendar 15, the backend end to end 30, SDK wiring 1); `adapter` 4; `market-data` 1; `tools` none (the e2e drives it). `./gradlew build` green 2026-10-27. `e2e/run-e2e.sh`: steps 1–7 pass, step 8 fails (§8.21) The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -411,6 +411,16 @@ parallel with item 2.
    6. **This repo's e2e**, against most-exchange's real
       processes. That is the first test of `OrderEntrySession` through a real failover
       (most-exchange Status §3, item 13(a)).
+      - **First run 2026-10-27**, uncommitted (Handover §2k). Built for it: §3.6's calendar, the
+        `adapter` module (`bin/adapter <node file>`), `tools`' `bin/fix`, and `e2e/run-e2e.sh`
+        (one member, from `../most-exchange`'s installs). Steps 1–7 pass: rest, cross, a report to
+        a logged-out client, 35=H, 35=F, 35=AF, an unknown symbol, a clean restart.
+      - **Step 8, a SIGKILL under load, fails: Design §8.21, to decide.** After a crash the adapter
+        reuses a MsgSeqNum the client has already seen; the client logs out, and a 35=D in flight
+        at the crash is never resent.
+      - **Fixed on the way:** Artio's monitoring files were host-wide; now in `fix.logDir`.
+      - **Still to do:** the three-member failover run (a `run-failover.sh` for the adapter, listed
+        gateways), after §8.21.
 6. **Tooling** (Design §10): the paced FIX sender and the HTML latency report, with service and
    response time per outcome. Then a baseline measurement (`perf-claim`).
 7. **`market-data`:** 35=y from the directory, then 35=V/W/X from `DepthFeedAssembler`.

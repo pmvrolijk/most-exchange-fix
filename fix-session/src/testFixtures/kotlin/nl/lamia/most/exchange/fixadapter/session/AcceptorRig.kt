@@ -140,6 +140,7 @@ class Initiator(dir: File) : Polled, AutoCloseable {
         bindAtStartup(false)
         libraryAeronChannel("aeron:ipc")
         logFileDir(File(dir, "logs").path)
+        monitoringFile(File(dir, "engine-monitoring").path) // not the host-wide default (ArtioFilesTest)
         logInboundMessages(false)
         logOutboundMessages(false)
         // The adapter's dictionary on the client side too: Artio's own codecs are not on the classpath.
@@ -150,6 +151,7 @@ class Initiator(dir: File) : Polled, AutoCloseable {
     val library: FixLibrary = FixLibrary.connect(LibraryConfiguration().apply {
         libraryAeronChannels(listOf("aeron:ipc"))
         aeronContext().aeronDirectoryName(File(dir, "aeron").path)
+        monitoringFile(File(dir, "library-monitoring").path)
         sessionAcquireHandler(SessionAcquireHandler { _, _ -> recordingHandler(received) })
     })
 

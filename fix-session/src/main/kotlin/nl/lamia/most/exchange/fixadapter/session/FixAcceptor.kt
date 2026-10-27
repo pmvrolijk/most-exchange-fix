@@ -11,6 +11,8 @@ import uk.co.real_logic.artio.engine.FixEngine
 import uk.co.real_logic.artio.library.LibraryConfiguration
 import uk.co.real_logic.artio.library.SessionExistsHandler
 import uk.co.real_logic.artio.validation.SessionPersistenceStrategy
+import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * The adapter's FIX acceptor (Design.md §2, §6.4): an embedded archiving media driver, and Artio's
@@ -18,6 +20,8 @@ import uk.co.real_logic.artio.validation.SessionPersistenceStrategy
  *
  * - The archive and Artio's logs are on the configured directories, never deleted at start, and
  *   the archive is synced at `fileSyncLevel`, its catalog the same.
+ * - Artio's monitoring files are there too, one per engine and library: by default every Artio
+ *   process on the host shares one path in the temp directory.
  * - Sequence numbers are always persistent: MsgSeqNum is the FIX session's, across logons and
  *   restarts. Sessions are accepted engine-owned, and each library claims those of its role.
  *
@@ -66,6 +70,8 @@ class FixAcceptor(
                 libraryAeronChannel(IPC)
                 logFileDir(config.logDir.path)
                 deleteLogFileDirOnStart(false)
+                // Artio's default is one path in the temp directory for every engine on the host.
+                monitoringFile(File(config.logDir, "engine-monitoring").path)
                 // Artio's default resets sequence numbers at every logon (Design §2).
                 sessionPersistenceStrategy(SessionPersistenceStrategy.alwaysPersistent())
                 authenticationStrategy(LogonAuthentication(sessions))
@@ -84,9 +90,13 @@ class FixAcceptor(
         throw e
     }
 
+    private val libraries = AtomicInteger()
+
     /** A library on this engine, told of every session by [sessionExists]: a [RoleClaims], normally. */
     fun libraryConfiguration(sessionExists: SessionExistsHandler): LibraryConfiguration = LibraryConfiguration().apply {
         libraryAeronChannels(listOf(IPC))
+        // As the engine's, under fix.logDir, and one per library.
+        monitoringFile(File(config.logDir, "library-${libraries.incrementAndGet()}-monitoring").path)
         sessionExistsHandler(sessionExists)
         aeronContext().aeronDirectoryName(config.aeronDir)
     }
