@@ -483,6 +483,23 @@ class OrderStoreTest {
     // ---------------------------------------------------------------- refusals at load
 
     @Test
+    fun `a stop is clean only once marked after the close, and each start clears the mark durably`() {
+        // Design §8.21: the adapter marks a clean stop after Artio's engine has closed; a start
+        // without the mark is after a crash, and moves every session's MsgSeqNum on.
+        assertFalse(open().stoppedCleanly, "a new store: no clean stop recorded")
+        store?.close(); store = null
+        OrderStore.markStoppedCleanly(dir)
+        assertTrue(open().stoppedCleanly, "marked after the close")
+        assertFalse(restart().stoppedCleanly, "the start cleared it: a close without the mark is a crash")
+        store?.close(); store = null
+        OrderStore.markStoppedCleanly(dir)
+        val reopened = open()
+        assertTrue(reopened.stoppedCleanly)
+        assertEquals(0, reopened.size, "the mark is not a row")
+        assertFalse(reopened.holdsState(0L), "nor any participant's state")
+    }
+
+    @Test
     fun `a row of an unknown version is refused, and the store does not load`() {
         val s = open()
         val row = s.order(P1, 1L, "ORD-1")

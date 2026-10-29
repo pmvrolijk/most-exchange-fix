@@ -453,3 +453,36 @@ The row of a request rebuilt before the directory came is stored *unresolved*. A
 the replay begins no later than the lowest such row, so a stop before the directory comes loses
 nothing. Holding the security in the row instead would change the row's format for a state that
 lasts only until the first directory.
+
+## 13. After an unclean stop, the outgoing MsgSeqNum moves on before the bind
+
+Found 2026-10-28 by the first end-to-end run (Design §8.21), and confirmed by spike (h).
+
+Artio's framer writes a message to the socket while the archive records the same stream on its
+own. Nothing orders the two, so a process can die after a 35=8 reached the client and before the
+archive had it. The report is safe: its `reportSeq` was not consumed (R§11), so the exchange
+delivers it again and the adapter writes it again under a new number. The *number* is not safe.
+The restarted engine counts from the archive, and its first message, the Logon, reuses one the
+client has. FIX gives the client one answer to that, a Logout, "MsgSeqNum too low", and the session
+cannot be resumed without an operator.
+
+The adapter cannot tell how far the archive trailed the socket. So after a stop it cannot vouch
+for, it moves every session's number on by 10 000. The client then sees a gap, not a reuse, and
+FIX's ordinary resend closes it: the adapter has nothing in the range, so one gap fill covers it.
+The margin costs only numbers. The spike lost 1–3 messages at 500 a second; the archive can trail
+by more under a slow disk, which is why the margin is large and not measured.
+
+- **The skip is made on the offline session the library holds before the bind**, so the library,
+  not the engine, numbers the client's next Logon (h2). A Heartbeat is then written and waited for
+  in the archive, so the skip survives a second crash before the client is back. Without it,
+  Artio's replayer complained of an empty range (h2a).
+- **"Clean" is marked after Artio's engine has closed,** because only a clean close waits for the
+  archive to record what was sent. It is cleared at start with a synced write: a start that loses
+  the clear to a host crash would take the next crash for a clean stop. A missing mark errs towards
+  a skip, which costs a client one gap fill; a mark that is wrong would cost it its session.
+- **Every start was rejected** as the trigger: it would cost every client a gap fill at every
+  restart, to save a flag.
+
+Not covered, and stated so: the client has the 35=8 that died with the process, and receives the
+same report again under a new number. The ExecID is the same (§5.3); PossResend is not set, because
+the adapter cannot tell which ones the client has.

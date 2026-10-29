@@ -17,6 +17,10 @@ import kotlin.random.Random
  * Not the measuring sender of Design.md §10.1: it records no latencies.
  */
 class Load(args: Args) {
+    private companion object {
+        const val MAX_RECONNECTS = 5
+    }
+
     private val symbol = args.required("symbol")
     private val count = args.int("count")
     private val rate = args.int("rate")
@@ -29,6 +33,7 @@ class Load(args: Args) {
     private val drainMs = (args.double("drain", 10.0) * 1000).toLong()
     private val reconnectMs = (args.double("reconnect", 0.0) * 1000).toLong()
     private val verbose = args.flag("verbose")
+    private val settleMs = (args.double("settle", 1.0) * 1000).toLong()
 
     init {
         require(count > 0 && rate > 0) { "--count and --rate must be positive" }
@@ -137,8 +142,12 @@ class Load(args: Args) {
         return true
     }
 
+    private var reconnects = 0
+
     private fun reconnect(client: FixClient, logon: Logon) {
         check(reconnectMs > 0) { "the session dropped after ${orders.size} orders, and --reconnect is not set" }
+        // A session the adapter keeps logging out (a block, say) fails the load rather than looping.
+        check(++reconnects <= MAX_RECONNECTS) { "the session dropped $reconnects times; giving up" }
         println("load: the session dropped; logging on again for up to ${reconnectMs / 1000} s")
         // Artio refuses a new initiate while the old session is still the library's: wait for its disconnect.
         runCatching { client.pollUntil("the old session's disconnect", 10_000L) { client.disconnected } }
@@ -146,7 +155,10 @@ class Load(args: Args) {
         while (true) {
             try {
                 client.logon(logon)
-                println("load: logged on again")
+                println("load: logged on again; settling ${settleMs} ms before sending")
+                // The adapter's ResendRequest is answered before new orders follow: an Artio acceptor
+                // stalls on a resend answered short (Design.md §8.21, spike (h4)).
+                client.pollFor(settleMs)
                 return
             } catch (e: IllegalStateException) {
                 check(System.nanoTime() < deadline) { "could not log on again within ${reconnectMs / 1000} s: ${e.message}" }

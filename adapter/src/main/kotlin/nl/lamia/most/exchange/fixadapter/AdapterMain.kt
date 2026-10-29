@@ -3,6 +3,7 @@ package nl.lamia.most.exchange.fixadapter
 import nl.lamia.most.exchange.fixadapter.orderentry.OrderEntryBackend
 import nl.lamia.most.exchange.fixadapter.orderentry.OrderEntryConfig
 import nl.lamia.most.exchange.fixadapter.orderentry.TradingCalendar
+import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
 import nl.lamia.most.exchange.fixadapter.session.FixAcceptor
 import nl.lamia.most.exchange.fixadapter.session.FixNodeConfig
 import nl.lamia.most.exchange.fixadapter.session.Role
@@ -54,11 +55,17 @@ class Adapter(properties: Properties, private val log: (String) -> Unit = System
         )
     }
 
-    /** The backend's thread first, so nothing polls a library while the engine and driver go. */
+    /**
+     * The backend's thread first, so nothing polls a library while the engine and driver go. Then,
+     * if all of it closed, the clean stop is marked (Design.md §8.21): Artio's engine waits at close
+     * for its archive to record every message it sent, so nothing reached a client that the next
+     * start does not number past.
+     */
     override fun close() {
-        CloseHelper.quietClose(runner)
-        CloseHelper.quietClose(backend)
-        CloseHelper.quietClose(acceptor)
+        val started = backend != null
+        val closed = runCatching { CloseHelper.closeAll(runner, backend, acceptor) }
+        closed.exceptionOrNull()?.let { log("adapter: not a clean stop: ${it.stackTraceToString()}") }
+        if (started && closed.isSuccess) OrderStore.markStoppedCleanly(orderEntryConfig.storeDir)
     }
 
     companion object {

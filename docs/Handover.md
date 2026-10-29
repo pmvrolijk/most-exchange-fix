@@ -519,3 +519,33 @@ unknown symbol; a clean restart keeps the store, and a new order rests after it.
 
 **The check.** `./gradlew build` green: fix-session 35 (+1), order-entry 218 (+15), adapter 4,
 market-data 1. `e2e/run-e2e.sh` passes steps 1–7, and fails step 8 on §8.21.
+
+**Spike (h), 2026-10-28** (`SequenceReuseSpikeTest`, `StreamingAcceptor`; Design §8.21, §8.13):
+4 tests, all passing, each asserting its finding.
+- (h1) a child acceptor SIGKILLed while writing a 35=8 every 2 ms: 1–3 messages reached the client
+  and not the archive, and the restarted Logon reused the next number. Flat out, the archive ran
+  ahead of the socket instead, which is why the pacing matters.
+- (h2) `Session.lastSentMsgSeqNum(lastSent + 10 000)` on the session the library holds offline
+  before the Logon: the Logon is numbered past it, the client asks for a resend, one gap fill
+  answers, and the session stays up. With a Heartbeat written offline after the setter (h2b),
+  Artio's replayer logs no error and the skip survives a second crash.
+- (h3) no crash: a gap the acceptor asked for, in a session the client ended at once, is not asked
+  for again at the next Logon. Artio had already counted the Logon as received.
+
+**The skip, built 2026-10-28** (decided with the user, each the recommendation; Design §8.21,
+CLAUDE.md non-negotiable 12, Rationale §13): after an unclean stop only, by a fixed 10 000, the
+setter then a Heartbeat archived before the bind. `OrderStore.stoppedCleanly`/`markStoppedCleanly`
+(a node-wide `meta` key, cleared at load with a synced write); `Adapter.close` marks after the
+acceptor has closed; `OrderEntryBackend.moveSequencesOn`. Tests: store +1, backend +2, adapter +1;
+five mutations caught. The collision log now names what collided.
+
+**Spike (h4)** (`ResendStallSpikeTest`, a raw-socket client; Design §8.21): with a resend answered
+up to the client's last message, every order arrives once under each Artio setting; answered short,
+the session stalls under each. The e2e's Artio initiator answered short, having sent new orders
+straight after its Logon: that was the ~170 unanswered. `fix load` now settles a second after a
+reconnect. A probe showed the same stall on the client's side, when the adapter writes before its
+gap fill.
+
+**The e2e after the skip:** 7 runs of 8 pass. The 8th: an id collision raised by the startup
+replay after the crash blocked CLIENT1, and its load looped on reconnects (now capped at 5). Not
+explained: afterwards the store and the archive agreed one for one.

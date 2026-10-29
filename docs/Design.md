@@ -951,6 +951,9 @@ The archive's recorded position (§6.2) then means durable.
       MsgSeqNum, under load, provided the library has requested the session back after the
       disconnect; sending on the session the disconnect took reuses MsgSeqNums and loses reports
       (§6.3).
+    - (h), 2026-10-28: a 35=8 can reach the client and not the archive, and the restarted engine
+      reuses its MsgSeqNum; moving the offline session's number on avoids it; and Artio forgets a
+      gap that a session left open (§8.21, `SequenceReuseSpikeTest`).
 
     **Left open by them:**
     - ~~Finding the library's `RecordingPos`~~ **From Aeron's public counters**, by the library's
@@ -1120,6 +1123,88 @@ The archive's recorded position (§6.2) then means durable.
       back. None sent a 35=8 that reached the client and not the archive.
     - **Not affected:** a clean stop and restart (step 7 passes), and the gap fills seen at
       resend, which were a Logout and a Logon (administrative messages are resent as gap fills).
+    - **Spike (h), 2026-10-28** (`SequenceReuseSpikeTest`, `StreamingAcceptor`; a child acceptor
+      SIGKILLed while writing a 35=8 every 2 ms to a logged-on client, up to five attempts):
+      - **(h1) reproduced,** at the first or second attempt each run: 1 to 3 messages reached the
+        client and not the archive. The restarted engine's Logon reused the next number, and the
+        client refused it. Streamed flat out instead, the archive ran *ahead* of the client (the
+        socket was the bottleneck), and nothing was reused.
+      - **(h2) moving the number on works.** Before the client's Logon, the adapter's library holds
+        the session offline (it requests it at startup, §8.17). There
+        `Session.lastSentMsgSeqNum(lastSent + 10 000)` makes the library number the Logon past the
+        skip. The client sees a gap and asks for a resend, and the acceptor answers with **one** gap
+        fill to past the Logon. The client stays logged on.
+        - **(h2a)** The setter alone: in one of two runs Artio's replayer logged an error ("count(0)
+          < expectedCount"), as the archive had nothing in the range. It still sent the gap fill.
+        - **(h2b)** The setter, then a Heartbeat written offline: no error. The new number is also
+          in the archive and the engine's index, so a second crash before the client's Logon keeps
+          the skip. **The one to build.**
+      - **(h3) Artio forgets a gap that a session left open, with no crash needed.** A client's Logon
+        skipped one MsgSeqNum, and the acceptor's Logon was below what the client expected. The
+        acceptor sent its ResendRequest, but had already counted the Logon as received. The client
+        logged out at once, and at the next Logon the acceptor expected the number after the Logout
+        and asked for nothing. **Any connection that ends before a resend completes loses the
+        messages in the gap**, so this is wider than the crash.
+    - **Decided 2026-10-28** (each the recommendation):
+      - **after an unclean stop only.** The store's `meta` holds a clean-stop flag, written at
+        close and cleared at start with a synced write, so a crash after the start is always
+        seen. A start without the flag moves the number on for every order-entry session the
+        library holds offline at startup, before the acceptor binds. A clean restart stays
+        invisible to clients. Rejected: at every start (one gap fill per client per restart, to
+        save a flag);
+      - **by a fixed 10 000**, the setter, then a Heartbeat written offline (h2b). One gap fill
+        covers any distance, so the margin costs only numbers: a 32-bit MsgSeqNum allows ~200 000
+        crashes between end-of-day resets. Rejected: a node-file key, until a rate or a disk makes
+        the archive trail the socket that far;
+      - **(h3): a spike of a make-up first.** The library may notice a number Artio never
+        delivered and ask for it itself, the client's PossDup resend then caught by the store.
+        Rejected for now: accepting it, and leaving the client to find the request with a 35=H.
+    - **Not covered by the skip:** a report the client received before the crash comes again from
+      the exchange under a new MsgSeqNum, with the same ExecID (§5.3). A client deduplicates by
+      ExecID; PossResend (97) is not set, because the adapter cannot tell which ones the client has.
+    - **As built 2026-10-28** (CLAUDE.md non-negotiable 12, R§13): `OrderStore.stoppedCleanly`
+      and `markStoppedCleanly`, a node-wide `meta` key; the `Adapter` marks after closing the
+      acceptor, and only if everything closed. `OrderEntryBackend.moveSequencesOn`, at the end of
+      the startup acquisition. Tests: store +1, backend end to end +2 (unclean: the Logon 10 002
+      past, one gap fill, an order after it; clean: the Logon follows on), adapter +1. Five
+      mutations, all caught. `e2e/run-e2e.sh` then passed 7 runs of 8. In the other, the startup replay
+      after the crash raised an id collision (§3.3), and CLIENT1 was blocked: every Logon after it
+      was logged out "session sequence reset required". **Not explained, not reproduced** in five
+      further runs. Afterwards the store's rows and the archive's 35=D/F agreed one for one, so the
+      replay compared something other than the client's own message with its own row. The log line
+      now names what collided (SenderCompID, MsgSeqNum, both ClOrdIDs, replayed or live).
+    - **(h4), the make-up spike, 2026-10-28** (`ResendStallSpikeTest`, a raw-socket client): new
+      messages that arrive while the acceptor waits for a resend are marked invalid, but Artio
+      counts them as received (`Session.checkSeqNoChange`, then `checkNormalSeqNoChange`).
+      - **A client that resends up to its last message,** as FIX asks for an EndSeqNo of 0: every
+        order reaches the library once, under each of Artio's settings.
+      - **A client that answers short** (it resends only up to where it was when it read the
+        request): the session **stalls**. `awaitingResend` never clears, and every later message is
+        invalid and dropped, until the client reconnects; then (h3) forgets them. The setting
+        makes no difference: the default, `acceptedSessionClosedResendInterval`, and
+        `acceptedSessionSendRedundantResendRequests`, which asks again on every message, at the
+        cost of a full resend each time.
+      - **Artio's own initiator answered short in the e2e,** having sent new orders straight after
+        its Logon, ahead of its own index. The ~170 unanswered orders per client were this. The
+        e2e's client now waits a second after a reconnect (`fix load --settle`) before sending.
+      - **The only public rewind,** `Session.tryUpdateLastReceivedSequenceNumber`, lowers the
+        received number by starting a new `sequenceIndex`. The `clOrdId` (§3.2), the startup
+        guard and the collision block (§3.3) all rest on that index. So a make-up by rewinding is
+        not free.
+    - **The same stall on the client's side** (seen once, 2026-10-28, in a probe test since
+      removed): after the skip, a client built on Artio asks for the gap and waits for the adapter's
+      gap fill. A message the adapter writes before that gap fill (here its reject of an order
+      sent straight after the Logon) is above the client's resend range. The client counts it as
+      received, so the gap fill ends below that count, and the client stays `awaitingResend`. The
+      adapter is unaffected: the next order reached the gateway. The window is any message written
+      between the adapter's Logon and its resend answer, at any reconnect where the client missed
+      messages. The skip only makes such reconnects more common.
+    - **Left to decide:** what the adapter does about (h3), (h4) and the client-side window. It can
+      detect a stall of its own: a session awaiting a resend that has dropped messages ahead of
+      it. Options include logging it out with a Text so the client knows; rewinding as above, then
+      logging it out, so its next Logon asks for the gap; holding its own writes to a session until
+      the client's resend has been answered; or stating it as a requirement on clients, and
+      reporting it to Artio.
 
 ## 9. Control and metrics
 

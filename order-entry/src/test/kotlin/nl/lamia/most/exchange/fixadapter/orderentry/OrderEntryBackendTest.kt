@@ -91,6 +91,14 @@ class OrderEntryBackendTest {
             exchange.close()
             rig.close()
         }
+
+        /** Stopped with no clean-stop mark, as after a crash (Design.md §8.21). */
+        fun crash() {
+            if (closed) return
+            closed = true
+            exchange.close()
+            rig.closeAsCrashed()
+        }
     }
 
     /** The adapter, then the exchange on its driver; [broadcast] null means no directory yet. */
@@ -611,6 +619,56 @@ class OrderEntryBackendTest {
         }
     }
 
+    /** A Logon and a Logout; the client's sequence numbers after it, sent and received. */
+    private fun Adapter.logOnAndOff(): Pair<Int, Int> {
+        val session = logon()
+        pollUntil(*all(), what = "logout sent") { session.startLogout() > 0 }
+        pollUntil(*all(), what = "logged out") { !session.isConnected }
+        pollUntil(*all(), what = "the session back offline") { rig.backend.sessions.session(1001L) != null }
+        return session.lastSentMsgSeqNum() to session.lastReceivedMsgSeqNum()
+    }
+
+    @Test
+    fun `after an unclean stop the adapter numbers on 10 000 past its last message, a gap fill covers the jump, and the session carries on`() {
+        // Design.md §8.21: a 35=8 can reach the client and not the archive, and a restarted engine
+        // numbering from the archive reuses its MsgSeqNum, which the client refuses.
+        val (sent, received) = start().let { adapter ->
+            adapter.awaitExchange()
+            adapter.logOnAndOff().also { adapter.crash() }
+        }
+        start().use { adapter ->
+            assertTrue(adapter.rig.log.any { "MsgSeqNum moved on from $received to ${received + 10_000}" in it }, "${adapter.rig.log}")
+            adapter.awaitExchange()
+            val session = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
+            val logon = adapter.awaitReply(session, "the adapter's Logon") { it.msgType == "A" && it.seqNum > received }
+            assertEquals(received + 10_002, logon.seqNum, "the skip, then the Heartbeat written offline, then the Logon")
+            val gapFill = adapter.awaitReply(session, "the gap fill") { it.msgType == "4" }
+            assertEquals("Y", gapFill[123], "a gap fill, not a reset")
+            assertEquals(received + 1, gapFill.seqNum, "from what the client expected")
+            assertEquals(received + 10_003, gapFill[36]?.toInt(), "to past the Logon, in one message")
+            adapter.send(session, order("AFTER"))
+            pollUntil(*adapter.all(), what = "the order at its gateway") { adapter.gateway(0).orders.size == 1 }
+            assertTrue(session.isConnected, "the session carried on")
+        }
+    }
+
+    @Test
+    fun `after a clean stop the adapter numbers on from its last message`() {
+        val (sent, received) = start().use { adapter ->
+            adapter.awaitExchange()
+            adapter.logOnAndOff()
+        }
+        start().use { adapter ->
+            assertTrue(adapter.rig.log.none { "moved on" in it }, "${adapter.rig.log}")
+            adapter.awaitExchange()
+            val session = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
+            val logon = adapter.awaitReply(session, "the adapter's Logon") { it.msgType == "A" && it.seqNum > received }
+            assertEquals(received + 1, logon.seqNum)
+            pollFor(300, *adapter.all())
+            assertTrue(session.messages().none { it.msgType == "4" }, "${session.messages()}")
+        }
+    }
+
     @Test
     fun `a request rejected here is not replayed at a clean restart, so it is never rejected twice`() {
         // §8.17: the reject raised the high-water. "exchange unavailable" needed the directory, so a
@@ -820,6 +878,8 @@ class OrderEntryBackendTest {
             store.load(OrderEntryRig.TODAY)
             for (n in 1..sent + 20) store.insert(row(store, 1001L, n.toLong(), "WIPED-$n"))
         }
+        // Loading cleared the clean-stop mark; this is a clean restart (§8.21).
+        OrderStore.markStoppedCleanly(OrderEntryRig.storeDir(adapterDir))
 
         start().use { adapter ->
             adapter.awaitExchange()

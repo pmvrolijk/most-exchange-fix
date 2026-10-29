@@ -13,6 +13,7 @@ import nl.lamia.most.exchange.client.OrderFate
 import nl.lamia.most.exchange.client.ReportAction
 import nl.lamia.most.exchange.client.OrderEntrySession
 import nl.lamia.most.exchange.fixadapter.codecs.Constants
+import nl.lamia.most.exchange.fixadapter.codecs.builder.HeartbeatEncoder
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReplies
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReports
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.InboundRecording
@@ -121,8 +122,8 @@ class OrderEntryBackend(
             sends = ArchivedSends(store, venue, InboundRecording(aeron.countersReader(), libraryConfiguration.inboundLibraryStream())) { row, text ->
                 outbound.refuse(row, text)
             }
-            inbound = InboundOrders(store, venue, index, tradingDate, sends) { participantId ->
-                log("participant $participantId: id collision, session blocked until its sequence is reset (Design.md §3.3)")
+            inbound = InboundOrders(store, venue, index, tradingDate, sends) { participantId, detail ->
+                log("participant $participantId: id collision, session blocked until its sequence is reset (Design.md §3.3): $detail")
             }
             outbound = OutboundReports(store, reports, sends, delivery, log)
             outbound.recover()
@@ -193,6 +194,34 @@ class OrderEntryBackend(
         }
         if (inbound.rebuilt > 0) {
             log("order entry: ${inbound.rebuilt} requests rebuilt from the archive, in flight once the directory names their shards (Design.md §8.17)")
+        }
+        if (!store.stoppedCleanly) moveSequencesOn(deadline)
+    }
+
+    /**
+     * After an unclean stop (Design.md §8.21): a message can have reached a client and not the archive,
+     * and Artio numbers on from the archive. Each session held offline is moved on [CRASH_SEQUENCE_SKIP],
+     * then a Heartbeat is written offline, so the number is in the archive before the acceptor binds.
+     * The client's next Logon is numbered past it; the client asks for a resend, and one gap fill covers
+     * the jump.
+     */
+    private fun moveSequencesOn(deadline: Long) {
+        for (participantId in participantIds) {
+            val session = sessions.session(participantId) ?: continue
+            val from = session.lastSentMsgSeqNum()
+            session.lastSentMsgSeqNum(from + CRASH_SEQUENCE_SKIP)
+            var position: Long
+            while (true) {
+                position = session.trySend(HeartbeatEncoder())
+                if (position > 0) break
+                check(System.nanoTime() < deadline) { "order entry: participant $participantId: the Heartbeat after an unclean stop was not written: $position" }
+                library.poll(FRAGMENT_LIMIT)
+            }
+            while (recording.asLong < position) {
+                check(System.nanoTime() < deadline) { "order entry: participant $participantId: the Heartbeat after an unclean stop was not archived" }
+                library.poll(FRAGMENT_LIMIT)
+            }
+            log("order entry: participant $participantId: the last stop was not clean; MsgSeqNum moved on from $from to ${from + CRASH_SEQUENCE_SKIP}, then a Heartbeat (Design.md §8.21)")
         }
     }
 
@@ -362,6 +391,9 @@ class OrderEntryBackend(
 
     private companion object {
         const val FRAGMENT_LIMIT = 10
+
+        /** How far an unclean stop moves each session's MsgSeqNum on (Design.md §8.21): one gap fill covers it. */
+        const val CRASH_SEQUENCE_SKIP = 10_000
         val STARTUP_TIMEOUT_NS = java.util.concurrent.TimeUnit.SECONDS.toNanos(10)
 
         fun isSessionMessage(messageType: Long): Boolean = when (messageType) {

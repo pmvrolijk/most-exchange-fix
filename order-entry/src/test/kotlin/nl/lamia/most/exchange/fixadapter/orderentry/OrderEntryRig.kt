@@ -10,6 +10,7 @@ import nl.lamia.most.exchange.client.GatewayEndpoint
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.DirectoryBroadcast
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.TestSecurity
 import nl.lamia.most.exchange.fixadapter.orderentry.exchange.TestShard
+import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
 import nl.lamia.most.exchange.fixadapter.session.AcceptorRig
 import nl.lamia.most.exchange.fixadapter.session.FixAcceptor
 import nl.lamia.most.exchange.fixadapter.session.Polled
@@ -60,7 +61,14 @@ class OrderEntryRig(
 
     override fun poll(): Int = backend.doWork()
 
-    override fun close() = CloseHelper.closeAll(backend, acceptor)
+    /** A clean stop, as the adapter's: the backend, Artio's engine, then the mark (Design.md §8.21). */
+    override fun close() {
+        CloseHelper.closeAll(backend, acceptor)
+        OrderStore.markStoppedCleanly(storeDir(dir))
+    }
+
+    /** Closed without the clean-stop mark: what the next start sees after a crash (§8.21). */
+    fun closeAsCrashed() = CloseHelper.closeAll(backend, acceptor)
 
     companion object {
         const val TODAY = 20261026

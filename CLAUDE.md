@@ -90,6 +90,12 @@ entry gateways and market data feeds. Kotlin, packages `nl.lamia.most.exchange.f
     sent, nor answered**: it may be at the exchange already. It is rebuilt in flight for the fence
     to settle. (Design.md §6.1, §8.17, §8.20) → R§12
 
+12. **After an unclean stop, every order-entry session's MsgSeqNum moves on 10 000 before the
+    acceptor binds**, on the offline session the library holds, then a Heartbeat is archived. A 35=8
+    can reach the client and not the archive, and a reused number ends the client's session. The
+    clean stop is marked only after Artio's engine has closed (`OrderStore.markStoppedCleanly`),
+    and cleared at start with a synced write. (Design.md §8.21) → R§13
+
 ## Provenance
 
 ## Skills

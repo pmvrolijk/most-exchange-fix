@@ -48,8 +48,8 @@ class InboundOrders(
     /** The adapter's trading date, `YYYYMMDD` (§3.6). */
     private val tradingDate: IntSupplier,
     private val sends: ArchivedSends,
-    /** An id collision (§3.3, §8.15), after the store has blocked the session: for counting and logging. */
-    private val onIdCollision: (participantId: Long) -> Unit,
+    /** An id collision (§3.3, §8.15), after the store has blocked the session: for counting and logging, with what collided. */
+    private val onIdCollision: (participantId: Long, detail: String) -> Unit,
 ) {
     private val message = MutableAsciiBuffer()
     private val header = HeaderDecoder()
@@ -195,7 +195,9 @@ class InboundOrders(
         val held = store.find(participantId, id)
         if (held != null) {
             if (!held.fixClOrdIdEquals(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)) {
-                return collision(participantId, sequenceIndex, replies.rejectOrder(d, OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies)
+                return collision(participantId, sequenceIndex, replies.rejectOrder(d, OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies) {
+                    collided("35=D", d.header(), id, held)
+                }
             }
             // Rebuilt by a recovery that stopped before the directory came: its copy is kept again (§8.17).
             if (recovering && held.isUnresolved) keepUnresolved(held, offset, length)
@@ -285,7 +287,9 @@ class InboundOrders(
         val held = store.find(participantId, id)
         if (held != null) {
             if (!held.fixClOrdIdEquals(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)) {
-                return collision(participantId, sequenceIndex, replies.rejectCancel(c, orderNamed(participantId), OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies)
+                return collision(participantId, sequenceIndex, replies.rejectCancel(c, orderNamed(participantId), OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies) {
+                    collided("35=F", c.header(), id, held)
+                }
             }
             if (recovering && held.isUnresolved) keepUnresolved(held, offset, length)
             return Action.CONTINUE
@@ -517,14 +521,19 @@ class InboundOrders(
         return SecurityLookup.NONE
     }
 
-    private fun collision(participantId: Long, sequenceIndex: Int, rejected: Boolean, replies: ClientReplies): Action {
+    private inline fun collision(participantId: Long, sequenceIndex: Int, rejected: Boolean, replies: ClientReplies, detail: () -> String): Action {
         if (!rejected) return Action.ABORT
         idCollisions++
         store.block(participantId, sequenceIndex)
-        onIdCollision(participantId)
+        onIdCollision(participantId, detail())
         replies.logout(Texts.SEQUENCE_RESET_REQUIRED)
         return Action.CONTINUE
     }
+
+    /** What collided, for the log: rare, so it may allocate. */
+    private fun collided(msgType: String, h: HeaderDecoder, id: Long, held: RequestRow): String =
+        "$msgType 49=${h.senderCompIDAsString()} 34=${h.msgSeqNum()} 11=${clOrdId}${if (recovering) ", replayed at startup" else ""}" +
+            " derives clOrdId ${id ushr 32}:${id and 0xffffffffL}, held for 11=${held.fixClOrdIdAsString()}"
 
     private fun sessionReject(replies: ClientReplies, h: HeaderDecoder, tag: Int, reason: Int): Action =
         answered(replies.sessionReject(h.msgSeqNum(), h.msgType(msgType), tag, reason))

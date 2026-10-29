@@ -55,6 +55,13 @@ class OrderStore private constructor(
     private val metaValueBytes = ByteBuffer.allocateDirect(Long.SIZE_BYTES)
     private val metaValue = UnsafeBuffer(metaValueBytes)
 
+    /**
+     * The adapter's last stop was clean: marked by [markStoppedCleanly] after Artio's engine closed,
+     * and cleared by [load], durably, so a crash after this start is seen at the next (Design.md §8.21).
+     */
+    var stoppedCleanly = false
+        private set
+
     private val participants = Long2ObjectHashMap<ParticipantRows>()
     private val pool = ArrayDeque<RequestRow>()
     private var loaded = false
@@ -91,6 +98,9 @@ class OrderStore private constructor(
         check(!loaded) { "the order store is loaded once" }
         loaded = true
         loadMeta()
+        if (stoppedCleanly) {
+            WriteOptions().setSync(true).use { synced -> db.delete(meta, synced, CLEAN_STOP_KEY) }
+        }
         val drop = WriteBatch()
         val dropped = Long2LongHashMap(0L)
         try {
@@ -149,6 +159,11 @@ class OrderStore private constructor(
             while (entries.isValid) {
                 val k = UnsafeBuffer(entries.key())
                 val v = UnsafeBuffer(entries.value())
+                if (k.getByte(0) == META_CLEAN_STOP) {
+                    stoppedCleanly = true
+                    entries.next()
+                    continue
+                }
                 val p = rowsOf(k.getLong(1, ByteOrder.BIG_ENDIAN))
                 when (val type = k.getByte(0)) {
                     META_FIRST_MISSING -> {
@@ -427,10 +442,24 @@ class OrderStore private constructor(
         private const val META_SEQUENCE_INDEX: Byte = 2
         private const val META_BLOCKED: Byte = 3
         private const val META_FLOOR: Byte = 4
+
+        /** The node's, not a participant's: its key's participant is 0. */
+        private const val META_CLEAN_STOP: Byte = 5
+        private val CLEAN_STOP_KEY = ByteArray(META_KEY_LENGTH).also { it[0] = META_CLEAN_STOP }
         private const val NOT_BLOCKED = -1
 
         /** Rationale §4: a crash leaves a prefix. Never relax this without rereading that section. */
         internal val WAL_RECOVERY_MODE = WALRecoveryMode.PointInTimeRecovery
+
+        /**
+         * Records that the adapter stopped cleanly (Design.md §8.21): called once Artio's engine has
+         * closed, when its archive holds every message it sent, and with the store closed. Synced.
+         */
+        fun markStoppedCleanly(dir: File) {
+            open(dir).use { store ->
+                WriteOptions().setSync(true).use { synced -> store.db.put(store.meta, synced, CLEAN_STOP_KEY, ByteArray(0)) }
+            }
+        }
 
         /** Opens (creating if absent) the store in [dir]. Then [load] it. */
         fun open(dir: File): OrderStore = open(dir, ClOrdIdHasher.DEFAULT)

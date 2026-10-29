@@ -1,6 +1,7 @@
 package nl.lamia.most.exchange.fixadapter
 
 import nl.lamia.most.exchange.fixadapter.codecs.builder.NewOrderSingleEncoder
+import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
 import nl.lamia.most.exchange.fixadapter.session.AcceptorRig
 import nl.lamia.most.exchange.fixadapter.session.Initiator
 import nl.lamia.most.exchange.fixadapter.session.TestSessions
@@ -77,6 +78,16 @@ class AdapterTest {
                 assertEquals("8", report[39])
                 assertEquals("exchange unavailable", report[58])
             }
+        }
+    }
+
+    @Test
+    fun `a clean close marks the stop clean, after Artio's engine has closed`() {
+        // Design.md §8.21: without the mark, the next start moves every session's MsgSeqNum on.
+        Adapter(properties()).close()
+        OrderStore.open(File(dir, "store")).use { store ->
+            store.load(20261028)
+            assertTrue(store.stoppedCleanly)
         }
     }
 

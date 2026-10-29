@@ -65,7 +65,7 @@ class InboundOrdersTest {
         sends = ArchivedSends(store, venue, { recorded }) { row, text -> outbound.refuse(row, text) }
         outbound = OutboundReports(store, client, sends, ArchiveModel(store))
         outbound.recover()
-        inbound = InboundOrders(store, venue, securities, { TODAY }, sends, { collisions += it })
+        inbound = InboundOrders(store, venue, securities, { TODAY }, sends, { p, _ -> collisions += p })
         venue.store = store
     }
 
@@ -1108,7 +1108,7 @@ class InboundOrdersTest {
     fun `an order on its way to the exchange allocates nothing`() {
         val quiet = QuietVenue()
         val hotSends = ArchivedSends(store, quiet, { Long.MAX_VALUE }) { _, _ -> error("refused") }
-        val hot = InboundOrders(store, quiet, QuietSecurities, { TODAY }, hotSends, { })
+        val hot = InboundOrders(store, quiet, QuietSecurities, { TODAY }, hotSends, { _, _ -> })
         val count = 32_000
         val orders = (1..count).map { fix("D", it, listOf(11 to "O$it", 55 to "ACME", 54 to "1", 60 to TIME, 38 to "10", 40 to "2", 44 to "100.25")) }
         val buffers = orders.map { UnsafeBuffer(it) }

@@ -28,7 +28,7 @@ Commands:
   mass-status  [--side buy|sell] [--id ID] [--follow SECONDS]                                 35=AF, type 7
   listen       [--follow SECONDS]          Log on and print what arrives: reports owed while away, say
   load         --symbol S --count N --rate PER_SECOND --price-min P --price-max P [--qty-min Q] [--qty-max Q]
-               [--cancel-pct N] [--prefix ID] [--drain SECONDS] [--reconnect SECONDS] [--verbose]
+               [--cancel-pct N] [--prefix ID] [--drain SECONDS] [--reconnect SECONDS] [--settle SECONDS] [--verbose]
 
 Every application message received is printed on one line (ExecutionReport ... ExecType=TRADE ...).
 --follow defaults to 3 seconds."""
