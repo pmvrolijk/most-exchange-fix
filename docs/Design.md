@@ -1083,6 +1083,20 @@ The archive's recorded position (§6.2) then means durable.
     - **The floor** (confirmed 2026-10-27): the highest `clOrdId` retention dropped, per participant
       in `meta`, written in the batch that drops the rows. Without it, a participant whose rows were
       all dropped would replay its whole history.
+    - **The startup requests go one at a time** (found 2026-10-30; the e2e's 8th run, §8.21; R§15). Each
+      participant's request is made only once the one before it has completed with its session
+      held. Artio 0.182 hands every offline session over with the same connection id,
+      `NO_CONNECTION_ID` (`Framer.HandoverOfflineFixSession`), its replay is rewritten to that id
+      (`CatchupReplayer`), and the library routes a message by connection id to the subscriber put
+      there last (`LibraryPoller.connectionIdToSession`). Requested together, the second handover
+      landed while the first replayed from the archive, and the first session's 35=Ds reached the
+      second's handler: rebuilt for the wrong participant, then a collision with that
+      participant's own message at the same MsgSeqNum. A request's reply follows its replay on the
+      engine's inbound stream, so once it has come, every message replayed for it has gone to its
+      own handler. **A replayed message whose SenderCompID is not its session's client refuses the
+      start**, rather than being rebuilt or dropped. Only the startup replay is affected: a request
+      after a disconnect replays from the last received + 1, which offline is nothing, and a client
+      back first is handed over online, with a connection id of its own.
     - **A request answered here raises the high-water** (as built 2026-10-27), in the same `meta`
       entry. This covers a 35=D or 35=F rejected here, once Artio has taken the reject. Without
       it, every restart, crash or not, would replay the last requests rejected here. A reject that
@@ -1219,10 +1233,15 @@ The archive's recorded position (§6.2) then means durable.
       past, one gap fill, an order after it; clean: the Logon follows on), adapter +1. Five
       mutations, all caught. `e2e/run-e2e.sh` then passed 7 runs of 8. In the other, the startup replay
       after the crash raised an id collision (§3.3), and CLIENT1 was blocked: every Logon after it
-      was logged out "session sequence reset required". **Not explained, not reproduced** in five
+      was logged out "session sequence reset required". ~~Not explained, not reproduced~~ in five
       further runs. Afterwards the store's rows and the archive's 35=D/F agreed one for one, so the
       replay compared something other than the client's own message with its own row. The log line
       now names what collided (SenderCompID, MsgSeqNum, both ClOrdIDs, replayed or live).
+      **Explained and fixed 2026-10-30** (§8.17, "The startup requests go one at a time"): CLIENT2's
+      archived 35=Ds were routed to CLIENT1's offline session by Artio's shared offline connection
+      id, rebuilt as participant 1001's, and CLIENT1's own 35=D at the same MsgSeqNum then
+      collided. Reproduced every time by a test with two sessions losing rows; it needs both
+      clients to have 35=Ds above their high-water at the crash, which is why the e2e saw it rarely.
     - **(h4), the make-up spike, 2026-10-28** (`ResendStallSpikeTest`, a raw-socket client): new
       messages that arrive while the acceptor waits for a resend are marked invalid, but Artio
       counts them as received (`Session.checkSeqNoChange`, then `checkNormalSeqNoChange`).

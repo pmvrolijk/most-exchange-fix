@@ -619,6 +619,55 @@ class OrderEntryBackendTest {
         }
     }
 
+    @Test
+    fun `rows two sessions lost are each rebuilt from that session's own archived messages, for its own participant`() {
+        // Design.md §8.17: the startup replay of a participant's offline session rebuilds its rows.
+        // Two sessions replay at once: Artio hands every offline session the same connection id.
+        val orders = 20
+        val lost = 5
+        start().use { adapter ->
+            adapter.awaitExchange()
+            val one = adapter.logon(CLIENT1)
+            val two = adapter.logon(CLIENT2)
+            for (i in 1..orders) {
+                adapter.send(one, order("ONE-$i"))
+                adapter.send(two, order("TWO-$i"))
+            }
+            pollUntil(*adapter.all(), what = "every order at the gateway") { adapter.gateway(0).orders.size == 2 * orders }
+            for (session in listOf(one, two)) {
+                pollUntil(*adapter.all(), what = "logout sent") { session.startLogout() > 0 }
+                pollUntil(*adapter.all(), what = "logged out") { !session.isConnected }
+            }
+        }
+        // The last rows of each, lost as a host crash loses them while the archive has the 35=Ds.
+        val expected = OrderStore.open(OrderEntryRig.storeDir(adapterDir)).use { store ->
+            store.load(OrderEntryRig.TODAY)
+            val byParticipant = mutableMapOf<Long, MutableList<Pair<Long, String>>>()
+            store.forEach { if (it.kind == RowKind.ORDER) byParticipant.getOrPut(it.participantId) { mutableListOf() } += it.clOrdId to it.fixClOrdIdAsString() }
+            byParticipant.mapValues { (participantId, rows) ->
+                rows.sortedBy { it.first }.takeLast(lost).onEach { (clOrdId, _) -> store.loseForTest(participantId, clOrdId) }
+            }
+        }
+        assertEquals(setOf(1001L, 1002L), expected.keys)
+
+        start().use { adapter ->
+            val store = adapter.rig.backend.store
+            assertTrue(adapter.rig.log.none { "id collision" in it }, "no collision: ${adapter.rig.log}")
+            assertTrue(!store.isBlocked(1001L) && !store.isBlocked(1002L), "neither session blocked")
+            for ((participantId, rows) in expected) {
+                for ((clOrdId, fixClOrdId) in rows) {
+                    val row = assertNotNull(store.find(participantId, clOrdId), "participant $participantId's $fixClOrdId rebuilt: ${adapter.rig.log}")
+                    assertEquals(fixClOrdId, row.fixClOrdIdAsString(), "participant $participantId's own order")
+                }
+            }
+            val prefixes = mapOf(1001L to "ONE-", 1002L to "TWO-")
+            store.forEach { row ->
+                assertTrue(row.fixClOrdIdAsString().startsWith(prefixes.getValue(row.participantId)), "${row.fixClOrdIdAsString()} held for participant ${row.participantId}")
+            }
+            assertTrue(adapter.rig.log.any { "${2 * lost} requests rebuilt from the archive" in it }, "${adapter.rig.log}")
+        }
+    }
+
     /** A Logon and a Logout; the client's sequence numbers after it, sent and received. */
     private fun Adapter.logOnAndOff(): Pair<Int, Int> {
         val session = logon()

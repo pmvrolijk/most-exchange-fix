@@ -3,7 +3,7 @@
 Where the adapter stands, what is open, and what to do next. **This is the session entry point** —
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
-Last updated 2026-10-27. **`fix-session` is implemented: the acceptor (2026-10-15) and the FIX
+Last updated 2026-10-30. **`fix-session` is implemented: the acceptor (2026-10-15) and the FIX
 dictionary (2026-10-20). `order-entry` has its order store, its inbound path, its outbound path and
 durable delivery (2026-10-25, slices 1–4 of §3 item 5): a client's 35=D reaches its shard's gateway
 over Aeron, the exchange's reports and fates come back as 35=8 and 35=9, logged on or not, and a
@@ -101,7 +101,7 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 5 — `fix-session`, `order-entry`, `market-data`, `adapter` (the process), `tools` (`bin/fix`); packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 35, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 243 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 38, SDK wiring 1); `adapter` 5; `market-data` 1; `tools` none (the e2e drives it). `./gradlew build` green 2026-10-29. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29 The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
+| Tests | `fix-session` 35, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 244 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 5; `market-data` 1; `tools` none (the e2e drives it). `./gradlew build` green 2026-10-30. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29 and 3 of 3 on 2026-10-30. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -346,7 +346,7 @@ parallel with item 2.
          Adapters.md (line 49) still describes this adapter's back-pressure as `Action.ABORT`.
          No end-to-end test can hold the archive back, so the gate is proven in unit tests and by
          the mutations, and the wiring by orders still flowing end to end.
-     - ~~**4c, recovery of lost rows**~~ **Done 2026-10-27**, uncommitted (Design §6.1, §8.17;
+     - ~~**4c, recovery of lost rows**~~ **Done 2026-10-27**, committed `1f379d9` (Design §6.1, §8.17;
        Rationale §12; non-negotiable 11 extended). Both points to confirm were confirmed. As built:
        - `OrderStore`: the high-water per participant (rows, the floor of dropped rows written in
          their drop batch, and requests rejected here), `replayFrom`, the floor in `holdsState`.
@@ -387,7 +387,7 @@ parallel with item 2.
          memory, before the shard sessions are created and `restoreInFlight` runs. **Confirmed 2026-10-27**:
          a recovered order whose security the directory does not know is refused, OrdRejReason
          99 "unknown security", through `refuse`.
-   5. ~~**35=H and 35=AF** from the store~~ **Done 2026-10-27**, uncommitted (Design §3.3, §5.4).
+   5. ~~**35=H and 35=AF** from the store~~ **Done 2026-10-27**, committed `1f379d9` (Design §3.3, §5.4).
       Decided with the user, each the recommendation:
       - a 35=H for a ClOrdID not held gets FIX 4.4's unknown-order 35=8 (I, 8, OrdRejReason 5);
       - 35=AF serves MassStatusReqType 7 and 1, with Side as a filter. 585 is cut in
@@ -411,7 +411,7 @@ parallel with item 2.
    6. **This repo's e2e**, against most-exchange's real
       processes. That is the first test of `OrderEntrySession` through a real failover
       (most-exchange Status §3, item 13(a)).
-      - **First run 2026-10-27**, uncommitted (Handover §2k). Built for it: §3.6's calendar, the
+      - **First run 2026-10-27**, committed `2531ea7` (Handover §2k). Built for it: §3.6's calendar, the
         `adapter` module (`bin/adapter <node file>`), `tools`' `bin/fix`, and `e2e/run-e2e.sh`
         (one member, from `../most-exchange`'s installs). Steps 1–7 pass: rest, cross, a report to
         a logged-out client, 35=H, 35=F, 35=AF, an unknown symbol, a clean restart.
@@ -424,7 +424,14 @@ parallel with item 2.
       - **The skip is built** (CLAUDE.md non-negotiable 12, R§13): after an unclean stop each
         session moves on 10 000 before the bind. The e2e then passed 7 runs of 8.
       - **Open, Design §8.21:**
-        - the 8th run's id collision at the startup replay, not explained;
+        - ~~the 8th run's id collision at the startup replay, not explained~~ **Explained and fixed
+          2026-10-30** (Design §8.17, §8.21): Artio hands every offline session the same
+          connection id, so with both startup requests out at once one client's archived 35=Ds
+          reached the other's handler, were rebuilt for the wrong participant, and collided. The
+          startup requests now go one at a time; a replayed message from another session's client
+          refuses the start. Reproduced every time by a new end-to-end test (two sessions losing
+          rows); two mutations, both caught. `e2e/run-e2e.sh` 3 of 3, though no run left a 35=D to
+          rebuild, so the e2e did not exercise the path;
         - ~~what the adapter does about (h3), (h4) and the client-side window~~ **Decided
           2026-10-29**, each the recommendation. The client-side window is a requirement on
           clients (Design §2), reported to Artio. For (h3) and (h4), a rewind was chosen first;
@@ -432,7 +439,7 @@ parallel with item 2.
           gap-fills over every report sent before it. Superseded: **the library asks for the gap
           itself** with its own ResendRequest, logged on, no new index (CLAUDE.md non-negotiable
           13, R§14).
-        - **Built 2026-10-29**, uncommitted (Design §2, "A gap Artio leaves open"):
+        - **Built 2026-10-29**, committed `82a8765` (Design §2, "A gap Artio leaves open"):
           - `artio.ReceiveGaps` keeps the library's own in-order count per session. It reads
             MsgSeqNum, PossDup and a SequenceReset's fields in place.
           - The gap is stored in `meta` (`OrderStore.saveReceiveGap`).
@@ -467,7 +474,8 @@ parallel with item 2.
           - **Not done here:** no e2e step makes a gap, so the make-up is proven against Artio's
             engine only, with a raw client, not against most-exchange. An Artio bump must rerun
             `RewindSpikeTest`.
-        - Still to do: report (h3), (h4) and the initiator's counting to Artio.
+        - Still to do: report (h3), (h4), the initiator's counting and the shared offline
+          connection id (R§15) to Artio.
         - The e2e's client now settles a second after a reconnect (`fix load --settle`), so it
           does not trigger (h4).
       - **Fixed on the way:** Artio's monitoring files were host-wide; now in `fix.logDir`.

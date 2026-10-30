@@ -533,3 +533,47 @@ and the client's resend counted as a duplicate. The client was told its order wa
 it had never been sent. The stored gap is the library's record of what it dropped, so the replay
 skips a non-PossDup message numbered within it. The cost is stated in Design §2: the gap is one
 range, and after a host crash it can make the replay skip a message that did arrive.
+
+## 15. The startup requests go one at a time, and a replayed message is checked against its session
+
+Found 2026-10-30: the e2e's one unexplained run of 8 (Design §8.17, §8.21).
+
+After the SIGKILL, the startup replay of R§12 raised an id collision and blocked CLIENT1. Afterwards
+the store and the archive agreed one for one, so neither had lost or invented anything. The
+collision came from routing, not from data. Artio 0.182 hands every offline session over with the
+same connection id, `NO_CONNECTION_ID` (`Framer.HandoverOfflineFixSession`). The catch-up replay
+rewrites each replayed message to that id (`CatchupReplayer`). The library routes an inbound
+message by connection id, to the subscriber stored under it last
+(`LibraryPoller.connectionIdToSession`). The adapter asked for every session at once. The second
+handover landed while the first was still replaying from the archive, so CLIENT2's 35=Ds reached
+CLIENT1's handler. They were rebuilt as participant 1001's rows. Both clients are at
+`sequenceIndex` 0 with similar MsgSeqNums, so CLIENT1's own 35=D at the same number then met a row
+holding another ClOrdID, which is the definition of a collision (§3.3).
+
+It shows only when two clients both have 35=Ds above their high-water at the crash, which a SIGKILL
+under load rarely leaves. The quiet case is worse than the collision. A misrouted 35=D numbered above
+the other participant's high-water is rebuilt in flight for the wrong participant, and the fence
+rejects it to the wrong client. Its own client's row is never rebuilt, so the exchange's report for
+it is dropped as a report for a lost row (R§10), and that client never hears of its order.
+
+- **One request at a time** is the fix. The next participant's request goes out only once the one
+  before has completed with its session held. A request's reply comes after its replay on the
+  engine's inbound stream (spike (f), R§12), so once it has come, every message replayed for that
+  session has gone to its own handler. The cost is one handover's latency per order-entry session at
+  startup, before the bind, within the existing 10 s startup limit.
+- **The handler checks a replayed message's SenderCompID against its session's client,** and a
+  mismatch refuses the start. Only the ordering above prevents the misrouting, and it rests on Artio's
+  reply following its replay. If that changes in a later Artio, the check refuses the start, which
+  is better than a rebuilt row for the wrong participant or a dropped row for the right one. The
+  check parses the header, so it runs on the startup replay only, where allocating is allowed.
+- **Rejected: routing by the message's CompIDs** to the right participant. That would build on
+  messages Artio delivered with the wrong `Session`, and would hide the misrouting instead of
+  preventing it.
+- **Only the startup replay is affected.** A request after a disconnect replays from the last
+  received + 1, which is nothing for an offline session (R§11). A client back first is handed
+  over online, with a connection id of its own. Other events the library routes by connection id
+  (slow status, throttle) mean nothing to an offline session.
+- **Pinned by an end-to-end test,** `rows two sessions lost are each rebuilt from that session's own
+  archived messages, for its own participant`, which failed every time before the fix. An Artio bump
+  (non-negotiable 6) runs it with the rest of the build. It belongs with (h3) and (h4) on the list
+  to report to Artio.

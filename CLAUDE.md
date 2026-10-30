@@ -89,6 +89,11 @@ entry gateways and market data feeds. Kotlin, packages `nl.lamia.most.exchange.f
     PossDup resend into a second order. And **a request replayed from the archive at startup is never
     sent, nor answered**: it may be at the exchange already. It is rebuilt in flight for the fence
     to settle. (Design.md §6.1, §8.17, §8.20) → R§12
+    - **The startup requests go one at a time.** Request the next offline session only once the
+      one before has completed with its session held: Artio gives every offline session the same
+      connection id, and replays routed by it reach the session handed over last. A replayed
+      message whose SenderCompID is not its session's client refuses the start; never rebuild it,
+      and never route it by its CompIDs. (Design.md §8.17) → R§15
 
 12. **After an unclean stop, every order-entry session's MsgSeqNum moves on 10 000 before the
     acceptor binds**, on the offline session the library holds, then a Heartbeat is archived. A 35=8

@@ -14,6 +14,7 @@ import nl.lamia.most.exchange.client.ReportAction
 import nl.lamia.most.exchange.client.OrderEntrySession
 import nl.lamia.most.exchange.fixadapter.codecs.Constants
 import nl.lamia.most.exchange.fixadapter.codecs.builder.HeartbeatEncoder
+import nl.lamia.most.exchange.fixadapter.codecs.decoder.HeaderDecoder
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReplies
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReports
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.InboundRecording
@@ -46,6 +47,7 @@ import uk.co.real_logic.artio.library.SessionHandler
 import uk.co.real_logic.artio.messages.DisconnectReason
 import uk.co.real_logic.artio.messages.SessionReplyStatus
 import uk.co.real_logic.artio.session.Session
+import uk.co.real_logic.artio.util.MutableAsciiBuffer
 import java.util.function.IntSupplier
 
 /**
@@ -111,6 +113,11 @@ class OrderEntryBackend(
     /** Shards whose directory endpoint has moved from the one their session was created with, as last logged. */
     private val movedLogged = HashSet<Int>()
 
+    /** A replayed message from another session than the one it was delivered to, as first seen (Design.md §8.17). */
+    private var misrouted: String? = null
+    private val replayBuffer = MutableAsciiBuffer()
+    private val replayHeader = HeaderDecoder()
+
     init {
         require(participantIds.isNotEmpty()) { "no order-entry session is configured" }
         try {
@@ -174,8 +181,16 @@ class OrderEntryBackend(
      * Every configured order-entry session Artio knows, requested offline before the acceptor binds,
      * so a report for a client not logged on is written to its session and resent at its Logon
      * (Design.md §6.3). Each replays its archived inbound messages from the participant's high-water
-     * + 1, and the inbound path rebuilds the rows a host crash lost (§8.17). Waits until every replay
-     * is complete with its session held: until the bind no client can log on.
+     * + 1, and the inbound path rebuilds the rows a host crash lost (§8.17). Until the bind no client
+     * can log on.
+     *
+     * **One at a time**, each replay complete with its session held before the next is requested.
+     * Artio 0.182 hands every offline session over with the same connection id, `NO_CONNECTION_ID`,
+     * and the library routes a replayed message by it to the session handed over last
+     * (`LibraryPoller.connectionIdToSession`). Requested together, one session's archived 35=Ds
+     * reached another's handler and were rebuilt for the wrong participant, then collided (§8.21).
+     * A request's reply follows its replay on the engine's inbound stream, so once it has come, every
+     * message replayed for it has gone to its own handler.
      */
     private fun acquireOffline() {
         val deadline = System.nanoTime() + STARTUP_TIMEOUT_NS
@@ -190,13 +205,14 @@ class OrderEntryBackend(
             val participantId = checkNotNull(configured.participantId)
             val from = store.replayFrom(participantId)
             sessions.requestAtStartup(participantId, info.sessionId(), replayFrom = (from and 0xffffffffL).toInt(), replayIndex = (from ushr 32).toInt())
-        }
-        while (sessions.isRequesting || sessions.isAnyReplaying) {
-            check(System.nanoTime() < deadline) {
-                "order entry: the offline sessions were not handed over, their archives replayed, within ${STARTUP_TIMEOUT_NS / 1_000_000_000L} s"
+            while (sessions.isRequesting || sessions.isAnyReplaying) {
+                check(System.nanoTime() < deadline) {
+                    "order entry: the offline sessions were not handed over, their archives replayed, within ${STARTUP_TIMEOUT_NS / 1_000_000_000L} s"
+                }
+                library.poll(FRAGMENT_LIMIT)
+                sessions.doWork()
             }
-            library.poll(FRAGMENT_LIMIT)
-            sessions.doWork()
+            misrouted?.let { error("order entry: $it; refusing to start rather than rebuild it for the wrong participant (Design.md §8.17)") }
         }
         if (inbound.rebuilt > 0) {
             log("order entry: ${inbound.rebuilt} requests rebuilt from the archive, in flight once the directory names their shards (Design.md §8.17)")
@@ -361,6 +377,14 @@ class OrderEntryBackend(
             if (!messageInfo.isValid || isSessionMessage(messageType)) return Action.CONTINUE
             if (sequenceIndex > store.highestSequenceIndex(participantId)) store.recordSequenceIndex(participantId, sequenceIndex)
             if (replayed) {
+                // Another session's message, routed here by Artio's shared offline connection id: never rebuilt as this one's.
+                if (!isFromClientOf(session, buffer, offset, length)) {
+                    if (misrouted == null) {
+                        misrouted = "participant $participantId's startup replay delivered a message from ${replayHeader.senderCompIDAsString()}, " +
+                            "not its client ${session.compositeKey().remoteCompId()}"
+                    }
+                    return Action.CONTINUE
+                }
                 // Dropped by the library before the restart: it never reached the exchange, and is asked for again (§2).
                 if (gaps.droppedBeforeRestart(participantId, sequenceIndex, buffer, offset, length)) return Action.CONTINUE
                 // Past a block's index, its Logon came, and lifted it (§3.3); Logons are not replayed to here.
@@ -382,6 +406,15 @@ class OrderEntryBackend(
 
         /** A Logon on a session the library already held offline. */
         override fun onSessionStart(session: Session) = loggedOn(participantId, session)
+    }
+
+
+    /** Whether the message's SenderCompID is [session]'s client. Startup only: it allocates. */
+    private fun isFromClientOf(session: Session, buffer: DirectBuffer, offset: Int, length: Int): Boolean {
+        replayBuffer.wrap(buffer)
+        replayHeader.reset()
+        replayHeader.decode(replayBuffer, offset, length)
+        return replayHeader.senderCompIDAsString() == session.compositeKey().remoteCompId()
     }
 
     private object Ignored : SessionHandler {
