@@ -96,6 +96,15 @@ entry gateways and market data feeds. Kotlin, packages `nl.lamia.most.exchange.f
     clean stop is marked only after Artio's engine has closed (`OrderStore.markStoppedCleanly`),
     and cleared at start with a synced write. (Design.md §8.21) → R§13
 
+13. **A gap Artio leaves open is asked for by the library, never rewound.** Never lower a session's
+    received number (`tryUpdateLastReceivedSequenceNumber`, `lastReceivedMsgSeqNum`): it starts a
+    new `sequenceIndex`, and Artio's replayer then gap-fills over every message sent before it,
+    so a 35=8 the client missed is lost. When Artio's resend stalls, or a connection ends with its
+    gap open, the library sends its own ResendRequest for the range: at once, or straight after
+    the next Logon from the gap stored in `meta`. The startup replay skips a non-PossDup message
+    numbered within that stored gap: Artio archives what it marked invalid and replays it as valid,
+    and rebuilt, it would be rejected "not sequenced". (Design.md §2, §8.21) → R§14
+
 ## Provenance
 
 ## Skills

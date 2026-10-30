@@ -483,6 +483,24 @@ class OrderStoreTest {
     // ---------------------------------------------------------------- refusals at load
 
     @Test
+    fun `an open receive gap survives a restart per participant with its sequenceIndex, and is gone once cleared`() {
+        // Design.md §2, "A gap Artio leaves open": stored in meta while open, deleted when it closes.
+        val s = open()
+        assertEquals(0, s.receiveGapFrom(1001L), "none until saved")
+        s.saveReceiveGap(1001L, sequenceIndex = 2, from = 3, to = 5)
+        s.saveReceiveGap(1002L, sequenceIndex = 0, from = 7, to = 7)
+        s.saveReceiveGap(1001L, sequenceIndex = 2, from = 3, to = 9) // grown
+        val r = restart()
+        assertEquals(Triple(2, 3, 9), Triple(r.receiveGapIndex(1001L), r.receiveGapFrom(1001L), r.receiveGapTo(1001L)))
+        assertEquals(Triple(0, 7, 7), Triple(r.receiveGapIndex(1002L), r.receiveGapFrom(1002L), r.receiveGapTo(1002L)))
+        r.clearReceiveGap(1001L)
+        assertEquals(0, r.receiveGapFrom(1001L))
+        val again = restart()
+        assertEquals(0, again.receiveGapFrom(1001L), "the clear is written through")
+        assertEquals(7, again.receiveGapFrom(1002L), "the other participant's is untouched")
+    }
+
+    @Test
     fun `a stop is clean only once marked after the close, and each start clears the mark durably`() {
         // Design §8.21: the adapter marks a clean stop after Artio's engine has closed; a start
         // without the mark is after a crash, and moves every session's MsgSeqNum on.

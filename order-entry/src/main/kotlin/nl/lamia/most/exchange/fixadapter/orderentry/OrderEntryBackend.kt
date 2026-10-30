@@ -18,7 +18,9 @@ import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReplies
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioReports
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.InboundRecording
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.LibraryRecording
+import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioGapSessions
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ArtioSessions
+import nl.lamia.most.exchange.fixadapter.orderentry.artio.ReceiveGaps
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.ReportSessions
 import nl.lamia.most.exchange.fixadapter.orderentry.delivery.ReportDelivery
 import nl.lamia.most.exchange.fixadapter.orderentry.outbound.OutboundReports
@@ -86,6 +88,9 @@ class OrderEntryBackend(
     private val replies = ArtioReplies(index)
     val sessions = ReportSessions(ArtioSessions, log)
     private val reports = ArtioReports(index, sessions)
+
+    /** The library's own count of what each session has received, and its ResendRequests (Design.md §2, §8.21). */
+    val gaps = ReceiveGaps(store, ArtioGapSessions, log)
     private val directory = DirectoryClient()
     val inbound: InboundOrders
     val sends: ArchivedSends
@@ -152,6 +157,7 @@ class OrderEntryBackend(
         work += outbound.doWork()
         work += sends.doWork()
         work += delivery.doWork()
+        work += gaps.doWork()
         return work
     }
 
@@ -316,6 +322,7 @@ class OrderEntryBackend(
             return Ignored
         }
         sessions.acquired(participantId, session)
+        gaps.acquired(participantId, session)
         // Offline (requested at startup or after a disconnect), its Logon comes later: onSessionStart.
         if (session.isActive) loggedOn(participantId, session)
         return Handler(participantId)
@@ -323,6 +330,7 @@ class OrderEntryBackend(
 
     /** The participant's client is logged on (§3.2, §3.3): its `sequenceIndex` guarded, a blocked session logged out. */
     private fun loggedOn(participantId: Long, session: Session) {
+        gaps.loggedOn(participantId, session)
         val sequenceIndex = session.sequenceIndex()
         if (sequenceIndex < store.highestSequenceIndex(participantId)) {
             // Artio's state lost while running: the derived ids would repeat (§3.2).
@@ -346,10 +354,15 @@ class OrderEntryBackend(
             buffer: DirectBuffer, offset: Int, length: Int, libraryId: Int, session: Session,
             sequenceIndex: Int, messageType: Long, timestampInNs: Long, position: Long, messageInfo: OnMessageInfo,
         ): Action {
+            // The archive's, replayed at startup (§8.17): no live message comes on an offline session.
+            val replayed = sessions.isReplaying(participantId) && !session.isActive
+            // Every message counts, valid or not, session messages included; the replay's are already counted (§2).
+            if (!replayed) gaps.onMessage(participantId, sequenceIndex, buffer, offset, length, messageInfo.isValid)
             if (!messageInfo.isValid || isSessionMessage(messageType)) return Action.CONTINUE
             if (sequenceIndex > store.highestSequenceIndex(participantId)) store.recordSequenceIndex(participantId, sequenceIndex)
-            // The archive's, replayed at startup (§8.17): no live message comes on an offline session.
-            if (sessions.isReplaying(participantId) && !session.isActive) {
+            if (replayed) {
+                // Dropped by the library before the restart: it never reached the exchange, and is asked for again (§2).
+                if (gaps.droppedBeforeRestart(participantId, sequenceIndex, buffer, offset, length)) return Action.CONTINUE
                 // Past a block's index, its Logon came, and lifted it (§3.3); Logons are not replayed to here.
                 store.liftBlock(participantId, sequenceIndex)
                 return inbound.onReplayed(participantId, sequenceIndex, messageType, buffer, offset, length)
@@ -363,6 +376,7 @@ class OrderEntryBackend(
         override fun onDisconnect(libraryId: Int, session: Session, reason: DisconnectReason): Action {
             // Requested here, inside the poll: ahead of a claim the engine announces in the same poll.
             sessions.disconnected(participantId, session)
+            gaps.disconnected(participantId)
             return Action.CONTINUE
         }
 

@@ -101,7 +101,7 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 5 — `fix-session`, `order-entry`, `market-data`, `adapter` (the process), `tools` (`bin/fix`); packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 35, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 221 (the store 25, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the directory index 7, the config 5, the calendar 15, the backend end to end 32, SDK wiring 1); `adapter` 5; `market-data` 1; `tools` none (the e2e drives it). `./gradlew build` green 2026-10-27. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21) The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28 |
+| Tests | `fix-session` 35, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 243 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 38, SDK wiring 1); `adapter` 5; `market-data` 1; `tools` none (the e2e drives it). `./gradlew build` green 2026-10-29. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29 The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -425,8 +425,49 @@ parallel with item 2.
         session moves on 10 000 before the bind. The e2e then passed 7 runs of 8.
       - **Open, Design §8.21:**
         - the 8th run's id collision at the startup replay, not explained;
-        - what the adapter does about (h3), (h4) and the client-side window, which needs a
-          decision.
+        - ~~what the adapter does about (h3), (h4) and the client-side window~~ **Decided
+          2026-10-29**, each the recommendation. The client-side window is a requirement on
+          clients (Design §2), reported to Artio. For (h3) and (h4), a rewind was chosen first;
+          **spike (i)** (`RewindSpikeTest`, 5 tests, green 3 runs of 3) found that Artio then
+          gap-fills over every report sent before it. Superseded: **the library asks for the gap
+          itself** with its own ResendRequest, logged on, no new index (CLAUDE.md non-negotiable
+          13, R§14).
+        - **Built 2026-10-29**, uncommitted (Design §2, "A gap Artio leaves open"):
+          - `artio.ReceiveGaps` keeps the library's own in-order count per session. It reads
+            MsgSeqNum, PossDup and a SequenceReset's fields in place.
+          - The gap is stored in `meta` (`OrderStore.saveReceiveGap`).
+          - The library's own ResendRequest goes out at once after a Logon whose gap is from
+            before it, otherwise after 1 s without progress.
+          - After 3 requests without progress, the session is logged out with Text "messages
+            <from> to <to> not received; resend them".
+          - Wired in the backend: every message counts, invalid and session messages included,
+            but not the startup replay's.
+          - **Found:** the startup replay handed back as valid a 35=D the library had dropped, and
+            recovery rebuilt it in flight. The fence would then have rejected it "not sequenced",
+            and its resend counted as a duplicate. This was so before the gap was tracked. Now a
+            non-PossDup message within the stored gap is skipped. A host-crash corner is left
+            (Design §2).
+          - Tests: order-entry 243 (+22). Store +1, `ReceiveGapsTest` 15 (one of them: counting
+            in order allocates nothing). End to end +6, each driven by a raw-socket client:
+            - a short answer asked again, every order at the gateway once, still logged on;
+            - a gap left by a disconnect asked for after the Logon;
+            - the same across a restart, nothing rebuilt;
+            - a stall left by a disconnect, across a restart: its dropped 35=Ds, in the archive,
+              asked for and sent once;
+            - a client that never answers, logged out naming the range;
+            - an in-order session, with a Heartbeat and a TestRequest, never asked.
+          - `./gradlew build` green, 290 tests.
+          - 17 mutations, 16 caught. The one not caught counts the startup replay's messages.
+            Here Artio's replay from MsgSeqNum 4 never delivered 5, the gap's first number, though
+            it is in the archive. So nothing could move the count, and the guard stands as
+            specified, unproven.
+          - `e2e/run-e2e.sh` passed 3 runs of 3, the SIGKILL step included. The adapter sent no
+            ResendRequest of its own in any of them: the e2e's client settles after a reconnect,
+            so it never leaves a gap.
+          - **Not done here:** no e2e step makes a gap, so the make-up is proven against Artio's
+            engine only, with a raw client, not against most-exchange. An Artio bump must rerun
+            `RewindSpikeTest`.
+        - Still to do: report (h3), (h4) and the initiator's counting to Artio.
         - The e2e's client now settles a second after a reconnect (`fix load --settle`), so it
           does not trigger (h4).
       - **Fixed on the way:** Artio's monitoring files were host-wide; now in `fix.logDir`.

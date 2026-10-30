@@ -800,6 +800,164 @@ class OrderEntryBackendTest {
         instrument().symbol("ACME")
     }
 
+    // ================================================================ a gap Artio leaves open, §2, §8.21
+
+    private fun Adapter.polled() = arrayOf<Polled>(rig, exchange)
+
+    private fun Adapter.ready() = pollUntil(*polled(), what = "the SDK's sessions ready") { rig.backend.readyShards == 2 }
+
+    /** A raw client logged on at [seq], the Logon answered. */
+    private fun Adapter.rawLogon(seq: Int): RawFixClient = RawFixClient(port).also { c ->
+        closing.addFirst(c)
+        c.logon(seq)
+        pollUntil(*polled(), what = "the raw client's Logon answered") { c.received("A").isNotEmpty() }
+    }
+
+    /** The MsgSeqNums of the 35=Ds that reached shard 0's gateway, from their derived clOrdIds (§3.2). */
+    private fun Adapter.sequenced(): List<Int> = gateway(0).orders.map { (it.clOrdId and 0xffffffffL).toInt() }
+
+    /** Spike (h4)'s client: a gap at 3–4, new orders during the resend, an answer that stops at 4, then more. */
+    private fun Adapter.answerShort(c: RawFixClient) {
+        c.order(2)
+        c.order(5)
+        pollUntil(*polled(), what = "Artio's ResendRequest") { c.received("2").isNotEmpty() }
+        c.order(6)
+        c.order(7)
+        pollFor(200, *polled())
+        c.order(3, possDup = true)
+        c.gapFill(4, 5)
+        pollFor(200, *polled())
+        c.order(8)
+        c.order(9)
+    }
+
+    @Test
+    fun `a client that answers a resend short is asked again by the adapter, and every order reaches its gateway once, logged on`() {
+        start().use { adapter ->
+            adapter.ready()
+            val c = adapter.rawLogon(1)
+            adapter.answerShort(c)
+            pollUntil(*adapter.polled(), timeoutMs = 5_000, what = "the adapter's own ResendRequest") { c.received("2").size == 2 }
+            val asked = c.received("2")[1]
+            assertEquals("5" to "9", asked[7] to asked[16], "from the first dropped to the last")
+            for (seq in 5..9) c.order(seq, possDup = true)
+            c.order(10)
+            pollUntil(*adapter.polled(), what = "every order at its gateway") { adapter.sequenced().size >= 8 }
+            pollFor(500, *adapter.polled())
+            assertEquals(listOf(2, 3, 5, 6, 7, 8, 9, 10), adapter.sequenced().sorted(), "each once")
+            assertTrue(!c.closed, "still logged on")
+            assertEquals(1L, adapter.rig.backend.gaps.requested)
+        }
+    }
+
+    @Test
+    fun `a 35=D in a gap left open by a disconnect is asked for after the next Logon, and reaches its gateway`() {
+        start().use { adapter ->
+            adapter.ready()
+            val first = adapter.rawLogon(1)
+            first.order(2)
+            first.order(5)
+            pollUntil(*adapter.polled(), what = "Artio's ResendRequest") { first.received("2").isNotEmpty() }
+            first.close()
+            pollFor(500, *adapter.polled())
+            val second = adapter.rawLogon(6)
+            pollUntil(*adapter.polled(), timeoutMs = 2_000, what = "the adapter's ResendRequest after the Logon") { second.received("2").isNotEmpty() }
+            val asked = second.received("2").single()
+            assertEquals("3" to "5", asked[7] to asked[16], "the gap Artio forgot (h3)")
+            for (seq in 3..5) second.order(seq, possDup = true)
+            second.order(7)
+            pollUntil(*adapter.polled(), what = "every order at its gateway") { adapter.sequenced().size >= 5 }
+            pollFor(500, *adapter.polled())
+            assertEquals(listOf(2, 3, 4, 5, 7), adapter.sequenced().sorted())
+        }
+    }
+
+    @Test
+    fun `a gap left open survives a restart, is asked for after the first Logon, and its 35=Ds reach the gateway`() {
+        start().use { adapter ->
+            adapter.ready()
+            val first = adapter.rawLogon(1)
+            first.order(2)
+            first.order(5)
+            pollUntil(*adapter.polled(), what = "Artio's ResendRequest") { first.received("2").isNotEmpty() }
+            first.close()
+            pollUntil(*adapter.polled(), what = "the order at its gateway") { adapter.sequenced().isNotEmpty() }
+            pollFor(500, *adapter.polled())
+        }
+        start().use { adapter ->
+            adapter.ready()
+            val second = adapter.rawLogon(6)
+            pollUntil(*adapter.polled(), timeoutMs = 2_000, what = "the adapter's ResendRequest after the Logon") { second.received("2").isNotEmpty() }
+            val asked = second.received("2").single()
+            assertEquals("3" to "5", asked[7] to asked[16])
+            for (seq in 3..5) second.order(seq, possDup = true)
+            second.order(7)
+            pollUntil(*adapter.polled(), what = "the orders at the gateway") { adapter.sequenced().size >= 4 }
+            pollFor(500, *adapter.polled())
+            assertEquals(listOf(3, 4, 5, 7), adapter.sequenced().sorted(), "after the restart: the gap's and the new one, nothing sent twice or rebuilt")
+            assertTrue(adapter.rig.log.none { "rebuilt" in it }, "${adapter.rig.log}")
+        }
+    }
+
+    @Test
+    fun `a stall left by a disconnect is asked for after a restart, its dropped 35=Ds in the archive counted by neither the replay nor recovery`() {
+        // The 35=Ds Artio dropped during the stall are in its archive, and the startup replay hands them back as valid.
+        start().use { adapter ->
+            adapter.ready()
+            val first = adapter.rawLogon(1)
+            adapter.answerShort(first)
+            pollFor(300, *adapter.polled())
+            first.close()
+            pollUntil(*adapter.polled(), what = "the orders before the stall at the gateway") { adapter.sequenced().size >= 2 }
+            pollFor(500, *adapter.polled())
+            assertEquals(listOf(2, 3), adapter.sequenced().sorted())
+        }
+        start().use { adapter ->
+            adapter.ready()
+            val second = adapter.rawLogon(10)
+            pollUntil(*adapter.polled(), timeoutMs = 2_000, what = "the adapter's ResendRequest after the Logon") { second.received("2").isNotEmpty() }
+            val asked = second.received("2").single()
+            assertEquals("5" to "9", asked[7] to asked[16])
+            for (seq in 5..9) second.order(seq, possDup = true)
+            second.order(11)
+            pollUntil(*adapter.polled(), what = "the orders at the gateway") { adapter.sequenced().size >= 6 }
+            pollFor(500, *adapter.polled())
+            assertEquals(listOf(5, 6, 7, 8, 9, 11), adapter.sequenced().sorted())
+            assertTrue(adapter.rig.log.none { "rebuilt" in it }, "${adapter.rig.log}")
+        }
+    }
+
+    @Test
+    fun `a client that never fills the gap is logged out after three requests, with a Text naming the range`() {
+        start().use { adapter ->
+            adapter.ready()
+            val c = adapter.rawLogon(1)
+            c.order(2)
+            c.order(5)
+            pollUntil(*adapter.polled(), timeoutMs = 8_000, what = "the logout") { c.closed }
+            assertEquals(4, c.received("2").size, "Artio's own, then the adapter's three")
+            assertEquals("messages 3 to 5 not received; resend them", c.received("5").single()[58])
+            assertEquals(3 to 5, adapter.rig.backend.store.receiveGapFrom(1001L) to adapter.rig.backend.store.receiveGapTo(1001L), "kept")
+        }
+    }
+
+    @Test
+    fun `a session whose messages all arrive in order is never asked for a resend by the adapter`() {
+        start().use { adapter ->
+            adapter.ready()
+            val c = adapter.rawLogon(1)
+            for (seq in 2..6) c.order(seq)
+            c.send("0", 7, emptyList())
+            c.send("1", 8, listOf(112 to "PING"))
+            pollUntil(*adapter.polled(), what = "the Heartbeat answering the TestRequest") { c.received("0").isNotEmpty() }
+            c.order(9)
+            pollFor(2_500, *adapter.polled())
+            assertEquals(emptyList(), c.received("2"))
+            assertEquals(listOf(2, 3, 4, 5, 6, 9), adapter.sequenced().sorted())
+            assertEquals(0L, adapter.rig.backend.gaps.requested)
+        }
+    }
+
     // ================================================================ gateways, §3.5
 
     @Test

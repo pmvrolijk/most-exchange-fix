@@ -109,6 +109,56 @@ sessions, and each one names:
   - **A client that resets recovers by itself** (decided 2026-10-15). 141=Y discards the resend of
     every report it had not yet received, offline ones included. It then sends an order mass status
     request (35=AF) and is answered from the store (§3.3). The adapter owes it nothing more.
+  - **What a client must do at a resend** (decided 2026-10-29, §8.21). Answer the adapter's
+    ResendRequest up to its last message sent, as an EndSeqNo of 0 asks. And while its own
+    ResendRequest is out, queue a message from the adapter numbered above the range it asked
+    for, rather than count it as received: FIX's rule, which Artio's initiator does not follow
+    (reported to Artio). A client that breaks the second stalls itself until it reconnects. If the
+    adapter's resend stalls, or a connection ends before it completes, the adapter asks for the gap
+    again itself, at once or straight after the next Logon (§8.21).
+  - **A gap Artio leaves open is asked for by the library** (decided 2026-10-29, §8.21; CLAUDE.md
+    non-negotiable 13). Artio counts a message above the expected number as received the moment
+    it asks for a resend, so its own count cannot show what is still missing. The library keeps
+    its own, per order-entry session:
+    - **In order:** the last MsgSeqNum it has seen with nothing missing below it. Every message
+      Artio hands the library counts, valid or not, session messages included. A SequenceReset
+      counts up to its NewSeqNo − 1, and the Logon counts. Messages the startup replay brings
+      (§8.17) do not count: they are the archive's, already counted.
+    - **The gap:** the numbers Artio has counted that the library has not seen. A message
+      dropped as invalid above the next expected number opens it, up to that message. So does a
+      valid message above every number seen, up to the one before it. It is one range, from the
+      first missing to the highest: a range wider than needed is safe, because what comes back is
+      PossDup and the store catches a ClOrdID it holds. It closes once the library has seen every
+      number up to its end.
+    - **Asking:** on a logged-on session, the library sends its own ResendRequest (35=2),
+      BeginSeqNo the first missing, EndSeqNo the gap's end. It asks **at once after a Logon**
+      whose gap is from before it: Artio has forgotten that gap (§8.21 (h3)). Otherwise it asks
+      once the gap has gone **1 s without progress**, a stall (§8.21 (h4)), and again after each
+      further second without progress. Progress is the in-order number moving, which also resets
+      the count. **After 3 requests without progress**, the session is logged out with Text
+      "messages <from> to <to> not received; resend them". The gap stays, and is asked for again
+      after the next Logon. A request Artio does not take (back-pressure) is made again in the
+      next duty cycle.
+    - **Kept across a disconnect and a restart:** while open, the gap is stored in `meta` per
+      participant, with its `sequenceIndex` (§6.1). It is written when it opens or grows, and
+      deleted when it closes. After a restart the in-order number is the gap's start − 1, or,
+      with no gap stored, Artio's last received at the offline acquisition.
+    - **The startup replay skips what the library dropped** (found 2026-10-29, building this).
+      Artio's archive holds every inbound message, the ones it marked invalid included, and the
+      replay of §8.17 hands them back as valid. Rebuilt in flight, a dropped 35=D would be
+      rejected "not sequenced" by the fence, and its resend would count as a duplicate. So a
+      replayed message that is not PossDup and is numbered within the stored gap, at its
+      `sequenceIndex`, is skipped: it never reached the exchange, and is asked for again after the
+      Logon. This was so before the gap was tracked: any message dropped in a stall and still in
+      the archive past the high-water at a restart. **Left:** the gap is one range, so it can
+      cover a message that did arrive valid. Such a message has a row, unless a host crash lost
+      the row; then the replay skips it, its resend has no row, and it is sent a second time.
+      That needs a host crash, a gap, and a valid message above the gap's start.
+    - **A message at a higher `sequenceIndex`** (a reset, §3.3) drops the gap: its numbers are
+      gone with that index.
+    - **Not covered:** the first Logon of a session Artio did not know at startup, acquired
+      online. The library has no number of its own for it yet, and starts from Artio's.
+
 ### Configuration and logon
 
 Decided 2026-10-15. Properties files, as the exchange's processes use.
@@ -1205,6 +1255,62 @@ The archive's recorded position (§6.2) then means durable.
       logging it out, so its next Logon asks for the gap; holding its own writes to a session until
       the client's resend has been answered; or stating it as a requirement on clients, and
       reporting it to Artio.
+    - **Decided 2026-10-29** (each the recommendation):
+      - ~~**(h3) and (h4): rewind, then log out.**~~ **Superseded the same day by spike (i), below:**
+        the rewind brings the client's messages back, but Artio then gap-fills over every message
+        the adapter sent before it. As first decided: the library watches for a session awaiting a resend
+        that has dropped messages ahead of it, and for one whose connection ended with its gap
+        still open. It rewinds the received number to the start of the gap
+        (`tryUpdateLastReceivedSequenceNumber`, which starts a new `sequenceIndex`), then logs the
+        session out with a Text. At the next Logon Artio asks for the whole gap; what the store
+        already holds is caught as a duplicate ClOrdID. A `sequenceIndex` the adapter raised itself
+        never lifts a collision block (§3.3). **First a spike (i)** to check the rewind leaves the
+        outbound MsgSeqNum alone and draws the resend at the next Logon. If it does not, the
+        fallback is logging out with a Text naming the missing range, the gap then forgotten.
+        Rejected: logging out only (an order can still vanish for a client that ignores the Text);
+        a requirement on clients only (nothing shows the loss).
+      - **The client-side window: a requirement on clients.** FIX asks a client to queue a message
+        above a pending resend range; Artio's initiator counts it as received. Stated in §2 and
+        reported to Artio. The e2e's client keeps `--settle`. Rejected: holding the adapter's writes
+        after a Logon until the gap fill (a short `ABORT` holds the shard's report stream for every
+        participant, and the library cannot see when the engine's replay ends).
+    - **Spike (i), 2026-10-29** (`RewindSpikeTest`, the raw-socket client of (h4)):
+      - **(i1)–(i3) the rewind**: a stalled session rewound while logged on, a gap left open by a
+        disconnect rewound offline, and that across an engine restart. Each time the next Logon
+        asked from the rewound number, everything resent reached the library valid at the new
+        `sequenceIndex`, and the outbound MsgSeqNum carried on. **But a client's ResendRequest
+        for the adapter's earlier messages was answered with one gap fill**: Artio's `Replayer`
+        queries only the session's current `sequenceIndex` (`Replayer.java:226`). A 35=8 the client
+        missed at the disconnect would be lost for good, since its `reportSeq` was consumed (§6.2).
+      - **(i4), (i5) the library asks itself**, with no rewind: its own ResendRequest for the gap,
+        sent on the session (`ResendRequestEncoder`). In the stall, the first message resent is
+        the end of Artio's own request range, which clears `awaitingResend`; the rest are PossDup
+        below the expected number, which Artio passes on valid. After a disconnect, the request
+        sent straight after the next Logon brought the forgotten messages. Either way the session
+        stayed logged on, at the same `sequenceIndex`, and E1 was resent as itself. Read in
+        `Session.onGapFill`, not spiked: a PossDup gap fill below the expected number is ignored.
+    - **Decided 2026-10-29, after the spike** (the recommendation): **the library asks for the gap
+      itself.**
+      - Per session, it tracks the last MsgSeqNum it has received in order. A message Artio marks
+        invalid above it opens a gap, up to Artio's last received.
+      - When Artio's resend does not close the gap, the library sends a ResendRequest for it. That
+        covers a stall (a message dropped while `awaitingResend`, after the answer has stopped).
+        A gap still open at a disconnect is stored per participant and `sequenceIndex` in `meta`,
+        and asked for straight after the next Logon, across a restart too.
+      - A reset to a higher `sequenceIndex` drops the gap.
+      - What comes back is PossDup and goes through the inbound path, where the store catches what
+        it already holds.
+      - A client that leaves the gap open after a bounded number of requests is logged out, with a
+        Text naming the range.
+      - Rejected: the rewind (above); the fallback, a Logout alone (an order can still vanish for a
+        client that ignores the Text).
+      - CLAUDE.md non-negotiable 13, R§14.
+    - **As built 2026-10-29** (§2, "A gap Artio leaves open"): `artio.ReceiveGaps`, the gap in
+      `meta` (`OrderStore.saveReceiveGap`), wired in `OrderEntryBackend`. Building it found that
+      the startup replay rebuilt a 35=D the library had dropped (§2, the replay skip). Tests:
+      `ReceiveGapsTest` 15, store +1, end to end +6 with a raw-socket client. 17 mutations, 16
+      caught. The one not caught counts the startup replay's messages: Artio's replay did not
+      deliver the gap's first number, so it could not move the count.
 
 ## 9. Control and metrics
 

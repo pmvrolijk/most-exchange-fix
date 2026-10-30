@@ -52,7 +52,7 @@ class OrderStore private constructor(
     private var value = UnsafeBuffer(valueBytes)
     private val metaKeyBytes = ByteBuffer.allocateDirect(META_SHARD_KEY_LENGTH)
     private val metaKey = UnsafeBuffer(metaKeyBytes)
-    private val metaValueBytes = ByteBuffer.allocateDirect(Long.SIZE_BYTES)
+    private val metaValueBytes = ByteBuffer.allocateDirect(RECEIVE_GAP_LENGTH)
     private val metaValue = UnsafeBuffer(metaValueBytes)
 
     /**
@@ -88,6 +88,11 @@ class OrderStore private constructor(
 
         /** The part of [highWater] that no row held shows: stored in `meta`. */
         var floor = 0L
+
+        /** The open receive gap (Design.md §2), [gapFrom] 0 if none. */
+        var gapIndex = 0
+        var gapFrom = 0
+        var gapTo = 0
     }
 
     /**
@@ -175,6 +180,11 @@ class OrderStore private constructor(
                     META_FLOOR -> {
                         p.floor = v.getLong(0, ByteOrder.LITTLE_ENDIAN)
                         p.highWater = maxOf(p.highWater, p.floor)
+                    }
+                    META_RECEIVE_GAP -> {
+                        p.gapIndex = v.getInt(0, ByteOrder.LITTLE_ENDIAN)
+                        p.gapFrom = v.getInt(Int.SIZE_BYTES, ByteOrder.LITTLE_ENDIAN)
+                        p.gapTo = v.getInt(2 * Int.SIZE_BYTES, ByteOrder.LITTLE_ENDIAN)
                     }
                     else -> error("order store meta entry of type $type")
                 }
@@ -392,6 +402,41 @@ class OrderStore private constructor(
             p.firstMissing.values.any { it > 1L }
     }
 
+    /** The first MsgSeqNum of the participant's open receive gap (Design.md §2), 0 if none is stored. */
+    fun receiveGapFrom(participantId: Long): Int = participants.get(participantId)?.gapFrom ?: 0
+
+    /** Its last MsgSeqNum. */
+    fun receiveGapTo(participantId: Long): Int = participants.get(participantId)?.gapTo ?: 0
+
+    /** The `sequenceIndex` its numbers are at. */
+    fun receiveGapIndex(participantId: Long): Int = participants.get(participantId)?.gapIndex ?: 0
+
+    /** Stores the participant's open receive gap, replacing the one stored: written when it opens or grows. */
+    fun saveReceiveGap(participantId: Long, sequenceIndex: Int, from: Int, to: Int) {
+        require(from in 1..to) { "receive gap $from to $to" }
+        metaValue.putInt(0, sequenceIndex, ByteOrder.LITTLE_ENDIAN)
+        metaValue.putInt(Int.SIZE_BYTES, from, ByteOrder.LITTLE_ENDIAN)
+        metaValue.putInt(2 * Int.SIZE_BYTES, to, ByteOrder.LITTLE_ENDIAN)
+        putMeta(META_RECEIVE_GAP, participantId, RECEIVE_GAP_LENGTH)
+        val p = rowsOf(participantId)
+        p.gapIndex = sequenceIndex
+        p.gapFrom = from
+        p.gapTo = to
+    }
+
+    /** Deletes the participant's receive gap: it closed, or a reset dropped it. */
+    fun clearReceiveGap(participantId: Long) {
+        val p = participants.get(participantId) ?: return
+        if (p.gapFrom == 0) return
+        metaKey.putByte(0, META_RECEIVE_GAP)
+        metaKey.putLong(1, participantId, ByteOrder.BIG_ENDIAN)
+        metaKeyBytes.limit(META_KEY_LENGTH).position(0)
+        db.delete(meta, writeOptions, metaKeyBytes)
+        p.gapIndex = 0
+        p.gapFrom = 0
+        p.gapTo = 0
+    }
+
     private fun putMeta(type: Byte, participantId: Long, valueLength: Int) {
         metaKey.putByte(0, type)
         metaKey.putLong(1, participantId, ByteOrder.BIG_ENDIAN)
@@ -442,6 +487,8 @@ class OrderStore private constructor(
         private const val META_SEQUENCE_INDEX: Byte = 2
         private const val META_BLOCKED: Byte = 3
         private const val META_FLOOR: Byte = 4
+        private const val META_RECEIVE_GAP: Byte = 6
+        private const val RECEIVE_GAP_LENGTH = 3 * Int.SIZE_BYTES
 
         /** The node's, not a participant's: its key's participant is 0. */
         private const val META_CLEAN_STOP: Byte = 5
