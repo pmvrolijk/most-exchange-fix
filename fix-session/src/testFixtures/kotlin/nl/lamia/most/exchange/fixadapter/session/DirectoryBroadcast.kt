@@ -1,4 +1,4 @@
-package nl.lamia.most.exchange.fixadapter.orderentry.exchange
+package nl.lamia.most.exchange.fixadapter.session
 
 import nl.lamia.most.exchange.client.DirectoryClient
 import nl.lamia.most.exchange.sbe.DirectoryBeginEncoder
@@ -18,7 +18,16 @@ data class TestShard(
     val executionReportStreamId: Int,
 )
 
-data class TestSecurity(val securityId: Int, val shardId: Int, val symbol: String, val isin: String)
+/** A security as the directory lists it; [tickSize] fixed-point, 8 implied decimals (0.01 by default). */
+data class TestSecurity(
+    val securityId: Int,
+    val shardId: Int,
+    val symbol: String,
+    val isin: String,
+    val currency: String = "EUR",
+    val name: String = symbol,
+    val tickSize: Long = 1_000_000L,
+)
 
 /**
  * One directory broadcast as most-exchange's discovery sends it (its Design.md §7): DirectoryBegin,
@@ -41,8 +50,8 @@ class DirectoryBroadcast(val version: Long, val shards: List<TestShard>, val sec
         }
         for (s in securities) {
             val e = SecurityEntryEncoder().wrapAndApplyHeader(buffer, 0, header)
-                .priceFloor(1L).tickSize(1_000_000L).securityId(s.securityId).shardId(s.shardId).levelCount(10)
-                .symbol(s.symbol).isin(s.isin).currency("EUR").name(s.symbol)
+                .priceFloor(1L).tickSize(s.tickSize).securityId(s.securityId).shardId(s.shardId).levelCount(10)
+                .symbol(s.symbol).isin(s.isin).currency(s.currency).name(s.name)
             if (!sink(buffer, 0, MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength())) return false
         }
         val end = DirectoryEndEncoder().wrapAndApplyHeader(buffer, 0, header).universeVersion(version)

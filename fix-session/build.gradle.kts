@@ -12,6 +12,8 @@ dependencies {
     api(libs.artio.core)
     api(libs.artio.codecs)
     codecGeneration(libs.artio.codecs)
+    // DirectoryBroadcast, the exchange's directory as both backends' tests receive it: SBE only, never main's.
+    testFixturesImplementation(libs.most.client)
 }
 
 // The adapter's dictionary (Design.md §5.4), generated into codecs by Artio's own tool. The XML is

@@ -1,9 +1,7 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.artio
 
-import nl.lamia.most.exchange.fixadapter.codecs.builder.BusinessMessageRejectEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.ExecutionReportEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderCancelRejectEncoder
-import nl.lamia.most.exchange.fixadapter.codecs.builder.RejectEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.NewOrderSingleDecoder
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.OrderCancelReplaceRequestDecoder
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.OrderCancelRequestDecoder
@@ -13,6 +11,7 @@ import nl.lamia.most.exchange.fixadapter.orderentry.inbound.ClientReplies
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.Texts
 import nl.lamia.most.exchange.fixadapter.orderentry.outbound.OutgoingExecution
 import nl.lamia.most.exchange.fixadapter.orderentry.store.RequestRow
+import nl.lamia.most.exchange.fixadapter.session.SessionRejects
 import org.agrona.AsciiSequenceView
 import org.agrona.concurrent.EpochClock
 import org.agrona.concurrent.SystemEpochClock
@@ -36,8 +35,7 @@ class ArtioReplies(directory: DirectoryIndex, private val clock: EpochClock = Sy
 
     private val statuses = ExecutionReportWriter(directory, clock)
 
-    private val reject = RejectEncoder()
-    private val businessReject = BusinessMessageRejectEncoder()
+    private val rejects = SessionRejects()
     private val execution = ExecutionReportEncoder()
     private val cancelReject = OrderCancelRejectEncoder()
 
@@ -48,21 +46,11 @@ class ArtioReplies(directory: DirectoryIndex, private val clock: EpochClock = Sy
     private val transactTime = UtcTimestampEncoder()
     private val logoutTexts = HashMap<String, ByteArray>()
 
-    override fun sessionReject(refSeqNum: Int, refMsgType: AsciiSequenceView, refTagId: Int, reason: Int): Boolean {
-        val r = reject
-        r.reset()
-        r.refSeqNum(refSeqNum).refMsgType(refMsgType).sessionRejectReason(reason)
-        if (refTagId > 0) r.refTagID(refTagId)
-        return send(r)
-    }
+    override fun sessionReject(refSeqNum: Int, refMsgType: AsciiSequenceView, refTagId: Int, reason: Int): Boolean =
+        rejects.sessionReject(session, refSeqNum, refMsgType, refTagId, reason)
 
-    override fun businessReject(refSeqNum: Int, refMsgType: AsciiSequenceView, reason: Int, text: String): Boolean {
-        val b = businessReject
-        b.reset()
-        b.refSeqNum(refSeqNum).refMsgType(refMsgType).businessRejectReason(reason)
-        b.text(this.text, 0, this.text.putStringWithoutLengthAscii(0, text))
-        return send(b)
-    }
+    override fun businessReject(refSeqNum: Int, refMsgType: AsciiSequenceView, reason: Int, text: String): Boolean =
+        rejects.businessReject(session, refSeqNum, refMsgType, reason, text)
 
     override fun rejectOrder(order: NewOrderSingleDecoder, ordRejReason: Int, text: String): Boolean {
         val e = execution

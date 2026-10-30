@@ -9,8 +9,8 @@ import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderMassStatusRequestEn
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderStatusRequestEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.TestRequestEncoder
 import nl.lamia.most.exchange.fixadapter.orderentry.OrderEntryRig.Companion.shard
-import nl.lamia.most.exchange.fixadapter.orderentry.exchange.DirectoryBroadcast
-import nl.lamia.most.exchange.fixadapter.orderentry.exchange.TestSecurity
+import nl.lamia.most.exchange.fixadapter.session.DirectoryBroadcast
+import nl.lamia.most.exchange.fixadapter.session.TestSecurity
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.Texts
 import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
 import nl.lamia.most.exchange.fixadapter.orderentry.store.RowKind

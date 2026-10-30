@@ -1,6 +1,8 @@
 package nl.lamia.most.exchange.fixadapter.session
 
 import nl.lamia.most.exchange.fixadapter.session.TestSessions.CLIENT1
+import nl.lamia.most.exchange.fixadapter.session.TestSessions.FEED1
+import nl.lamia.most.exchange.fixadapter.session.TestSessions.FEED_SECRET
 import nl.lamia.most.exchange.fixadapter.session.TestSessions.SECRET1
 import org.junit.jupiter.api.io.TempDir
 import uk.co.real_logic.artio.Reply
@@ -13,7 +15,8 @@ import kotlin.test.assertTrue
 
 /**
  * Design.md §2: MsgSeqNum is the FIX session's, owned by Artio and persisted across logons and
- * adapter restarts. A Logon must match, or it is refused when too low; only 141=Y resets.
+ * adapter restarts. A Logon must match, or it is refused when too low; only 141=Y resets. A
+ * market-data session is the exception (§4): it starts again at 1 at every Logon.
  */
 class SequenceTest {
 
@@ -29,12 +32,16 @@ class SequenceTest {
         return reply.resultIfPresent()
     }
 
-    /** Logs CLIENT1 on and off; returns the client's sequence numbers after the logout. */
-    private fun logOnAndOff(rig: AcceptorRig, client: Initiator, initialSent: Int? = null, initialReceived: Int? = null): Pair<Int, Int> {
+    /** Logs CLIENT1, or FEED1 with [feed], on and off; returns the client's sequence numbers after the logout. */
+    private fun logOnAndOff(rig: AcceptorRig, client: Initiator, initialSent: Int? = null, initialReceived: Int? = null, feed: Boolean = false): Pair<Int, Int> {
         val all = arrayOf<Polled>(rig.orderEntry, rig.marketData, client)
-        pollUntil(*all, what = "libraries connected") { rig.orderEntry.library.isConnected && client.library.isConnected }
-        val session: Session = await(client.logon(port, CLIENT1, "client1", SECRET1, initialSent, initialReceived), *all, what = "logon")
-        pollUntil(*all, what = "claimed") { rig.orderEntry.session(CLIENT1) != null }
+        pollUntil(*all, what = "libraries connected") { rig.orderEntry.library.isConnected && rig.marketData.library.isConnected && client.library.isConnected }
+        val session: Session = if (feed) {
+            await(client.logon(port, FEED1, "feed1", FEED_SECRET, initialSent, initialReceived), *all, what = "logon")
+        } else {
+            await(client.logon(port, CLIENT1, "client1", SECRET1, initialSent, initialReceived), *all, what = "logon")
+        }
+        pollUntil(*all, what = "claimed") { (if (feed) rig.marketData.session(FEED1) else rig.orderEntry.session(CLIENT1)) != null }
         pollUntil(*all, what = "logout sent") { session.startLogout() > 0 }
         pollUntil(*all, what = "logged out") { !session.isConnected }
         return session.lastSentMsgSeqNum() to session.lastReceivedMsgSeqNum()
@@ -80,6 +87,21 @@ class SequenceTest {
             val logon = acceptorLogons(client).last()
             assertEquals(1, logon.seqNum)
             assertEquals("Y", logon[141])
+        }
+    }
+
+    @Test
+    fun `a market-data session starts again at MsgSeqNum 1 at every Logon, with no 141=Y, across a restart too`() {
+        // Design.md §4, decided 2026-10-30: nothing old is resent, so a client is never handed a stale book.
+        Initiator(File(dir, "initiator")).use { client ->
+            AcceptorRig(acceptorDir, port).use { rig ->
+                val (sent, _) = logOnAndOff(rig, client, feed = true)
+                assertTrue(sent >= 2, "a Logon and a Logout")
+                logOnAndOff(rig, client, initialSent = 1, initialReceived = 1, feed = true)
+            }
+            AcceptorRig(acceptorDir, port).use { rig -> logOnAndOff(rig, client, initialSent = 1, initialReceived = 1, feed = true) }
+            val logons = acceptorLogons(client)
+            assertEquals(listOf(1, 1, 1), logons.map { it.seqNum }, "the acceptor's Logon each time: $logons")
         }
     }
 }

@@ -7,9 +7,9 @@ import io.aeron.archive.ArchiveThreadingMode
 import io.aeron.driver.ThreadingMode
 import io.aeron.logbuffer.FragmentHandler
 import nl.lamia.most.exchange.client.GatewayEndpoint
-import nl.lamia.most.exchange.fixadapter.orderentry.exchange.DirectoryBroadcast
-import nl.lamia.most.exchange.fixadapter.orderentry.exchange.TestSecurity
-import nl.lamia.most.exchange.fixadapter.orderentry.exchange.TestShard
+import nl.lamia.most.exchange.fixadapter.session.DirectoryBroadcast
+import nl.lamia.most.exchange.fixadapter.session.TestSecurity
+import nl.lamia.most.exchange.fixadapter.session.TestShard
 import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
 import nl.lamia.most.exchange.fixadapter.session.AcceptorRig
 import nl.lamia.most.exchange.fixadapter.session.FixAcceptor

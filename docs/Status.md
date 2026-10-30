@@ -474,16 +474,37 @@ parallel with item 2.
           - **Not done here:** no e2e step makes a gap, so the make-up is proven against Artio's
             engine only, with a raw client, not against most-exchange. An Artio bump must rerun
             `RewindSpikeTest`.
-        - Still to do: report (h3), (h4), the initiator's counting and the shared offline
-          connection id (R§15) to Artio.
+        - ~~Report (h3), (h4), the initiator's counting and the shared offline connection id (R§15)
+          to Artio~~ **Skipped 2026-10-30** (the user's call). Artio is now `artiofix/artio`; in
+          0.187 `Session`, `CatchupReplayer` and `ReplayQuery` are unchanged from 0.182, so all four
+          still hold there.
         - The e2e's client now settles a second after a reconnect (`fix load --settle`), so it
           does not trigger (h4).
       - **Fixed on the way:** Artio's monitoring files were host-wide; now in `fix.logDir`.
-      - **Still to do:** the three-member failover run (a `run-failover.sh` for the adapter, listed
-        gateways), after §8.21's decision.
+      - ~~The three-member failover run (a `run-failover.sh` for the adapter, listed gateways)~~
+        **Skipped 2026-10-30** (the user's call).
 6. **Tooling** (Design §10): the paced FIX sender and the HTML latency report, with service and
    response time per outcome. Then a baseline measurement (`perf-claim`).
-7. **`market-data`:** 35=y from the directory, then 35=V/W/X from `DepthFeedAssembler`.
+7. **`market-data`:** 35=y from the directory, then 35=V/W/X from `DepthFeedAssembler`. Started
+   2026-10-30, uncommitted. Decided first (`decision-fork`, each the recommendation, Design §4): 35=X
+   from a listener added to the SDK's assembler; market-data sessions transient (MsgSeqNum 1 at every
+   Logon); one engine, the archive coupling measured later (§8.22). In five slices:
+   1. ~~**The dictionary**~~ **Done**: 35=x, V, y, W, X, Y added to `extract_fix44.py`, FIX 4.4's
+      code sets uncut (an unserved entry type is the backend's 35=Y); 969 MinPriceIncrement taken
+      from FIX 5.0 onto each 35=y entry (FIX 4.4 has no tick tag). `DictionaryTest` +7.
+   2. ~~**The SDK listener**~~ **Done in `../most-exchange`, uncommitted and not published**:
+      `DepthFeedListener` (depth changed on a trusted book, trade, synchronised, desynchronised),
+      7 tests, 5 mutations caught; its Design and Adapters.md updated. **Publishing waits for a go**
+      (most-exchange's rule); until then market-data builds with `-PmostExchange.local=true`.
+   3. ~~**The backend and 35=x**~~ **Done**: `FixAcceptor.persistenceByRole` (market data transient);
+      `SessionRejects` (35=3 and 35=j, now shared with order entry); `MarketDataConfig`
+      (`fix.md.l1|l2|snapshot.channel|streamId`); `SecurityLists` (fragments of 100, resumes after a
+      refusal); `MarketDataBackend` (its own library, claims, the directory, the handler's filters).
+      `DirectoryBroadcast` moved to `fix-session`'s test fixtures. Tests: `SequenceTest` +1,
+      `DictionaryTest` +1, `SecurityListsTest` 5, `MarketDataBackendTest` 5; 9 mutations, all caught
+      (two only after a test was changed: a sort hidden by HashMap order, a refusal hidden by a Logout).
+   4. **Subscriptions**: 35=V → 35=W or 35=Y, 35=X from the listener, the resync, unsubscribe.
+   5. **Wiring**: the backend in `bin/adapter`, and an e2e step against most-exchange's feeds.
 8. **The remote:** GitHub and CI, which needs a go. In CI the job token reads the SDK, once
    most-exchange's job token allowlist includes this project. The move to GitHub changes
    `mostSdk.url`, the credentials and the pipelines (Rationale §3).

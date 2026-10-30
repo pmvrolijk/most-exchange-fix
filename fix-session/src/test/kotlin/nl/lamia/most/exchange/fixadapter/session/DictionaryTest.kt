@@ -10,6 +10,11 @@ import uk.co.real_logic.artio.builder.Encoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.ExecutionReportEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderCancelRejectEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.NewOrderSingleDecoder
+import nl.lamia.most.exchange.fixadapter.codecs.decoder.MarketDataRequestDecoder
+import nl.lamia.most.exchange.fixadapter.codecs.decoder.SecurityListRequestDecoder
+import nl.lamia.most.exchange.fixadapter.codecs.builder.MarketDataIncrementalRefreshEncoder
+import nl.lamia.most.exchange.fixadapter.codecs.builder.MarketDataSnapshotFullRefreshEncoder
+import nl.lamia.most.exchange.fixadapter.codecs.builder.SecurityListEncoder
 import uk.co.real_logic.artio.util.MutableAsciiBuffer
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -23,12 +28,94 @@ import kotlin.test.assertTrue
 class DictionaryTest {
 
     @Test
-    fun `the dictionary holds the session messages, 35=j and the order-entry types, and no others`() {
+    fun `the dictionary holds the session messages, 35=j, the order-entry types and the market-data types, and no others`() {
         val types = Constants::class.java.fields
             .filter { it.name.endsWith("_MESSAGE_AS_STR") }
             .map { it.get(null) as String }
             .toSet()
-        assertEquals(setOf("0", "1", "2", "3", "4", "5", "A", "j", "D", "F", "G", "H", "AF", "8", "9"), types)
+        // §5.4 for order entry; §4 for market data: 35=x and V in, 35=y, W, X and Y out.
+        assertEquals(setOf("0", "1", "2", "3", "4", "5", "A", "j", "D", "F", "G", "H", "AF", "8", "9", "x", "V", "y", "W", "X", "Y"), types)
+    }
+
+    // ---------------------------------------------------------------- market data, §4
+
+    @Test
+    fun `a 35=V for snapshot plus updates, every level, bids offers and trades on one symbol, is valid`() {
+        val request = decodeRequest()
+        assertTrue(request.validate(), "${request.rejectReason() to request.invalidTagId()}")
+        assertEquals("MD-1", request.mDReqIDAsString())
+        assertEquals('1', request.subscriptionRequestType())
+        assertEquals(0, request.marketDepth())
+        assertEquals(1, request.mDUpdateType())
+        assertEquals(listOf('0', '1', '2'), request.mDEntryTypesGroupIterator().map { it.mDEntryType() })
+        assertEquals(listOf("ACME"), request.relatedSymGroupIterator().map { it.symbolAsString() })
+    }
+
+    @Test
+    fun `a 35=V asking for a FIX 4·4 entry type the adapter does not serve is valid, for the backend to answer with a 35=Y`() {
+        val request = decodeRequest(entryTypes = listOf("4"))
+        assertTrue(request.validate(), "${request.rejectReason() to request.invalidTagId()}")
+    }
+
+    @Test
+    fun `a 35=V with an entry type outside FIX 4·4's code set is refused with SessionRejectReason 5 on tag 269`() {
+        val request = decodeRequest(entryTypes = listOf("Z"))
+        assertFalse(request.validate())
+        assertEquals(VALUE_IS_INCORRECT to 269, request.rejectReason() to request.invalidTagId())
+    }
+
+    @Test
+    fun `a 35=x for all securities is valid`() {
+        val bytes = fixMessage("x", HEADER + listOf(320 to "SL-1", 559 to "4"))
+        val request = SecurityListRequestDecoder().apply { decode(MutableAsciiBuffer(bytes), 0, bytes.size) }
+        assertTrue(request.validate(), "${request.rejectReason() to request.invalidTagId()}")
+        assertEquals(4, request.securityListRequestType())
+    }
+
+    @Test
+    fun `35=W and 35=X carry their entries as FIX 4·4 numbers them`() {
+        val snapshot = MarketDataSnapshotFullRefreshEncoder().apply {
+            header().senderCompID("MOST").targetCompID("MD1").msgSeqNum(2).sendingTime(SENDING_TIME.toByteArray())
+            mDReqID("MD-1")
+            instrument().symbol("ACME")
+            mDFullGrp().mDEntriesGroup(1).mDEntryType('0').mDEntryPx(10025L, 2).mDEntrySize(30L, 0).numberOfOrders(2)
+        }
+        val w = encode(snapshot)
+        assertEquals(listOf("MD-1", "ACME", "1", "0", "100.25", "30", "2"), listOf(262, 55, 268, 269, 270, 271, 346).map { w[it] })
+
+        val incremental = MarketDataIncrementalRefreshEncoder().apply {
+            header().senderCompID("MOST").targetCompID("MD1").msgSeqNum(3).sendingTime(SENDING_TIME.toByteArray())
+            mDReqID("MD-1")
+            mDIncGrp().mDEntriesGroup(1).mDUpdateAction('2').mDEntryType('1').mDEntryPx(10050L, 2).apply { instrument().symbol("ACME") }
+        }
+        val x = encode(incremental)
+        assertEquals(listOf("MD-1", "1", "2", "1", "100.5", "ACME"), listOf(262, 268, 279, 269, 270, 55).map { x[it] })
+    }
+
+    @Test
+    fun `a 35=y entry carries the tick as MinPriceIncrement, tag 969 from FIX 5·0, beside FIX 4·4's instrument fields`() {
+        val list = SecurityListEncoder().apply {
+            header().senderCompID("MOST").targetCompID("MD1").msgSeqNum(2).sendingTime(SENDING_TIME.toByteArray())
+            securityReqID("SL-1").securityResponseID("SL-1").securityRequestResult(0).totNoRelatedSym(1).lastFragment(true)
+            secListGrp().relatedSymGroup(1).apply {
+                instrument().symbol("ACME").securityID("42").securityIDSource("8").securityDesc("Acme NV")
+                    .secAltIDGrp().securityAltIDGroup(1).securityAltID("NL0000000042").securityAltIDSource("4")
+                currency("EUR")
+                minPriceIncrement(1L, 2)
+            }
+        }
+        val y = encode(list)
+        assertEquals(
+            listOf("SL-1", "0", "1", "ACME", "42", "8", "1", "NL0000000042", "4", "Acme NV", "EUR", "0.01"),
+            listOf(320, 560, 146, 55, 48, 22, 454, 455, 456, 107, 15, 969).map { y[it] },
+        )
+    }
+
+    private fun decodeRequest(entryTypes: List<String> = listOf("0", "1", "2")): MarketDataRequestDecoder {
+        val body = listOf(262 to "MD-1", 263 to "1", 264 to "0", 265 to "1", 267 to "${entryTypes.size}") +
+            entryTypes.map { 269 to it } + listOf(146 to "1", 55 to "ACME")
+        val bytes = fixMessage("V", HEADER + body)
+        return MarketDataRequestDecoder().apply { decode(MutableAsciiBuffer(bytes), 0, bytes.size) }
     }
 
     @Test

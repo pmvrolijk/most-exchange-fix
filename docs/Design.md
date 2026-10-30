@@ -469,6 +469,34 @@ only: the `expireDate` of a day order (59=0 or absent).
     `LastTrade`.
   - **While a book resynchronises** (`book()` is null), incrementals stop, and a fresh 35=W follows
     once it is trusted again.
+- **Decided 2026-10-30** (`decision-fork`, each the recommendation):
+  - **35=X comes from a listener on the SDK's `DepthFeedAssembler`**, added to most-exchange's
+    `client` (non-negotiable 4): a depth change applied to a trusted book, a trade, a book
+    synchronised, a book desynchronised. Every update and every trade reaches the client; a book
+    synchronised again gets a fresh 35=W. Rejected: diffing each book every duty cycle, which needs
+    no SDK change but keeps only the last trade, so two trades in one cycle would send one.
+  - **Market-data sessions are transient: MsgSeqNum restarts at 1 at every Logon**, Artio's
+    `SessionPersistenceStrategy` chosen by the session's role. Nothing old is ever resent, so a
+    reconnecting client is never handed a stale book. Subscriptions live in memory and end with the
+    session; the client subscribes again and gets a fresh 35=W. Order-entry sessions stay
+    persistent. Rejected: persistent numbers with 35=W/X/y gap-filled on replay, which keeps
+    sequence state that serves market data nothing.
+  - **One engine, as decided 2026-10-03.** Its archive records every 35=W/X too; the coupling with
+    the order path is §8.22, measured before market data is relied on under load. Rejected for now:
+    a second Artio engine for market data.
+  - **The feeds are the node file's**: the L1, L2 and snapshot channels and stream ids, as
+    most-exchange's own processes configure them (`md.l1`, `md.l2`, `md.snapshot`). The directory
+    carries order-entry routes only.
+- **35=y as built** (2026-10-30, FIX 4.4's codes where §4 above is silent):
+  - **The tick is MinPriceIncrement, tag 969, FIX 5.0's.** FIX 4.4 has no tag for it, so it is added
+    to the dictionary on each 35=y entry, as 2362 and 2964 were taken from FIX Latest (§5.4).
+  - SecurityRequestResult (560) **0** with the list; **1**, invalid or unsupported request, for any
+    SecurityListRequestType but 4; **4**, temporarily unavailable, before the first directory. An
+    empty directory is the same to the SDK (`DirectoryClient.isReady` needs a security), so 2, no
+    instruments found, is never sent.
+  - **At most 100 entries per 35=y**, each carrying TotNoRelatedSym (393) and LastFragment (893), in
+    `securityId` order. SecurityResponseID (322) echoes SecurityReqID. A send Artio refuses aborts
+    the 35=x, and its redelivery goes on from the fragment refused.
 
 ## 5. FIX dictionary and field mapping
 
@@ -600,9 +628,11 @@ Decided 2026-10-20. **FIX 4.4, only the message types the adapter handles, plus 
   the type of tag 532, is outside the messages kept. Not QuickFIX/J's `FIX44.xml`: its licence
   carries an acknowledgment clause and name restrictions, the shape of Apache 1.1.
 - **`fix-session/src/main/dictionary/extract_fix44.py` writes `fix44-most.xml`** from it, and the
-  output is committed. It keeps the header, the trailer, the seven session messages, and 35=j, D,
-  F, G, H, AF, 8 and 9, each with its complete FIX 4.4 structure, so a standard field the adapter
-  does not read is accepted and ignored (§5.1). Market data messages are added with `market-data`.
+  output is committed. It keeps the header, the trailer, the seven session messages, 35=j, D,
+  F, G, H, AF, 8 and 9, and for market data (§4, added 2026-10-30) 35=x, V, y, W, X and Y, each
+  with its complete FIX 4.4 structure, so a standard field the adapter does not read is accepted
+  and ignored (§5.1). Market data's code sets are FIX 4.4's, uncut: an entry type or update type
+  FIX 4.4 defines but the adapter does not serve is the backend's to answer, with a 35=Y (§4).
   A group becomes a component of its own name, as in QuickFIX's FIX 4.4, so one decoder serves
   every message that carries it. The script is re-run, never its output edited.
 - **2362 SelfMatchPreventionID**, String (FIX Latest EP211), on 35=D and echoed on 35=8. The backend
@@ -614,6 +644,8 @@ Decided 2026-10-20. **FIX 4.4, only the message types the adapter handles, plus 
   2026-10-20).
 - **5001 OrdStatusUnknown**, Boolean, user-defined, on 35=8 and 35=9 (§3.4; number decided
   2026-10-20).
+- **969 MinPriceIncrement**, Float (FIX 5.0), on each 35=y entry (§4; 2026-10-30). The script adds
+  it inside the SecListGrp group (`ADDITIONS_BY_GROUP`).
 - **585 MassStatusReqType cut to 1 and 7** (decided 2026-10-27, §3.3), the one FIX 4.4 code set
   the script cuts (`CODE_SET_CUTS`). Any other value is refused by the decoder, a 35=3 with
   SessionRejectReason 5, as a 2964 of 3 is.
@@ -1330,6 +1362,13 @@ The archive's recorded position (§6.2) then means durable.
       `ReceiveGapsTest` 15, store +1, end to end +6 with a raw-socket client. 17 mutations, 16
       caught. The one not caught counts the startup replay's messages: Artio's replay did not
       deliver the gap's first number, so it could not move the count.
+
+22. **Market data shares the order path's archive** (decided 2026-10-30 to measure, §4). One Artio
+    engine serves both backends, and its archive, fsynced at `fileSyncLevel=1`, records every 35=W
+    and 35=X. A `reportSeq` is consumed only once the archive has its 35=8 (§6.2), so a burst of
+    market data can delay report delivery. To measure with the latency tooling (§10) under a market
+    data load before relying on it; the remedy, if needed, is a second engine for market data, with
+    its own port and an unsynced archive.
 
 ## 9. Control and metrics
 

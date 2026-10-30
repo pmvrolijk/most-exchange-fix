@@ -4,4 +4,10 @@
 dependencies {
     implementation(project(":fix-session"))
     implementation(libs.most.client)
+    testImplementation(testFixtures(project(":fix-session")))
+}
+
+tasks.test {
+    // As the adapter runs: the acceptor refuses to start without it (Design.md §5.4).
+    systemProperty("fix.codecs.reject_unknown_field", "true")
 }

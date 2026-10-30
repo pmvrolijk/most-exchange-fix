@@ -10,6 +10,7 @@ import uk.co.real_logic.artio.engine.EngineConfiguration
 import uk.co.real_logic.artio.engine.FixEngine
 import uk.co.real_logic.artio.library.LibraryConfiguration
 import uk.co.real_logic.artio.library.SessionExistsHandler
+import uk.co.real_logic.artio.validation.PersistenceLevel
 import uk.co.real_logic.artio.validation.SessionPersistenceStrategy
 import java.io.File
 import java.util.concurrent.atomic.AtomicInteger
@@ -22,8 +23,9 @@ import java.util.concurrent.atomic.AtomicInteger
  *   the archive is synced at `fileSyncLevel`, its catalog the same.
  * - Artio's monitoring files are there too, one per engine and library: by default every Artio
  *   process on the host shares one path in the temp directory.
- * - Sequence numbers are always persistent: MsgSeqNum is the FIX session's, across logons and
- *   restarts. Sessions are accepted engine-owned, and each library claims those of its role.
+ * - An order-entry session's sequence numbers are persistent: MsgSeqNum is the FIX session's, across
+ *   logons and restarts. A market-data session's start again at 1 at every Logon (Design §4), so
+ *   nothing old is resent. Sessions are accepted engine-owned, and each library claims those of its role.
  *
  * With [bindAtStartup] false the engine listens only once [bind] is called: the adapter binds after
  * its backends' startup checks (Design.md §3.2), so no Logon reaches an adapter about to refuse to
@@ -72,8 +74,8 @@ class FixAcceptor(
                 deleteLogFileDirOnStart(false)
                 // Artio's default is one path in the temp directory for every engine on the host.
                 monitoringFile(File(config.logDir, "engine-monitoring").path)
-                // Artio's default resets sequence numbers at every logon (Design §2).
-                sessionPersistenceStrategy(SessionPersistenceStrategy.alwaysPersistent())
+                // Artio's default resets sequence numbers at every logon (Design §2); market data's do (§4).
+                sessionPersistenceStrategy(persistenceByRole(sessions))
                 authenticationStrategy(LogonAuthentication(sessions))
                 // The adapter's dictionary (Design §5.4); the engine hands it to each library with the session.
                 acceptorfixDictionary(FixDictionaryImpl::class.java)
@@ -116,5 +118,15 @@ class FixAcceptor(
 
     companion object {
         const val IPC = "aeron:ipc"
+
+        /**
+         * Persistent for an order-entry session, transient for a market-data one (Design §2, §4). A
+         * Logon matching no configured session is refused by [LogonAuthentication] in any case.
+         */
+        fun persistenceByRole(sessions: ConfiguredSessions) = SessionPersistenceStrategy { logon ->
+            val header = logon.header()
+            val session = sessions.find(senderCompId = header.targetCompIDAsString(), targetCompId = header.senderCompIDAsString())
+            if (session?.role == Role.MARKET_DATA) PersistenceLevel.TRANSIENT_SEQUENCE_NUMBERS else PersistenceLevel.PERSISTENT_SEQUENCE_NUMBERS
+        }
     }
 }
