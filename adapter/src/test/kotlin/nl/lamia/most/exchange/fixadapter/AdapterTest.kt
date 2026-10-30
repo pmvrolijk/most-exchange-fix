@@ -1,6 +1,7 @@
 package nl.lamia.most.exchange.fixadapter
 
 import nl.lamia.most.exchange.fixadapter.codecs.builder.NewOrderSingleEncoder
+import nl.lamia.most.exchange.fixadapter.codecs.builder.SecurityListRequestEncoder
 import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
 import nl.lamia.most.exchange.fixadapter.session.AcceptorRig
 import nl.lamia.most.exchange.fixadapter.session.Initiator
@@ -21,7 +22,7 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
-/** The adapter as a process (Design.md §1, §7): started from the node file, order entry on its own thread. */
+/** The adapter as a process (Design.md §1, §7): started from the node file, each backend on its own thread. */
 class AdapterTest {
 
     @TempDir
@@ -43,6 +44,10 @@ class AdapterTest {
         setProperty("fix.calendar.zone", "UTC")
         setProperty("fix.calendar.rollTime", "23:59")
         setProperty("fix.idleStrategy", "backoff")
+        for ((feed, stream) in listOf("l1" to 9401, "l2" to 9402, "snapshot" to 9404)) {
+            setProperty("fix.md.$feed.channel", "aeron:ipc")
+            setProperty("fix.md.$feed.streamId", "$stream")
+        }
         for ((k, v) in entries) if (v.isEmpty()) remove(k) else setProperty(k, v)
     }
 
@@ -79,6 +84,32 @@ class AdapterTest {
                 assertEquals("exchange unavailable", report[58])
             }
         }
+    }
+
+    @Test
+    fun `market data runs on its own thread, so a market-data client's 35=x before the directory is answered temporarily unavailable`() {
+        // Design.md §4: a market-data session configured, so the backend runs, its feeds from the node file.
+        Adapter(properties()).use { adapter ->
+            assertTrue(adapter.marketData != null, "the market-data backend runs")
+            Initiator(File(dir, "client")).use { client ->
+                pollUntil(client, what = "the client's library connected") { client.library.isConnected }
+                val logon = client.logon(port, TestSessions.FEED1, "feed1", TestSessions.FEED_SECRET)
+                pollUntil(client, what = "logon") { !logon.isExecuting }
+                val session = checkNotNull(logon.resultIfPresent()) { "logon: ${logon.state()} ${logon.error()}" }
+                val request = SecurityListRequestEncoder().securityReqID("SL-1").securityListRequestType(4)
+                pollUntil(client, what = "35=x sent") { session.trySend(request) > 0 }
+                pollUntil(client, what = "the 35=y") { client.received[session.id()].orEmpty().any { it.msgType == "y" } }
+                assertEquals("4", client.received.getValue(session.id()).first { it.msgType == "y" }[560])
+            }
+        }
+    }
+
+    @Test
+    fun `a market-data session configured without the feeds' keys refuses to start before anything is opened`() {
+        val e = assertFailsWith<IllegalArgumentException> { Adapter(properties("fix.md.l2.channel" to "")) }
+        assertTrue("fix.md.l2.channel" in e.message.orEmpty(), e.message)
+        assertTrue(!File(dir, "aeron").exists(), "the media driver was started")
+        assertTrue(!listening(), "port $port is listening")
     }
 
     @Test

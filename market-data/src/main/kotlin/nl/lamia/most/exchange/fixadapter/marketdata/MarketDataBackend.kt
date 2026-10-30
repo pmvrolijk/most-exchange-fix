@@ -4,9 +4,11 @@ import io.aeron.Aeron
 import io.aeron.FragmentAssembler
 import io.aeron.Subscription
 import io.aeron.logbuffer.ControlledFragmentHandler.Action
+import nl.lamia.most.exchange.client.DepthFeedDecoder
 import nl.lamia.most.exchange.client.DirectoryClient
 import nl.lamia.most.exchange.fixadapter.codecs.Constants
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.HeaderDecoder
+import nl.lamia.most.exchange.fixadapter.codecs.decoder.MarketDataRequestDecoder
 import nl.lamia.most.exchange.fixadapter.codecs.decoder.SecurityListRequestDecoder
 import nl.lamia.most.exchange.fixadapter.session.FixAcceptor
 import nl.lamia.most.exchange.fixadapter.session.Role
@@ -27,7 +29,8 @@ import uk.co.real_logic.artio.util.MutableAsciiBuffer
 /**
  * The market-data backend (Design.md §4): its own Artio library and duty cycle, so fan-out to market
  * data sessions never delays the order path. It claims the configured market-data sessions
- * ([RoleClaims]), follows the directory, and answers 35=x from it ([SecurityLists]).
+ * ([RoleClaims]), follows the directory, and answers 35=x from it ([SecurityLists]). It subscribes to
+ * the exchange's three feeds, assembled by the SDK, and serves 35=V from them ([Subscriptions]).
  *
  * As order entry's (non-negotiables 9, 10): Artio's invalid and session messages stop at the handler,
  * every application message is decoded and `validate()`d, a failure is a 35=3, and a type not served
@@ -46,6 +49,10 @@ class MarketDataBackend(
 
     private val directory = DirectoryClient()
     private val securityLists = SecurityLists(directory)
+    private val subscriptions = Subscriptions(directory)
+    private val feedDecoder = DepthFeedDecoder(subscriptions.assembler)
+    private val feedAssembler = FragmentAssembler { buffer, offset, length, _ -> feedDecoder.onMessage(buffer, offset, length) }
+    private val feeds = ArrayList<Subscription>(3)
     private val rejects = SessionRejects()
 
     private val aeron: Aeron
@@ -63,6 +70,7 @@ class MarketDataBackend(
         try {
             aeron = owned(Aeron.connect(Aeron.Context().aeronDirectoryName(acceptor.config.aeronDir)))
             directorySubscription = owned(aeron.addSubscription(config.directoryChannel, config.directoryStreamId))
+            for (feed in listOf(config.l2, config.snapshot, config.l1)) feeds += owned(aeron.addSubscription(feed.channel, feed.streamId))
             library = owned(FixLibrary.connect(acceptor.libraryConfiguration(claims).apply {
                 libraryName("market-data")
                 sessionAcquireHandler(SessionAcquireHandler { session, _ -> Handler(session) })
@@ -79,12 +87,15 @@ class MarketDataBackend(
         var work = library.poll(FRAGMENT_LIMIT)
         work += claims.poll()
         work += directorySubscription.poll(directoryAssembler, FRAGMENT_LIMIT)
+        for (i in 0 until feeds.size) work += feeds[i].poll(feedAssembler, FEED_FRAGMENT_LIMIT)
+        work += subscriptions.doWork()
         return work
     }
 
     private val message = MutableAsciiBuffer()
     private val header = HeaderDecoder()
     private val securityListRequest = SecurityListRequestDecoder()
+    private val marketDataRequest = MarketDataRequestDecoder()
     private val msgType = AsciiSequenceView()
 
     /** One market-data session's messages (§4). */
@@ -108,6 +119,16 @@ class MarketDataBackend(
                         securityLists.answer(session.id(), x, out)
                     }
                 }
+                Constants.MARKET_DATA_REQUEST_MESSAGE -> {
+                    val v = marketDataRequest
+                    v.reset()
+                    v.decode(message, offset, length)
+                    if (!v.validate()) {
+                        answered(rejects.sessionReject(session, v.header().msgSeqNum(), v.header().msgType(msgType), v.invalidTagId(), v.rejectReason()))
+                    } else {
+                        subscriptions.onRequest(session.id(), v, out)
+                    }
+                }
                 Constants.BUSINESS_MESSAGE_REJECT_MESSAGE -> Action.CONTINUE // never answered: no reject loop
                 else -> {
                     header.reset()
@@ -119,7 +140,10 @@ class MarketDataBackend(
 
         override fun onTimeout(libraryId: Int, session: Session) = Unit
         override fun onSlowStatus(libraryId: Int, session: Session, hasBecomeSlow: Boolean) = Unit
-        override fun onDisconnect(libraryId: Int, session: Session, reason: DisconnectReason): Action = Action.CONTINUE
+        override fun onDisconnect(libraryId: Int, session: Session, reason: DisconnectReason): Action {
+            subscriptions.onDisconnect(session.id()) // they end with the session (§4)
+            return Action.CONTINUE
+        }
         override fun onSessionStart(session: Session) = Unit
     }
 
@@ -134,6 +158,7 @@ class MarketDataBackend(
 
     private companion object {
         const val FRAGMENT_LIMIT = 10
+        const val FEED_FRAGMENT_LIMIT = 100
 
         /** BusinessRejectReason (380) 3. */
         const val UNSUPPORTED_MESSAGE_TYPE = 3

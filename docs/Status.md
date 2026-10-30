@@ -486,16 +486,16 @@ parallel with item 2.
 6. **Tooling** (Design §10): the paced FIX sender and the HTML latency report, with service and
    response time per outcome. Then a baseline measurement (`perf-claim`).
 7. **`market-data`:** 35=y from the directory, then 35=V/W/X from `DepthFeedAssembler`. Started
-   2026-10-30, uncommitted. Decided first (`decision-fork`, each the recommendation, Design §4): 35=X
+   2026-10-30. Decided first (`decision-fork`, each the recommendation, Design §4): 35=X
    from a listener added to the SDK's assembler; market-data sessions transient (MsgSeqNum 1 at every
    Logon); one engine, the archive coupling measured later (§8.22). In five slices:
    1. ~~**The dictionary**~~ **Done**: 35=x, V, y, W, X, Y added to `extract_fix44.py`, FIX 4.4's
       code sets uncut (an unserved entry type is the backend's 35=Y); 969 MinPriceIncrement taken
       from FIX 5.0 onto each 35=y entry (FIX 4.4 has no tick tag). `DictionaryTest` +7.
-   2. ~~**The SDK listener**~~ **Done in `../most-exchange`, uncommitted and not published**:
+   2. ~~**The SDK listener**~~ **Done in `../most-exchange`** (`3afef4f`, published 2026-10-30):
       `DepthFeedListener` (depth changed on a trusted book, trade, synchronised, desynchronised),
-      7 tests, 5 mutations caught; its Design and Adapters.md updated. **Publishing waits for a go**
-      (most-exchange's rule); until then market-data builds with `-PmostExchange.local=true`.
+      7 tests, 5 mutations caught; its Design and Adapters.md updated. Built against the local SDK
+      until the publish; the registry's `0.1.0-SNAPSHOT` has it since 2026-10-30.
    3. ~~**The backend and 35=x**~~ **Done**: `FixAcceptor.persistenceByRole` (market data transient);
       `SessionRejects` (35=3 and 35=j, now shared with order entry); `MarketDataConfig`
       (`fix.md.l1|l2|snapshot.channel|streamId`); `SecurityLists` (fragments of 100, resumes after a
@@ -503,8 +503,27 @@ parallel with item 2.
       `DirectoryBroadcast` moved to `fix-session`'s test fixtures. Tests: `SequenceTest` +1,
       `DictionaryTest` +1, `SecurityListsTest` 5, `MarketDataBackendTest` 5; 9 mutations, all caught
       (two only after a test was changed: a sort hidden by HashMap order, a refusal hidden by a Logout).
-   4. **Subscriptions**: 35=V → 35=W or 35=Y, 35=X from the listener, the resync, unsubscribe.
-   5. **Wiring**: the backend in `bin/adapter`, and an e2e step against most-exchange's feeds.
+   4. ~~**Subscriptions**~~ **Done 2026-10-30**, uncommitted (Design §4, "Subscriptions"). Decided
+      first: a client whose 35=X Artio refuses gets a fresh 35=W once it can (the recommendation;
+      rejected: logging it out). Specified, then built: `Subscriptions` (owns the SDK's assembler, is
+      its listener; every 35=W from the duty cycle; FIX 4.4's MDReqRejReason; New/Change/Delete per
+      level, MarketDepth 1 as the best of each side), the feeds and 35=V wired into
+      `MarketDataBackend`, `FeedModel` in the tests. Tests: `SubscriptionsTest` 20,
+      `MarketDataBackendTest` +1 (35=V through to 35=W and 35=X over Aeron). 11 mutations, all
+      caught (one only after a trade was added to the resync test).
+   5. ~~**Wiring**~~ **Done 2026-10-30**, uncommitted. `Adapter` runs the market-data backend on its
+      own thread when a market-data session is configured, its `fix.md.*` keys read before anything
+      opens (order entry is still required). `bin/fix` gained `securities` (35=x) and `md` (35=V),
+      both logging on with 141=Y, and prints 35=y/W/X/Y with their groups. `e2e/run-e2e.sh` starts
+      most-exchange's market-data process, its feeds on dynamic MDC channels to the adapter, and step
+      3b checks the 35=y, one 35=W of AAPL's book and the 35=X for a new bid: 3 runs of 3.
+      - **Found by the e2e:** a quiet book's repeated snapshot sent every client the same 35=W every
+        500 ms. Now a book trusted again and exactly as its clients hold it resumes the 35=X with no
+        35=W (Design §4). `SubscriptionsTest` +3, `AdapterTest` +2; 3 mutations, 2 caught, the third
+        an equivalent guard, removed. Mutation runs now detect a compile error (`-Werror`), which
+        had silently reused the last run's results.
+   - **Item 7 is built**, against the published SDK. Left: Design §8.22 (the shared archive) and
+     §8.23 (the SDK book's allocation).
 8. **The remote:** GitHub and CI, which needs a go. In CI the job token reads the SDK, once
    most-exchange's job token allowlist includes this project. The move to GitHub changes
    `mostSdk.url`, the credentials and the pipelines (Rationale §3).

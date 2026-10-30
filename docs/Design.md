@@ -465,8 +465,8 @@ only: the `expireDate` of a day order (59=0 or absent).
   - **35=V.** SubscriptionRequestType 0 (snapshot), 1 (snapshot plus updates) or 2 (unsubscribe).
     MarketDepth 1 (top of book) or 0 (every level). MDUpdateType 1 (incremental). Entry types
     0 (bid), 1 (offer), 2 (trade). Anything else → 35=Y.
-  - **35=W** from the `AggregatedBook` at subscription. **35=X** from `DepthUpdate`, `TopOfBook` and
-    `LastTrade`.
+  - **35=W** from the `AggregatedBook` at subscription. **35=X** from `DepthUpdate` and `LastTrade`
+    (as built 2026-10-30: TopOfBook is not read, L1 is the book's best level; below).
   - **While a book resynchronises** (`book()` is null), incrementals stop, and a fresh 35=W follows
     once it is trusted again.
 - **Decided 2026-10-30** (`decision-fork`, each the recommendation):
@@ -497,6 +497,43 @@ only: the `expireDate` of a day order (59=0 or absent).
   - **At most 100 entries per 35=y**, each carrying TotNoRelatedSym (393) and LastFragment (893), in
     `securityId` order. SecurityResponseID (322) echoes SecurityReqID. A send Artio refuses aborts
     the 35=x, and its redelivery goes on from the fragment refused.
+- **Subscriptions, specified 2026-10-30** (slice 4; FIX 4.4's codes where the list above is silent):
+  - **A subscription is the session's MDReqID.** It may name several instruments (NoRelatedSym),
+    each found by SecurityID with 22=8 or 22=4, else Symbol, as a 35=D's (§5.1). It lives in memory
+    and ends with the session.
+  - **35=Y, MDReqRejReason (281):** **0** an instrument the directory does not list (the whole
+    request); **1** an MDReqID already subscribed on the session; **5** MarketDepth other than 0 or
+    1; **6** MDUpdateType other than 1, or none, on a 263=1; **7** AggregatedBook N; **8** an
+    MDEntryType other than 0, 1 or 2; **9** a TradingSessionID; **A** a Scope; **B** an
+    OpenCloseSettlFlag; **C** MDImplicitDelete Y. Text names what was refused.
+  - **35=W, one per instrument**: MDReqID, the instrument (55, 48 with 22=8), then the bids best
+    first, the offers best first (one each at MarketDepth 1, every level at 0), each with 270, 271
+    and NumberOfOrders (346), then the last trade, if 2 was asked and there is one. An empty book is
+    a 35=W with no entries. Only the entry types asked for are sent.
+  - **35=X, one per change the listener tells**, the instrument on each entry. At MarketDepth 0:
+    MDUpdateAction (279) **0** for a price the book did not hold, **1** for a new aggregate at a held
+    one, **2** when the level is gone. At MarketDepth 1 the client holds one entry per side: a new best
+    price is **2** for the old and **0** for the new, a new aggregate at the same best is **1**, an
+    empty side is **2**; a change below the best sends nothing. A trade is 269=2, 279=0, 270 and 271.
+  - **A book not trusted** (`book()` null): at subscription the 35=W waits until it is; once it
+    stops being trusted, its subscriptions get no 35=X, and each gets a fresh 35=W when it is again,
+    **unless the book is then exactly as its clients hold it** (every level, and the last trade):
+    the 35=X resume and no 35=W is sent. Found in the e2e (2026-10-30): on a quiet book
+    most-exchange's market-data process repeats its snapshot every cycle at the same `l2SeqNum`, the
+    SDK installs each one over the trusted book (an equal image may differ after a market-data
+    restart, its Design says), and every client got the same 35=W every 500 ms.
+  - **A client that cannot keep up** (decided 2026-10-30, the recommendation): a 35=X Artio refuses
+    marks the subscription for a fresh 35=W, sent from the duty cycle once Artio takes messages
+    again; until then it gets no 35=X. Its book is replaced, never left wrong. Rejected: logging it
+    out.
+  - **Every 35=W goes from the duty cycle**, the first one too: the 35=V creates the subscription,
+    owing a 35=W, and is consumed (a 35=Y Artio refuses aborts it). One retry path serves the first
+    snapshot, a resync and a client that fell behind; a 35=W Artio refuses is tried again.
+  - **263=0** sends each instrument's 35=W and keeps nothing. **263=2** removes the session's
+    subscription with that MDReqID, unanswered; an MDReqID not subscribed is ignored.
+  - **TopOfBook is not read.** L1 is the book's best level, as the SDK's decoder says
+    (`DepthFeedDecoder`): a second derivation could disagree with the publisher's. The L1 stream is
+    subscribed for LastTrade.
 
 ## 5. FIX dictionary and field mapping
 
@@ -1369,6 +1406,11 @@ The archive's recorded position (§6.2) then means durable.
     market data can delay report delivery. To measure with the latency tooling (§10) under a market
     data load before relying on it; the remedy, if needed, is a second engine for market data, with
     its own port and an unsynced archive.
+
+23. **Market data's path allocates, in the SDK's book** (found 2026-10-30, slice 4). `AggregatedBook`
+    stores a `Level` object per update and its `levels()` returns a new list, which the 35=X for
+    MarketDepth 1 and every 35=W read. Allocation-free market data needs a change to most-exchange's
+    `client` (non-negotiable 4), as §8.16 does for the directory. Not measured.
 
 ## 9. Control and metrics
 

@@ -1,6 +1,8 @@
 package nl.lamia.most.exchange.fixadapter.tools
 
+import nl.lamia.most.exchange.fixadapter.codecs.builder.MarketDataRequestEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.NewOrderSingleEncoder
+import nl.lamia.most.exchange.fixadapter.codecs.builder.SecurityListRequestEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderCancelRequestEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderMassStatusRequestEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderStatusRequestEncoder
@@ -30,6 +32,11 @@ Commands:
   load         --symbol S --count N --rate PER_SECOND --price-min P --price-max P [--qty-min Q] [--qty-max Q]
                [--cancel-pct N] [--prefix ID] [--drain SECONDS] [--reconnect SECONDS] [--settle SECONDS] [--verbose]
 
+Market data, as a market-data session (it starts at MsgSeqNum 1 at every Logon, so these log on with 141=Y):
+  securities   [--id ID] [--follow SECONDS]                                                    35=x, all securities
+  md           --symbol S[,S...] [--depth 0|1] [--entries bid,offer,trade] [--snapshot] [--id ID] [--follow SECONDS]
+               35=V: snapshot plus updates, unless --snapshot
+
 Every application message received is printed on one line (ExecutionReport ... ExecType=TRADE ...).
 --follow defaults to 3 seconds."""
 
@@ -40,7 +47,7 @@ fun main(argv: Array<String>) {
     }
     val command = argv[0]
     val args = try {
-        Args.parse(argv.drop(1), flags = setOf("reset", "verbose"))
+        Args.parse(argv.drop(1), flags = setOf("reset", "verbose", "snapshot"))
     } catch (e: IllegalArgumentException) {
         System.err.println("fix: ${e.message}")
         exitProcess(2)
@@ -66,7 +73,7 @@ private fun run(command: String, args: Args): Int {
         username = args.required("user"),
         password = args.optional("password") ?: args.optional("password-file")?.let { File(it).readText().trim() }
             ?: throw IllegalArgumentException("--password or --password-file is required"),
-        reset = args.flag("reset"),
+        reset = args.flag("reset") || command in setOf("securities", "md"),
     )
     val state = File(args.required("state"))
     val followMs = (args.double("follow", 3.0) * 1000).toLong()
@@ -87,6 +94,11 @@ private fun run(command: String, args: Args): Int {
             args.optional("side")?.let { side(side(it)) }
         }
         "listen" -> null
+        "securities" -> SecurityListRequestEncoder().apply {
+            securityReqID(args.string("id", "SL-${System.currentTimeMillis()}"))
+            securityListRequestType(4)
+        }
+        "md" -> marketDataRequest(args)
         else -> throw IllegalArgumentException("unknown command: $command\n$USAGE")
     }
     args.rejectUnused()
@@ -100,6 +112,27 @@ private fun run(command: String, args: Args): Int {
 }
 
 private val timestamp = UtcTimestampEncoder()
+
+private fun marketDataRequest(args: Args) = MarketDataRequestEncoder().apply {
+    val snapshotOnly = args.flag("snapshot")
+    mDReqID(args.string("id", "MD-${System.currentTimeMillis()}"))
+    subscriptionRequestType(if (snapshotOnly) '0' else '1')
+    marketDepth(args.int("depth", 0))
+    if (!snapshotOnly) mDUpdateType(1)
+    val types = args.string("entries", "bid,offer,trade").split(',').map {
+        when (it.trim().lowercase()) {
+            "bid" -> '0'
+            "offer" -> '1'
+            "trade" -> '2'
+            else -> throw IllegalArgumentException("--entries takes bid, offer and trade, not $it")
+        }
+    }
+    var entry = mDReqGrp().mDEntryTypesGroup(types.size)
+    types.forEachIndexed { i, t -> entry.mDEntryType(t); if (i < types.size - 1) entry = entry.next() }
+    val symbols = args.required("symbol").split(',').map { it.trim() }
+    var instrument = instrmtMDReqGrp().relatedSymGroup(symbols.size)
+    symbols.forEachIndexed { i, sym -> instrument.instrument().symbol(sym); if (i < symbols.size - 1) instrument = instrument.next() }
+}
 
 internal fun side(name: String): Char = when (name.lowercase()) {
     "buy" -> '1'

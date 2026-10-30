@@ -174,14 +174,18 @@ class FixClient(stateDir: File, private val onMessage: (FixMessage) -> Unit) : A
     }
 }
 
-/** A received FIX message as tag to value; the tools may allocate. */
-class FixMessage(val fields: Map<Int, String>) {
+/** A received FIX message as tag to value, and in order with repeats for its groups; the tools may allocate. */
+class FixMessage(val fields: Map<Int, String>, val ordered: List<Pair<Int, String>> = emptyList()) {
     val msgType: String get() = fields[35].orEmpty()
     operator fun get(tag: Int): String? = fields[tag]
 
+    /** Every value of [tag], in order: a repeating group's. */
+    fun all(tag: Int): List<String> = ordered.filter { it.first == tag }.map { it.second }
+
     companion object {
-        fun parse(text: String) = FixMessage(
-            text.split('\u0001').filter { '=' in it }.associate { it.substringBefore('=').toInt() to it.substringAfter('=') },
-        )
+        fun parse(text: String): FixMessage {
+            val ordered = text.split('\u0001').filter { '=' in it }.map { it.substringBefore('=').toInt() to it.substringAfter('=') }
+            return FixMessage(ordered.toMap(), ordered)
+        }
     }
 }

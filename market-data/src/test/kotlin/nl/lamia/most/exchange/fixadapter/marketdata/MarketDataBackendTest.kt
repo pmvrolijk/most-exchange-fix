@@ -19,6 +19,13 @@ import nl.lamia.most.exchange.fixadapter.session.TestSessions.FEED_SECRET
 import nl.lamia.most.exchange.fixadapter.session.TestShard
 import nl.lamia.most.exchange.fixadapter.session.fixMessage
 import nl.lamia.most.exchange.fixadapter.session.pollUntil
+import nl.lamia.most.exchange.sbe.DepthSnapshotBeginEncoder
+import nl.lamia.most.exchange.sbe.DepthSnapshotEndEncoder
+import nl.lamia.most.exchange.sbe.DepthSnapshotLevelEncoder
+import nl.lamia.most.exchange.sbe.DepthUpdateEncoder
+import nl.lamia.most.exchange.sbe.LastTradeEncoder
+import nl.lamia.most.exchange.sbe.MessageHeaderEncoder
+import nl.lamia.most.exchange.sbe.Side
 import org.agrona.CloseHelper
 import org.agrona.concurrent.UnsafeBuffer
 import org.junit.jupiter.api.io.TempDir
@@ -56,6 +63,7 @@ class MarketDataBackendTest {
         val log = mutableListOf<String>()
         val backend = MarketDataBackend(acceptor, CONFIG, log = { log += it })
         val exchange = DirectoryModel(acceptor.config.aeronDir, broadcast)
+        val feeds = FeedModel(acceptor.config.aeronDir)
         val client = Initiator(File(dir, "client"))
 
         init {
@@ -87,7 +95,7 @@ class MarketDataBackendTest {
                     pollUntil(*all, timeoutMs = 2_000, what = "logged out") { !session.isConnected }
                 }
             }
-            CloseHelper.closeAll(client, exchange, backend, acceptor)
+            CloseHelper.closeAll(client, feeds, exchange, backend, acceptor)
         }
     }
 
@@ -170,6 +178,27 @@ class MarketDataBackendTest {
         assertEquals(emptyList(), rig.client.received.getValue(session.id()).filter { it.msgType == "y" })
     }
 
+    @Test
+    fun `a 35=V is answered with a 35=W of the book the feeds built, then a 35=X for each change and trade`() {
+        val rig = start()
+        pollUntil(*rig.all, what = "the directory and the feeds connected") { rig.backend.hasDirectory && rig.feeds.isConnected }
+        rig.feeds.snapshot(42, Triple(true, 10_025_000_000L, 10_00000000L))
+        val session = rig.logon()
+        rig.sendRaw(session, "V", Constants.MARKET_DATA_REQUEST_MESSAGE,
+            262 to "MD-1", 263 to "1", 264 to "0", 265 to "1", 267 to "3", 269 to "0", 269 to "1", 269 to "2", 146 to "1", 55 to "ACME")
+
+        val w = rig.reply(session, "the 35=W") { it.msgType == "W" }
+        assertEquals(listOf("MD-1", "ACME", "1", "0", "100.25", "10"), listOf(262, 55, 268, 269, 270, 271).map { w[it] })
+
+        rig.feeds.depth(42, isBid = false, price = 10_050_000_000L, qty = 3_00000000L)
+        val x = rig.reply(session, "the 35=X for the offer") { it.msgType == "X" }
+        assertEquals(listOf("MD-1", "0", "1", "100.5", "3", "ACME"), listOf(262, 279, 269, 270, 271, 55).map { x[it] })
+
+        rig.feeds.trade(42, price = 10_050_000_000L, qty = 1_00000000L)
+        val t = rig.reply(session, "the 35=X for the trade") { it.msgType == "X" && it[269] == "2" }
+        assertEquals(listOf("0", "100.5", "1"), listOf(279, 270, 271).map { t[it] })
+    }
+
     private companion object {
         const val DIRECTORY_STREAM = 9100
         val SHARD = TestShard(0, "aeron:ipc", 9200, "aeron:ipc", 9300)
@@ -197,4 +226,52 @@ class DirectoryModel(aeronDir: String, private val broadcast: DirectoryBroadcast
     }
 
     override fun close() = CloseHelper.closeAll(directory, aeron)
+}
+
+/**
+ * most-exchange's market-data process, as the adapter meets it (its Design.md "The L2 recovery feed"):
+ * the L2 increments, the snapshot cycle and the L1 stream's trades, in SBE over Aeron on the adapter's
+ * driver, sequenced per stream as the process numbers them. Shard 0.
+ */
+class FeedModel(aeronDir: String) : AutoCloseable {
+    private val aeron = Aeron.connect(Aeron.Context().aeronDirectoryName(aeronDir))
+    private val l1: ExclusivePublication = aeron.addExclusivePublication("aeron:ipc", 9401)
+    private val l2: ExclusivePublication = aeron.addExclusivePublication("aeron:ipc", 9402)
+    private val snapshots: ExclusivePublication = aeron.addExclusivePublication("aeron:ipc", 9404)
+    private val buffer = UnsafeBuffer(ByteArray(256))
+    private val header = MessageHeaderEncoder()
+    private var l1Seq = 0L
+    private var l2Seq = 0L
+    private var snapSeq = 0L
+
+    val isConnected: Boolean get() = l1.isConnected && l2.isConnected && snapshots.isConnected
+
+    private fun offer(publication: ExclusivePublication, length: Int) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(5)
+        while (publication.offer(buffer, 0, MessageHeaderEncoder.ENCODED_LENGTH + length) < 0) {
+            check(System.nanoTime() < deadline) { "the feed would not take a message" }
+        }
+    }
+
+    /** A complete snapshot cycle for [securityId] at the current L2 sequence: levels (isBid, price, qty). */
+    fun snapshot(securityId: Int, vararg levels: Triple<Boolean, Long, Long>) {
+        offer(snapshots, DepthSnapshotBeginEncoder().wrapAndApplyHeader(buffer, 0, header).securityId(securityId).shardId(0)
+            .seqNum(++snapSeq).l2SeqNum(l2Seq).lastTradePrice(Long.MIN_VALUE).lastTradeQty(0).levelCount(levels.size).encodedLength())
+        for ((isBid, price, qty) in levels) {
+            offer(snapshots, DepthSnapshotLevelEncoder().wrapAndApplyHeader(buffer, 0, header).securityId(securityId).shardId(0)
+                .seqNum(++snapSeq).side(if (isBid) Side.BUY else Side.SELL).price(price).aggregateQty(qty).orderCount(1).encodedLength())
+        }
+        offer(snapshots, DepthSnapshotEndEncoder().wrapAndApplyHeader(buffer, 0, header).securityId(securityId).shardId(0)
+            .seqNum(++snapSeq).l2SeqNum(l2Seq).levelCount(levels.size).encodedLength())
+    }
+
+    fun depth(securityId: Int, isBid: Boolean, price: Long, qty: Long) =
+        offer(l2, DepthUpdateEncoder().wrapAndApplyHeader(buffer, 0, header).securityId(securityId).shardId(0).seqNum(++l2Seq)
+            .side(if (isBid) Side.BUY else Side.SELL).price(price).aggregateQty(qty).orderCount(1).encodedLength())
+
+    fun trade(securityId: Int, price: Long, qty: Long) =
+        offer(l1, LastTradeEncoder().wrapAndApplyHeader(buffer, 0, header).securityId(securityId).shardId(0).seqNum(++l1Seq)
+            .price(price).qty(qty).aggressorSide(Side.BUY).encodedLength())
+
+    override fun close() = CloseHelper.closeAll(l1, l2, snapshots, aeron)
 }

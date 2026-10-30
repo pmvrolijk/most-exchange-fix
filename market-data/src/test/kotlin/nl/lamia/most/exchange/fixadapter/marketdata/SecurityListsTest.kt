@@ -18,28 +18,6 @@ import kotlin.test.assertEquals
  */
 class SecurityListsTest {
 
-    /** What was sent, each message's fields in order, repeats kept. A send it is told to refuse is not kept. */
-    private class Recorder : FixOut {
-        val sent = mutableListOf<List<Pair<Int, String>>>()
-        var refuseNext = 0
-        private val buffer = MutableAsciiBuffer(ByteArray(1 shl 20))
-
-        override fun send(encoder: Encoder): Boolean {
-            if (refuseNext > 0) {
-                refuseNext--
-                return false
-            }
-            encoder.header().senderCompID("MOST").targetCompID("FEED1").msgSeqNum(sent.size + 2).sendingTime("20261030-12:00:00.000".toByteArray())
-            val result = encoder.encode(buffer, 0)
-            sent += buffer.getAscii(Encoder.offset(result), Encoder.length(result)).split('\u0001')
-                .filter { '=' in it }.map { it.substringBefore('=').toInt() to it.substringAfter('=') }
-            return true
-        }
-    }
-
-    private fun List<Pair<Int, String>>.first(tag: Int) = firstOrNull { it.first == tag }?.second
-    private fun List<Pair<Int, String>>.all(tag: Int) = filter { it.first == tag }.map { it.second }
-
     private val shard = TestShard(0, "aeron:ipc", 1, "aeron:ipc", 2)
 
     private fun directory(vararg securities: TestSecurity) = DirectoryClient().also {

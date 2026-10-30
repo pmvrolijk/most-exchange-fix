@@ -1,14 +1,15 @@
 #!/usr/bin/env bash
 # End to end: FIX clients -> the adapter -> most-exchange's real processes, and back.
 #
-# One cluster member, one independent gateway, discovery, all from ../most-exchange's installs. The
+# One cluster member, one independent gateway, market data, discovery, all from ../most-exchange's installs. The
 # adapter runs its own media driver (Design.md §3.5), so the gateway's client channels and the
 # directory are UDP: the requests to the gateway's endpoint, the reports and the directory on
 # dynamic multi-destination channels, which both the adapter and most-exchange's `most` subscribe to.
 #
 # What it shows: a 35=D reaches the book and rests; a cross trades both sides; a report for a
-# logged-out client waits for its logon; 35=H, 35=F and 35=AF; a clean restart keeps the store;
-# and a SIGKILL of the adapter under load loses no order and leaves none unknown.
+# logged-out client waits for its logon; market data, 35=x and 35=V, from most-exchange's own
+# market-data process; 35=H, 35=F and 35=AF; a clean restart keeps the store; and a SIGKILL of the
+# adapter under load loses no order and leaves none unknown.
 #
 # Prerequisites:  ./gradlew :adapter:installDist :tools:installDist   (here)
 #                 ./gradlew installDist                                (in ../most-exchange)
@@ -33,9 +34,10 @@ MOST="$ME/tools/build/install/most/bin/most"
 ENGINE="$ME/engine/build/install/engine/bin/engine"
 GATEWAY="$ME/gateway/build/install/gateway/bin/gateway"
 DISCOVERY="$ME/discovery/build/install/discovery/bin/discovery"
+MARKETDATA="$ME/market-data/build/install/market-data/bin/market-data"
 ADAPTER="$ROOT/adapter/build/install/adapter/bin/adapter"
 FIX="$ROOT/tools/build/install/fix/bin/fix"
-for bin in "$MOST" "$ENGINE" "$GATEWAY" "$DISCOVERY" "$ADAPTER" "$FIX"; do
+for bin in "$MOST" "$ENGINE" "$GATEWAY" "$MARKETDATA" "$DISCOVERY" "$ADAPTER" "$FIX"; do
   [ -x "$bin" ] || { echo "missing $bin: see the prerequisites at the top of $0" >&2; exit 2; }
 done
 
@@ -135,6 +137,27 @@ gateway.gatewayId=gw-0
 gateway.credentialTokenFile=$RUN/gateway.secret
 EOF
 
+# The feeds cross from the exchange's driver to the adapter's on dynamic multi-destination channels,
+# as the directory does: the market-data process publishes, the adapter subscribes (Design.md §4).
+MD_PUB() { echo "aeron:udp?control=localhost:$1|control-mode=dynamic"; }
+MD_SUB() { echo "aeron:udp?endpoint=localhost:0|control=localhost:$1|control-mode=dynamic"; }
+
+cat > "$RUN/market-data.properties" <<EOF
+md.securitiesFile=$RUN/securities.properties
+md.aeronDir=$AERON_DIR
+md.bookEvent.channel=aeron:ipc
+md.bookEvent.streamId=12
+md.l1.channel=$(MD_PUB 40201)
+md.l1.streamId=31
+md.l2.channel=$(MD_PUB 40202)
+md.l2.streamId=32
+md.l3.channel=aeron:ipc
+md.l3.streamId=33
+md.snapshot.channel=$(MD_PUB 40204)
+md.snapshot.streamId=34
+md.snapshot.cycleMs=500
+EOF
+
 cat > "$RUN/discovery.properties" <<EOF
 discovery.shards=0
 discovery.shard.0.securitiesFile=$RUN/securities.properties
@@ -168,6 +191,11 @@ session.C2.username=client2
 session.C2.passwordSha256=$(sha256 "client2-secret")
 session.C2.role=order-entry
 session.C2.participantId=8
+session.M1.senderCompId=MOST
+session.M1.targetCompId=FEED1
+session.M1.username=feed1
+session.M1.passwordSha256=$(sha256 "feed1-secret")
+session.M1.role=market-data
 EOF
 
 cat > "$RUN/adapter.properties" <<EOF
@@ -181,6 +209,12 @@ fix.sessionsFile=$RUN/sessions.properties
 fix.storeDir=$RUN/adapter/store
 fix.directoryChannel=$DIR_SUB
 fix.directoryStreamId=100
+fix.md.l1.channel=$(MD_SUB 40201)
+fix.md.l1.streamId=31
+fix.md.l2.channel=$(MD_SUB 40202)
+fix.md.l2.streamId=32
+fix.md.snapshot.channel=$(MD_SUB 40204)
+fix.md.snapshot.streamId=34
 fix.calendar.zone=UTC
 fix.calendar.rollTime=23:59
 fix.calendar.weekdays=MON,TUE,WED,THU,FRI,SAT,SUN
@@ -231,7 +265,7 @@ fixc() {
 expect() { grep -qE "$2" "$1" || { cat "$1"; fail "$3"; }; }
 
 # ---------------------------------------------------------------- processes
-echo "== starting most-exchange: one member, a gateway, discovery"
+echo "== starting most-exchange: one member, a gateway, market data, discovery"
 $MOST cluster --fresh --dir "$RUN/cluster-host" --aeron-dir "$AERON_DIR" \
   --participants "$RUN/participants.properties" > "$LOGS/cluster.log" 2>&1 &
 PIDS+=($!)
@@ -242,6 +276,9 @@ wait_for "$LOGS/engine.log" "awaiting shutdown signal" 45 "engine" || fail "engi
 $GATEWAY "$RUN/gateway.properties" > "$LOGS/gateway.log" 2>&1 &
 PIDS+=($!)
 wait_for "$LOGS/gateway.log" "gateway: started" 45 "gateway" || fail "gateway"
+$MARKETDATA "$RUN/market-data.properties" > "$LOGS/market-data.log" 2>&1 &
+PIDS+=($!)
+wait_for "$LOGS/market-data.log" "market-data: started" 30 "market data" || fail "market data"
 $DISCOVERY "$RUN/discovery.properties" > "$LOGS/discovery.log" 2>&1 &
 PIDS+=($!)
 wait_for "$LOGS/discovery.log" "discovery: started" 30 "discovery" || fail "discovery"
@@ -275,6 +312,31 @@ cat "$RUN/s1-listen.out"
 expect "$RUN/s1-listen.out" "ClOrdID=S1 .*ExecType=TRADE OrdStatus=PARTIALLY_FILLED.*CumQty=4 LeavesQty=6" \
   "CLIENT1 was not told of its fill while logged out (Design.md §6.3)"
 pass "both sides of the trade reported; the maker's while it was logged out"
+
+# fixmd <command> [options]: the FIX client as the market-data session FEED1 (141=Y at every Logon, §4).
+fixmd() {
+  local command="$1"; shift
+  "$FIX" "$command" "$@" --port "$FIX_PORT" --sender FEED1 --user feed1 --password feed1-secret --state "$RUN/clients/feed1"
+}
+
+echo
+echo "== 3b. market data: the security list, the book as a 35=W, a new bid as a 35=X"
+fixmd securities > "$RUN/sl.out" 2>&1
+cat "$RUN/sl.out"
+expect "$RUN/sl.out" "SecurityList .*SecurityRequestResult=0 .*Securities=\[AAPL/1/USD/tick=0.01\]" "the 35=y"
+fixmd md --symbol AAPL --id MD-1 --follow 12 > "$RUN/md.out" 2>&1 &
+MD_CLIENT=$!; PIDS+=("$MD_CLIENT")
+wait_for "$RUN/md.out" "MarketDataSnapshot" 20 "the 35=W" || fail "no 35=W for AAPL"
+fixc 2 send --symbol AAPL --side buy --price 99.00 --qty 2 --clordid B2 > "$RUN/b2.out" 2>&1
+expect "$RUN/b2.out" "ClOrdID=B2 .*ExecType=NEW" "B2 did not rest"
+wait_for "$RUN/md.out" "MarketDataIncremental .*NEW BID AAPL 99x2" 20 "the 35=X for B2" || fail "no 35=X for the new bid"
+grep -E "MarketDataSnapshot|MarketDataIncremental" "$RUN/md.out" | head -3
+expect "$RUN/md.out" "MarketDataSnapshot MDReqID=MD-1 Symbol=AAPL Entries=\[OFFER 100x6\(1\)" \
+  "the 35=W: S1's rest, 6 at 100.00, after B1's 4"
+# The market-data process repeats its snapshot every 500 ms; a quiet book is not sent again (Design.md §4).
+[ "$(grep -c MarketDataSnapshot "$RUN/md.out")" -eq 1 ] || { cat "$RUN/md.out"; fail "the 35=W was sent more than once"; }
+kill "$MD_CLIENT" 2>/dev/null; wait "$MD_CLIENT" 2>/dev/null
+pass "SecurityList, then the book from most-exchange's feeds, and a change to it"
 
 echo
 echo "== 4. 35=H states the order from the store"

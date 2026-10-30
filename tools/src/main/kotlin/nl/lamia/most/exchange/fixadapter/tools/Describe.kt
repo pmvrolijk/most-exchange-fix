@@ -11,6 +11,21 @@ object Describe {
         "6" to "PENDING_CANCEL", "8" to "REJECTED", "A" to "PENDING_NEW", "C" to "EXPIRED", "E" to "PENDING_REPLACE",
     )
     private val SIDES = mapOf("1" to "BUY", "2" to "SELL")
+    private val ENTRY_TYPES = mapOf("0" to "BID", "1" to "OFFER", "2" to "TRADE")
+    private val UPDATE_ACTIONS = mapOf("0" to "NEW", "1" to "CHANGE", "2" to "DELETE")
+
+    /** A 35=W's or 35=X's entries, each starting at [first]. */
+    private fun entries(m: FixMessage, first: Int): List<Map<Int, String>> {
+        val out = mutableListOf<MutableMap<Int, String>>()
+        var inGroup = false
+        for ((tag, value) in m.ordered) {
+            if (tag == 268) { inGroup = true; continue }
+            if (!inGroup || tag == 10) continue
+            if (tag == first) out += mutableMapOf()
+            out.lastOrNull()?.put(tag, value)
+        }
+        return out
+    }
     private val SESSION_TYPES = setOf("0", "1", "2", "4", "A")
 
     fun isSessionLevel(m: FixMessage) = m.msgType in SESSION_TYPES
@@ -48,6 +63,31 @@ object Describe {
             "5" -> {
                 parts += "Logout"
                 add("MsgSeqNum", 34); add("Text", 58)
+            }
+            "y" -> {
+                parts += "SecurityList"
+                add("SecurityReqID", 320); add("SecurityRequestResult", 560); add("TotNoRelatedSym", 393); add("LastFragment", 893)
+                if (m.all(55).isNotEmpty()) parts += "Securities=" + m.all(55).indices.joinToString(",", "[", "]") { i ->
+                    "${m.all(55)[i]}/${m.all(48).getOrElse(i) { "?" }}/${m.all(15).getOrElse(i) { "?" }}/tick=${m.all(969).getOrElse(i) { "?" }}"
+                }
+            }
+            "W" -> {
+                parts += "MarketDataSnapshot"
+                add("MDReqID", 262); add("Symbol", 55)
+                parts += "Entries=" + entries(m, 269).joinToString(",", "[", "]") { e ->
+                    "${ENTRY_TYPES[e[269]] ?: e[269]} ${e[270]}x${e[271]}" + (e[346]?.let { "($it)" } ?: "")
+                }
+            }
+            "X" -> {
+                parts += "MarketDataIncremental"
+                add("MDReqID", 262)
+                parts += "Entries=" + entries(m, 279).joinToString(",", "[", "]") { e ->
+                    "${UPDATE_ACTIONS[e[279]] ?: e[279]} ${ENTRY_TYPES[e[269]] ?: e[269]} ${e[55]} ${e[270]}" + (e[271]?.let { "x$it" } ?: "")
+                }
+            }
+            "Y" -> {
+                parts += "MarketDataRequestReject"
+                add("MDReqID", 262); add("MDReqRejReason", 281); add("Text", 58)
             }
             else -> parts += "35=${m.msgType}"
         }

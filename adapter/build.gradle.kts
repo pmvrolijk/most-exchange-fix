@@ -8,6 +8,7 @@ plugins {
 dependencies {
     implementation(project(":fix-session"))
     implementation(project(":order-entry"))
+    implementation(project(":market-data"))
     implementation(libs.most.client)
 }
 
