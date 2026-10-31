@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# The `fix` client against the containerised adapter, logged on as participant 7's sessions.
+#
+#   deploy/fix send --symbol AAPL --side sell --price 100.00 --qty 10 --clordid S1
+#   deploy/fix listen --follow 5
+#   deploy/fix securities            # market data: FEED7 at 9877, 141=Y at every Logon
+#   deploy/fix md --symbol AAPL --follow 10
+#
+# The client runs on the host (`./gradlew :tools:installDist` first) and reaches the adapter through
+# its published ports. Its MsgSeqNums persist in build/deploy/clients; after `docker compose down -v`
+# the adapter's are gone too, so delete that directory or pass --reset.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+FIX="$ROOT/tools/build/install/fix/bin/fix"
+[ -x "$FIX" ] || { echo "no $FIX: run ./gradlew :tools:installDist" >&2; exit 1; }
+[ $# -ge 1 ] || { "$FIX" 2>&1 | head -40; exit 2; }
+
+HOST="${FIX_HOST:-localhost}"
+STATE="$ROOT/build/deploy/clients"
+
+command="$1"; shift
+case "$command" in
+  securities|md)
+    exec "$FIX" "$command" "$@" --host "$HOST" --port "${FIX_MD_PORT:-9877}" \
+      --sender FEED7 --user feed7 --password feed7-secret --state "$STATE/feed7" ;;
+  *)
+    exec "$FIX" "$command" "$@" --host "$HOST" --port "${FIX_PORT:-9876}" \
+      --sender CLIENT7 --user client7 --password client7-secret --state "$STATE/client7" ;;
+esac

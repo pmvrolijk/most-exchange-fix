@@ -39,19 +39,23 @@ class TraceTest {
 
     @Test
     fun `a full ring drops the event and counts it, never waits, and the file says how many`() {
-        val file = File(dir, "trace.bin")
-        val written = 200_000
-        val dropped: Long
-        // The smallest ring, about ten records: the drainer, waking each millisecond, cannot keep up.
-        Trace.open(file, 512).use { t ->
-            repeat(written) { t.event(TraceFormat.SENT, 1L, it.toLong(), it.toLong(), 0L) }
-            dropped = t.droppedEvents
+        // Rounds that stop at different points of the ring: one whose reader stands at the wrap's
+        // padding at close lost what was after it (found on Linux, 2026-10-31).
+        repeat(20) { round ->
+            val file = File(dir, "trace-$round.bin")
+            val written = 200_000 + round
+            val dropped: Long
+            // The smallest ring, about ten records: the drainer, waking each millisecond, cannot keep up.
+            Trace.open(file, 512).use { t ->
+                repeat(written) { t.event(TraceFormat.SENT, 1L, it.toLong(), it.toLong(), 0L) }
+                dropped = t.droppedEvents
+            }
+            val log = TraceLog.read(file)
+            assertTrue(dropped > 0, "round $round: some dropped")
+            assertEquals(dropped, log.dropped, "round $round")
+            assertEquals(written.toLong(), log.size + log.dropped, "round $round: every event either in the file or counted")
+            assertEquals(log.time.sorted(), log.time.toList(), "round $round: what was kept, in order")
         }
-        val log = TraceLog.read(file)
-        assertTrue(dropped > 0, "some dropped")
-        assertEquals(dropped, log.dropped)
-        assertEquals(written.toLong(), log.size + log.dropped, "every event either in the file or counted")
-        assertEquals(log.time.sorted(), log.time.toList(), "what was kept, in order")
     }
 
     @Test

@@ -1,0 +1,63 @@
+# Participant 7's FIX adapter, beside most-exchange's dev stack (../most-exchange/deploy).
+#
+# A compose project of its own that joins the exchange's networks, so most-exchange stays as it is:
+#
+#   most-aeron  the exchange's inside, internal. The adapter reaches the gateway, the directory and
+#               the market data feeds over UDP here, with media drivers of its own (Design.md §3.5).
+#   most-edge   the only network with published ports. The FIX listeners are published on it.
+#
+# The adapter is the one thing that bridges the two, which is the role most-exchange's compose file
+# draws for it. Start the exchange's stack first: these networks are its.
+#
+#   ./gradlew :adapter:installDist
+#   (cd ../most-exchange/deploy && docker compose up -d)
+#   docker compose -f deploy/docker-compose.yml up -d --build
+
+name: most-fix
+
+networks:
+  most-aeron: { external: true }
+  most-edge: { external: true }
+
+volumes:
+  # Order entry's state: the fsynced archive, Artio's logs and sequence indexes, the order store.
+  # A plain named volume and never tmpfs, since the archive is what a 35=D and a reportSeq wait on
+  # (CLAUDE.md 7, 11). `docker compose down -v` discards it, and with it every MsgSeqNum.
+  fix-7-data:
+  # Market data's engine, emptied at every start (CLAUDE.md 14). Its archive grows within a run
+  # (Design.md §8.28), so it is on disk, not in memory.
+  fix-7-md:
+
+services:
+
+  fix-7:
+    build: { context: .., dockerfile: deploy/Dockerfile }
+    image: most-fix-adapter
+    environment:
+      # Shared driver and archive threads: the dev stack runs the whole exchange on this machine.
+      ADAPTER_OPTS: "-Daeron.threading.mode=SHARED -Daeron.archive.threading.mode=SHARED"
+    volumes:
+      - fix-7-data:/data
+      - fix-7-md:/data-md
+      - ./config:/config:ro
+    # Two embedded media drivers' log buffers. Docker's default /dev/shm is 64 MB, and an Aeron
+    # driver that cannot map a buffer dies of SIGBUS rather than an error (most-exchange's compose).
+    shm_size: 1gb
+    networks: [most-aeron, most-edge]
+    ports:
+      - "9876:9876"   # order entry
+      - "9877:9877"   # market data
+    # The JVM's shutdown hook closes the engine and marks the clean stop (Design.md §8.21). Without
+    # the mark, the next start moves every MsgSeqNum on 10,000, so give the close its time.
+    init: true
+    stop_grace_period: 30s
+    # After a kill the archive refuses its own mark file for ~10 s (Design.md §6.4), and the adapter
+    # exits. Docker's restart back-off outlasts that; a configuration error stops after ten tries.
+    restart: on-failure:10
+    healthcheck:
+      # The acceptor binds last, once both backends run (AdapterMain), so an open port is a start.
+      test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9876"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 10s

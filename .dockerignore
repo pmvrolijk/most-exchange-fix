@@ -1,0 +1,4 @@
+# The adapter image copies one host build (deploy/Dockerfile) and nothing else. Without this the
+# build context is the whole checkout, e2e and perf runs under build/ included: gigabytes of archive.
+*
+!adapter/build/install/adapter

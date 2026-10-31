@@ -150,9 +150,10 @@ class Trace private constructor(file: File?, ringBytes: Int, epochClock: EpochNa
         val ring = ring ?: return
         running = false
         drainer?.join()
-        do {
-            val read = ring.read(copy, 1024)
-        } while (read > 0)
+        // Until the ring is empty, not until a read returns 0: a read stops at the end of the buffer,
+        // and one that finds only the wrap's padding there returns 0 with records still after it.
+        // Nothing writes now, so its size is final.
+        while (ring.size() > 0) ring.read(copy, 1024)
         flush()
         val channel = checkNotNull(channel)
         val tail = ByteBuffer.allocate(16).order(ByteOrder.LITTLE_ENDIAN)

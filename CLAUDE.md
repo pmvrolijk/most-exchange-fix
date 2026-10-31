@@ -28,6 +28,7 @@ entry gateways and market data feeds. Kotlin, packages `nl.lamia.most.exchange.f
 ./gradlew :fix-session:test                  # one module
 ./e2e/run-e2e.sh                             # against ../most-exchange's installs; see its header
 ./e2e/run-perf.sh                            # the latency baseline, beside `most load`; perf-claim first
+docker compose -f deploy/docker-compose.yml up -d --build   # beside most-exchange's dev stack; deploy/README.md
 ```
 
 - **The SDK comes from the registry by default.** That needs `githubUser` and a `read:packages`
@@ -97,8 +98,10 @@ entry gateways and market data feeds. Kotlin, packages `nl.lamia.most.exchange.f
       and never route it by its CompIDs. (Design.md §8.17) → R§15
 
 12. **After an unclean stop, every order-entry session's MsgSeqNum moves on 10 000 before the
-    acceptor binds**, on the offline session the library holds, then a Heartbeat is archived. A 35=8
-    can reach the client and not the archive, and a reused number ends the client's session. The
+    acceptor binds**, written as 10 000 Heartbeats on the offline session the library holds, all
+    archived. Never by `lastSentMsgSeqNum`: Artio's resend lookup assumes one replay-index record per
+    MsgSeqNum, and a hole makes every later resend a gap fill. A 35=8 can reach the client and not
+    the archive, and a reused number ends the client's session. The
     clean stop is marked only after Artio's engine has closed (`OrderStore.markStoppedCleanly`),
     and cleared at start with a synced write. (Design.md §8.21) → R§13
 

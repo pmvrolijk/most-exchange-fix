@@ -237,28 +237,38 @@ class OrderEntryBackend(
 
     /**
      * After an unclean stop (Design.md §8.21): a message can have reached a client and not the archive,
-     * and Artio numbers on from the archive. Each session held offline is moved on [CRASH_SEQUENCE_SKIP],
-     * then a Heartbeat is written offline, so the number is in the archive before the acceptor binds.
-     * The client's next Logon is numbered past it; the client asks for a resend, and one gap fill covers
-     * the jump.
+     * and Artio numbers on from the archive. Each session held offline is moved on [CRASH_SEQUENCE_SKIP]
+     * by writing that many Heartbeats offline, all archived before the acceptor binds. The client's
+     * next Logon is numbered past them; the client asks for a resend, and one gap fill covers them.
+     *
+     * Never by `lastSentMsgSeqNum`: that leaves a hole in Artio's replay index, whose lookup assumes
+     * one record per MsgSeqNum and jumps past the end of it, so every later resend is a gap fill and
+     * a 35=8 written offline never reaches its client (§8.29).
      */
     private fun moveSequencesOn(deadline: Long) {
+        val heartbeat = HeartbeatEncoder()
         for (participantId in participantIds) {
             val session = sessions.session(participantId) ?: continue
             val from = session.lastSentMsgSeqNum()
-            session.lastSentMsgSeqNum(from + CRASH_SEQUENCE_SKIP)
-            var position: Long
-            while (true) {
-                position = session.trySend(HeartbeatEncoder())
-                if (position > 0) break
-                check(System.nanoTime() < deadline) { "order entry: participant $participantId: the Heartbeat after an unclean stop was not written: $position" }
-                library.poll(FRAGMENT_LIMIT)
+            var position = 0L
+            var written = 0
+            while (written < CRASH_SEQUENCE_SKIP) {
+                heartbeat.reset()
+                val sent = session.trySend(heartbeat)
+                if (sent > 0) {
+                    position = sent
+                    written++
+                    if (written % SKIP_POLL_EVERY == 0) library.poll(FRAGMENT_LIMIT)
+                } else {
+                    check(System.nanoTime() < deadline) { "order entry: participant $participantId: Heartbeat ${written + 1} of $CRASH_SEQUENCE_SKIP after an unclean stop was not written: $sent" }
+                    library.poll(FRAGMENT_LIMIT)
+                }
             }
             while (recording.asLong < position) {
-                check(System.nanoTime() < deadline) { "order entry: participant $participantId: the Heartbeat after an unclean stop was not archived" }
+                check(System.nanoTime() < deadline) { "order entry: participant $participantId: the Heartbeats after an unclean stop were not archived" }
                 library.poll(FRAGMENT_LIMIT)
             }
-            log("order entry: participant $participantId: the last stop was not clean; MsgSeqNum moved on from $from to ${from + CRASH_SEQUENCE_SKIP}, then a Heartbeat (Design.md §8.21)")
+            log("order entry: participant $participantId: the last stop was not clean; MsgSeqNum moved on from $from to ${session.lastSentMsgSeqNum()}, $CRASH_SEQUENCE_SKIP Heartbeats (Design.md §8.21)")
         }
     }
 
@@ -460,6 +470,9 @@ class OrderEntryBackend(
 
         /** How far an unclean stop moves each session's MsgSeqNum on (Design.md §8.21): one gap fill covers it. */
         const val CRASH_SEQUENCE_SKIP = 10_000
+
+        /** While writing the skip, the library is polled this often, so its link to the engine stays alive. */
+        private const val SKIP_POLL_EVERY = 256
         val STARTUP_TIMEOUT_NS = java.util.concurrent.TimeUnit.SECONDS.toNanos(10)
 
         fun isSessionMessage(messageType: Long): Boolean = when (messageType) {

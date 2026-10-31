@@ -3,41 +3,39 @@
 Where the adapter stands, what is open, and what to do next. **This is the session entry point** —
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
-Last updated 2026-10-31. **Both backends are built, `bin/adapter` runs them, and the adapter has
-its first latency baseline: the fsynced archive is its bottleneck.** `fix perf` and `fix report`
-(§3 item 6) measured it against most-exchange's real processes beside `most load` straight to the
-gateway, the same day (Measurements A1–A3, X1–X2): at fileSyncLevel 1 the adapter answers 1,000 and
-3,000/s at a 15–18 ms p50 and saturates at ~4,250 requests/s on a quiet machine; the gateway alone
-keeps up at 10,000/s under 0.2 ms; at fileSyncLevel 0 the adapter keeps up at 5,000/s at 0.36 ms.
-Open as Design §8.24, not decided. The laptop's figures only (macOS fsync).
-**§8.22 measured** (A3): four market-data sessions on the same engine add ~2–2.5 ms p50 and 5–8 ms
-p99 to order entry and take ~8% of its capacity.
+Last updated 2026-10-31. **Both backends are built and `bin/adapter` runs them; market data has its
+own engine; the adapter has its latency tooling, a baseline and a trace ring.**
 
-Decided 2026-10-31 (the user, on A3):
-- **Market data gets its own engine**, its own port, an archive at fileSyncLevel 0 (Design §4,
-  superseding "one engine"). Built the same day (item 8a; CLAUDE.md 14, R§16).
-- **One session for both roles is scrapped** (§8.26): order entry and market data are on separate
-  ports.
-- **The sender's crosses carry a SelfMatchPreventionID** (2362) other than its passive orders', on
-  one session, instead of a second participant as taker. Not yet built.
-- The deployment: **a dedicated adapter per participant**, which may hold several of its sessions.
-  Several order-entry sessions for one participant are refused today; Design §8.27 is the decision
-  that comes first.
-**Market data has its own engine** (built 2026-10-31, §3 item 8a): its own port and an unsynced
-archive. Measured (A4), the latency coupling is mostly gone below saturation; the ~8% of capacity
-market data takes at saturation is the laptop's (CPU or disk), not the archive's.
-**The trace ring is built** (2026-10-31, §3 item 6a; Design §9.3): below saturation the archive
-gate and the exchange stage take ~8 ms each, ~90% of the time; at saturation the queue is before
-the order-entry handler (Measurements A5, Design §8.24).
-**Next, in the user's order (2026-10-31): a deployment setup with Docker, then a GitHub Action that
-builds and tests (item 8, now with a go).** §8.24 waits for
-the user's Linux run. Several sessions per participant (§8.27) is a low-priority roadmap item.
+- **Measured** (Measurements A1–A5, X1–X2, the laptop, macOS): at fileSyncLevel 1 the adapter
+  answers 1,000 and 3,000 orders/s at a 15–18 ms p50 and saturates at ~4,250 requests/s; the gateway
+  alone keeps up at 10,000/s under 0.2 ms; at fileSyncLevel 0 the adapter keeps up at 5,000/s at
+  0.36 ms. The trace: below saturation the archive gate and the exchange stage take ~8 ms each, ~90%
+  of the time; at saturation the queue is before the order-entry handler. Open as Design §8.24,
+  nothing decided; the user will run it on Linux.
+- **Market data on its own engine** (item 8a, Design §4, CLAUDE.md 14): its cost to order entry
+  below saturation is mostly gone (A4); ~8% of capacity at saturation remains, the laptop's.
+- **Docker is built** (§3 item 9, `deploy/`): participant 7's adapter beside most-exchange's dev
+  stack, verified with a cross, market data, a clean restart and a crash. Its smoke run found a
+  delivery defect, **fixed the same day** (item 10, Design §8.29): after a crash restart's MsgSeqNum
+  skip, a 35=8 sent to a logged-out client was never resent. The skip is now 10,000 Heartbeats.
+- **Next, in the user's order: a GitHub Action that builds and tests (item 8, with a go).** §8.24
+  waits for the Linux run. Several sessions per participant (§8.27) is a low-priority roadmap item.
+- **Committed** through the trace ring (`358d7b5`); the Status rewrite, Docker and the §8.29 fix are not.
 
-The user's frame, 2026-10-31: production is Linux, and a Linux run is planned; 300–1,000 orders/s
-per connection is fine, and 3,500–5,000/s through one adapter is the target worth reaching. Raised,
-not designed: an optional order-entry throttle (Design §8.25), and both roles on one session for
-lower-tier participants (§8.26). A participant is expected to run a dedicated market-data session
-beside its order-entry one, which makes §8.22 (one engine, one fsynced archive) more pressing.
+The user's frame, 2026-10-31: production is Linux; 300–1,000 orders/s per connection is fine, and
+3,500–5,000/s through one adapter is the target worth reaching. Each participant gets a dedicated
+adapter, with a market-data session beside its order-entry one, on separate ports. Raised, not
+designed: an optional order-entry throttle (Design §8.25).
+
+Decided 2026-10-31 (the user):
+- **Market data gets its own engine**, port and an archive at fileSyncLevel 0 (Design §4, superseding
+  "one engine"; R§16). Built the same day.
+- **One session for both roles is scrapped** (§8.26).
+- **`fix perf`'s crosses carry another SelfMatchPreventionID** (2362) than its passive orders, on
+  one session (Design §10.1), superseding a second participant as taker. Built the same day.
+- **A dedicated adapter per participant**, which may hold several of its sessions: several
+  order-entry sessions per participant is a roadmap item, low priority (§8.27).
+- **The order of work**: the trace ring, then Docker, then a GitHub Action.
 
 Decided 2026-10-31 (Design §10; with the user):
 - **`fix perf` is its own command**; `load` stays the e2e's.
@@ -46,9 +44,8 @@ Decided 2026-10-31 (Design §10; with the user):
   deviation, "so we can correctly attribute".
 - **The baseline in the e2e's topology, UDP** (the user's call): one machine, one cluster member,
   adapter at fileSyncLevel 1 with back-off idling.
-- Found, not decided: **two participants for the sender**, a maker and a taker. most-exchange's
-  self-match prevention cancels a participant's cross on its own order, so one session's crosses
-  never filled.
+- ~~Found, not decided: **two participants for the sender**, a maker and a taker.~~ Superseded the
+  same day by SelfMatchPreventionIDs on one session (above).
 
 2026-10-30: **Both backends are built, and `bin/adapter` runs them.** `fix-session`:
 the acceptor and the FIX 4.4 dictionary, now with market data's messages. `order-entry`: the store,
@@ -156,7 +153,7 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 5 — `fix-session`, `order-entry`, `market-data`, `adapter` (the process), `tools` (`bin/fix`: the e2e's client, `perf` and `report`); packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 49, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 245 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 10; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` 25 (pacing 8, the mix and the raw reader 9, the report 7, `fix perf` end to end 1). `./gradlew build` green 2026-10-31. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29, 3 of 3 on 2026-10-30, and 5 of 5 on 2026-10-31 on the shared `e2e/exchange.sh`, the last two with market data on its own port. `e2e/run-perf.sh`: Measurements A1–A4, X1–X2 on 2026-10-31. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
+| Tests | `fix-session` 49, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 246 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 10; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` 25 (pacing 8, the mix and the raw reader 9, the report 7, `fix perf` end to end 1). `./gradlew build` green 2026-10-31. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29, 3 of 3 on 2026-10-30, and 5 of 5 on 2026-10-31 on the shared `e2e/exchange.sh`, the last two with market data on its own port; 1 of 1 with step 9 (§8.29) on 2026-10-31. `e2e/run-perf.sh`: Measurements A1–A4, X1–X2 on 2026-10-31. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT from GitHub Packages (`pmvrolijk/most-exchange`), republished 2026-10-30 with `DepthFeedListener` (most-exchange `3afef4f`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -194,11 +191,8 @@ Each changes what gets built (`decision-fork`):
 
 ## 3. To do next
 
-In order. Items 1–7 are done, but for item 6's two leftovers, which come next: §8.22 (market data on
-order entry's archive) needs its run before market data is relied on under load, and the trace ring
-is what says where the adapter's time goes before §8.24 (the fsync's cost) can be decided. 8 needs a
-go. (Originally: the SDK changes and the spikes came before code, because
-they decided whether `order-entry`'s persistence design stood.)
+In order. Items 1–7, 6a and 8a are done and committed; 9 and 10 are done, uncommitted. **Next: 8,
+the remote and a GitHub Action** (the user's order, 2026-10-31). Then §8.24's investigation with the user's Linux run.
 
 1. ~~**Switch the build to GitHub Packages**~~ **Done 2026-10-15.** `mostSdk.url` points at
    `maven.pkg.github.com/pmvrolijk/most-exchange`; `githubUser` + `githubPackagesToken` (classic,
@@ -540,7 +534,7 @@ they decided whether `order-entry`'s persistence design stood.)
       - **Fixed on the way:** Artio's monitoring files were host-wide; now in `fix.logDir`.
       - ~~The three-member failover run (a `run-failover.sh` for the adapter, listed gateways)~~
         **Skipped 2026-10-30** (the user's call).
-6. ~~**Tooling**~~ **Done 2026-10-31**, uncommitted (Design §10; Handover §2m). `fix perf`, the
+6. ~~**Tooling**~~ **Done 2026-10-31**, committed `0cd88a2`, `1f456e0` (Design §10; Handover §2m). `fix perf`, the
    measuring sender: a schedule fixed before the first send, a maker and a taker session, the mix of
    passive orders, crosses and cancels predicted from what it sends, and a memory-mapped log written
    without allocating per message. `fix report`: each report timed against the request that caused
@@ -565,7 +559,7 @@ they decided whether `order-entry`'s persistence design stood.)
    - **Still open:** (a) **The trace ring** (Design §9.2), to say where the adapter's time goes;
      `fix report` reads it beside the sender's log. (b) The 2.25 s gap in every stream at 10,000/s
      (A1c), unexplained, and taken on a loaded machine.
-8a. ~~**Market data's own engine**~~ **Done 2026-10-31**, uncommitted (Design §2, §4; CLAUDE.md 14;
+8a. ~~**Market data's own engine**~~ **Done 2026-10-31**, committed `19eedf8` (Design §2, §4; CLAUDE.md 14;
    R§16; Handover §2m). A second `FixAcceptor` in the adapter's process from `fix.md.port`,
    `fix.md.logDir`, `fix.md.archiveDir` (required with a market-data session), `fix.md.aeronDir`
    (default `fix.aeronDir-md`), `fix.md.fileSyncLevel` (default 0); emptied at every start
@@ -574,7 +568,7 @@ they decided whether `order-entry`'s persistence design stood.)
    6 tests; 5 mutations, each caught. Measured (A4): the coupling below saturation mostly gone.
    - **Still open:** the ~8% of capacity at saturation (A4e–f), on a host that is not a laptop;
      market data's archive grows within a run (Design §8.28).
-6a. ~~**The trace ring**~~ **Done 2026-10-31**, uncommitted (Design §9.3; Handover §2m). `Trace`
+6a. ~~**The trace ring**~~ **Done 2026-10-31**, committed `358d7b5` (Design §9.3; Handover §2m). `Trace`
    (Agrona's one-to-one ring, a drainer thread, a file), off unless `fix.trace.file`; events IN,
    GATE, SENT, REPORT, OUT, DURABLE from the order-entry thread; the sender logs its MsgSeqNum (log
    format 2); `fix report --trace` cuts the service time at each stage. 7 tests; 7 mutations, each
@@ -583,6 +577,10 @@ they decided whether `order-entry`'s persistence design stood.)
    - **Measured** (A5): see the header. **Still open** (§8.24): why the exchange stage and the
      library's intake move with the fsync; the 2.25 s gap of A1c.
    - Not built: the rest of §9 (`/metrics`, `/status`, control).
+   - **Fixed 2026-10-31, uncommitted** (found by item 8's Linux run): `Trace.close()` stopped draining
+     at a read that found only the wrap's padding, losing up to a ring of events uncounted.
+     `TraceTest`'s full-ring test now runs 20 rounds ending at different points; it failed on macOS
+     too before the fix (round 2, 9 events).
 7. **`market-data`:** 35=y from the directory, then 35=V/W/X from `DepthFeedAssembler`. Started
    2026-10-30. Decided first (`decision-fork`, each the recommendation, Design §4): 35=X
    from a listener added to the SDK's assembler; market-data sessions transient (MsgSeqNum 1 at every
@@ -622,9 +620,41 @@ they decided whether `order-entry`'s persistence design stood.)
         had silently reused the last run's results.
    - **Item 7 is built**, against the published SDK. Left: Design §8.22 (the shared archive) and
      §8.23 (the SDK book's allocation).
-8. **The remote:** GitHub and CI, which needs a go. In CI the job token reads the SDK, once
-   most-exchange's job token allowlist includes this project. The move to GitHub changes
-   `mostSdk.url`, the credentials and the pipelines (Rationale §3).
+8. **The remote and a GitHub Action that builds and tests** (go given 2026-10-31, after 9). The
+   remote exists (`origin`, `github.com/pmvrolijk/most-exchange-fix`). **Decided 2026-10-31 (the
+   user): the regular tests only, never most-exchange's processes** — no e2e, no perf, no spikes.
+   Written, uncommitted, not yet run on GitHub: `.github/workflows/ci.yml`, one job,
+   `./gradlew build --continue` on ubuntu-latest with temurin 21, the test reports uploaded. The SDK
+   is read with `GITHUB_ACTOR` and the job's `GITHUB_TOKEN` (`packages: read`), or an
+   `SDK_PACKAGES_TOKEN` secret (a classic token, `read:packages`) if the job token may not read
+   most-exchange's package (Rationale §3).
+   - **Checked locally, as the runner would:** the same command in a clean `eclipse-temurin:21-jdk`
+     Linux container, an empty Gradle home, credentials from `GITHUB_ACTOR`/`GITHUB_TOKEN` only:
+     the SDK resolved, 366 tests, 0 failures. The first such run found `Trace.close()`'s lost events
+     (item 6a), fixed.
+   - **Not known until it runs on GitHub:** whether the job's own `GITHUB_TOKEN` may read
+     most-exchange's Maven package. If the first run fails resolving `nl.lamia.most.exchange`, add
+     the `SDK_PACKAGES_TOKEN` secret.
+9. ~~**A deployment setup with Docker**~~ **Done 2026-10-31**, uncommitted (Design §7; `deploy/`
+   and its README). Decided with the user: a compose project here that joins most-exchange's
+   networks as external ones; one adapter, participant 7, order entry on 9876 and market data on
+   9877; the image copies the host's `installDist`. `deploy/fix` (the client as CLIENT7/FEED7) and
+   `deploy/smoke.sh`. Verified against most-exchange's dev stack: a 35=D, a cross from participant
+   8 through `most send`, the fill at the next Logon, 35=y and 35=W; a clean `restart` (stop marked);
+   a SIGKILL of the JVM (7 mark-file refusals, back in 21 s, MsgSeqNum moved on 10,000).
+   - **Found:** after that crash, no 35=8 sent offline is resent (Design §8.29), item 10.
+   - Also found: `most send --qty` is most-exchange's raw `int64` (4 shares is `400000000`); and
+     wiping the adapter's volume while the exchange keeps the participant's orders repeats their
+     `clOrdId`s (deploy/README.md). The dev stack's `most` image predates `cancel-all`.
+10. ~~**§8.29: a 35=8 sent offline after the crash skip is never resent**~~ **Fixed 2026-10-31**,
+    uncommitted (Design §8.21, §8.29; CLAUDE.md 12; R§13). Cause, from Artio 0.182's source:
+    `ReplayQuery.jumpPosition` assumes one replay-index record per MsgSeqNum, and the
+    `lastSentMsgSeqNum` skip left a 10,000-number hole. Decided (the user, the recommendation):
+    the skip is written as 10,000 Heartbeats offline, archived before the bind. Spec first:
+    `e2e/run-e2e.sh` step 9 (MSFT added to the e2e) and `OrderEntryBackendTest` +1, both failing
+    before the fix; the skip's own test now expects the Logon at +10,001. `./gradlew build` green,
+    the e2e 9 of 9, and in Docker a SIGKILL then `deploy/smoke.sh` twice.
+    - **Left:** report the lookup to Artio upstream (the user's call: a public issue).
 
 ## 4. What is that is worth having here based on other Fix gateways using Aeron
 

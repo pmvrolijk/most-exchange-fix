@@ -739,14 +739,48 @@ class OrderEntryBackendTest {
             adapter.awaitExchange()
             val session = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
             val logon = adapter.awaitReply(session, "the adapter's Logon") { it.msgType == "A" && it.seqNum > received }
-            assertEquals(received + 10_002, logon.seqNum, "the skip, then the Heartbeat written offline, then the Logon")
+            // The skip is 10 000 Heartbeats written offline (§8.29, decided 2026-10-31), so the Logon is next.
+            assertEquals(received + 10_001, logon.seqNum, "the skip's Heartbeats written offline, then the Logon")
             val gapFill = adapter.awaitReply(session, "the gap fill") { it.msgType == "4" }
             assertEquals("Y", gapFill[123], "a gap fill, not a reset")
             assertEquals(received + 1, gapFill.seqNum, "from what the client expected")
-            assertEquals(received + 10_003, gapFill[36]?.toInt(), "to past the Logon, in one message")
+            assertEquals(received + 10_002, gapFill[36]?.toInt(), "to past the Logon, in one message")
             adapter.send(session, order("AFTER"))
             pollUntil(*adapter.all(), what = "the order at its gateway") { adapter.gateway(0).orders.size == 1 }
             assertTrue(session.isConnected, "the session carried on")
+        }
+    }
+
+    @Test
+    fun `after an unclean stop a report written offline is still resent at the client's next Logon`() {
+        // Design.md §6.3: a report for a logged-out client is written offline and resent at its
+        // Logon; §8.21: the skip costs the client one gap fill, nothing else. §8.29: a skip that left
+        // a hole in Artio's replay index, whose lookup assumes one record per MsgSeqNum, had every
+        // later resend answered with a gap fill instead.
+        val (sent, received) = start().let { adapter ->
+            adapter.awaitExchange()
+            adapter.logOnAndOff().also { adapter.crash() }
+        }
+        start().use { adapter ->
+            adapter.awaitExchange()
+            val session = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
+            adapter.awaitReply(session, "the gap fill over the skip") { it.msgType == "4" }
+            adapter.send(session, order("AFTER"))
+            pollUntil(*adapter.all(), what = "the order at its gateway") { adapter.gateway(0).orders.size == 1 }
+            pollUntil(*adapter.all(), what = "logout sent") { session.startLogout() > 0 }
+            pollUntil(*adapter.all(), what = "logged out") { !session.isConnected }
+            val lastReceived = session.lastReceivedMsgSeqNum()
+            pollUntil(*adapter.all(), what = "the session back offline") { adapter.rig.backend.sessions.session(1001L) != null }
+            val o = adapter.gateway(0).orders.single()
+            adapter.gateway(0).report(1001L, o.clOrdId, ExecType.NEW, 5001L, price = o.price, leavesQty = o.qty, origQty = o.qty)
+            pollUntil(*adapter.all(), what = "reportSeq 1 consumed behind the archive (${adapter.rig.log})") {
+                adapter.rig.backend.store.firstMissing(1001L, 0) == 2L
+            }
+            val again = adapter.logon(initialSent = session.lastSentMsgSeqNum() + 1, initialReceived = lastReceived + 1)
+            val ack = adapter.awaitReply(again, "the acknowledgement resent") { it.msgType == "8" && it.seqNum > lastReceived }
+            assertEquals(lastReceived + 1, ack.seqNum, "the report written offline, numbered on from the last sent")
+            assertEquals("0", ack[150])
+            assertEquals("Y", ack[43], "Artio's resend of what was archived offline, not a gap fill over it")
         }
     }
 

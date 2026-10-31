@@ -473,9 +473,20 @@ The margin costs only numbers. The spike lost 1–3 messages at 500 a second; th
 by more under a slow disk, which is why the margin is large and not measured.
 
 - **The skip is made on the offline session the library holds before the bind**, so the library,
-  not the engine, numbers the client's next Logon (h2). A Heartbeat is then written and waited for
+  not the engine, numbers the client's next Logon (h2). ~~A Heartbeat is then written and waited for
   in the archive, so the skip survives a second crash before the client is back. Without it,
-  Artio's replayer complained of an empty range (h2a).
+  Artio's replayer complained of an empty range (h2a).~~
+- **The skip is 10 000 Heartbeats, never a setter** (2026-10-31, superseding the setter and one
+  Heartbeat; Design §8.29). Artio's resend lookup (`ReplayQuery.jumpPosition`) assumes its replay
+  index has one record per outbound MsgSeqNum, and jumps ahead by the difference. A number skipped
+  by `lastSentMsgSeqNum` is a hole the jump overshoots, so every later ResendRequest found nothing
+  and was answered with a gap fill: a 35=8 written offline after a crash never reached its client,
+  for as long as the hole stayed in the index's ring. The spike (h2) checked only the gap fill at the
+  first Logon, which a jump of nine records happened to land on. Writing each number as a message
+  keeps the index whole and is archived before the bind, so the skip still survives a second crash.
+  It costs ~0.7 MB of archive per session per crash. Patching Artio was rejected because the adapter
+  runs Artio's pinned release (R§2); a new `sequenceIndex` because Artio would then gap-fill every
+  archived report from before the crash (R§14).
 - **"Clean" is marked after Artio's engine has closed,** because only a clean close waits for the
   archive to record what was sent. It is cleared at start with a synced write: a start that loses
   the clear to a host crash would take the next crash for a clean stop. A missing mark errs towards

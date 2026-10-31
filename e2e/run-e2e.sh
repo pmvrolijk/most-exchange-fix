@@ -8,8 +8,9 @@
 #
 # What it shows: a 35=D reaches the book and rests; a cross trades both sides; a report for a
 # logged-out client waits for its logon; market data, 35=x and 35=V, from most-exchange's own
-# market-data process; 35=H, 35=F and 35=AF; a clean restart keeps the store; and a SIGKILL of the
-# adapter under load loses no order and leaves none unknown.
+# market-data process; 35=H, 35=F and 35=AF; a clean restart keeps the store; a SIGKILL of the
+# adapter under load loses no order and leaves none unknown, and a report written offline after it
+# still reaches its client.
 #
 # Prerequisites:  ./gradlew :adapter:installDist :tools:installDist   (here)
 #                 ./gradlew installDist                                (in ../most-exchange)
@@ -29,6 +30,8 @@ AERON_DIR="$RUN/exchange-aeron"
 FIX_PORT="${FIX_PORT:-29880}"
 LOAD_COUNT="${LOAD_COUNT:-400}"
 LOAD_RATE="${LOAD_RATE:-100}"
+# MSFT is step 9's: a book step 8's load never touches, so its cross can only meet its own order.
+SECURITIES="${SECURITIES:-AAPL MSFT}"
 
 
 # shellcheck source=exchange.sh
@@ -83,7 +86,7 @@ echo
 echo "== 3b. market data: the security list, the book as a 35=W, a new bid as a 35=X"
 fixmd securities > "$RUN/sl.out" 2>&1
 cat "$RUN/sl.out"
-expect "$RUN/sl.out" "SecurityList .*SecurityRequestResult=0 .*Securities=\[AAPL/1/USD/tick=0.01\]" "the 35=y"
+expect "$RUN/sl.out" "SecurityList .*SecurityRequestResult=0 .*Securities=\[AAPL/1/USD/tick=0.01,MSFT/2/USD/tick=0.01\]" "the 35=y"
 fixmd md --symbol AAPL --id MD-1 --follow 12 > "$RUN/md.out" 2>&1 &
 MD_CLIENT=$!; PIDS+=("$MD_CLIENT")
 wait_for "$RUN/md.out" "MarketDataSnapshot" 20 "the 35=W" || fail "no 35=W for AAPL"
@@ -161,6 +164,23 @@ for n in 1 2; do
   grep -q "UNANSWERED" "$RUN/load$n.out" && { cat "$RUN/load$n.out"; fail "client $n: a cancel unanswered"; }
 done
 pass "every order and cancel answered after a SIGKILL, none left unknown"
+
+echo
+echo "== 9. after the crash, a report for a logged-out client still reaches it at its next Logon"
+# Design.md §6.3: a 35=8 for a logged-out client is written offline and resent at its next Logon;
+# §8.21: the crash's MsgSeqNum skip costs the client one gap fill, nothing else. Found in Docker as
+# §8.29: since the skip, the 35=8 written offline was answered with a gap fill.
+fixc 1 send --symbol MSFT --side sell --price 100.00 --qty 10 --clordid P1 > "$RUN/p1.out" 2>&1
+cat "$RUN/p1.out"
+expect "$RUN/p1.out" "ClOrdID=P1 .*ExecType=NEW OrdStatus=NEW" "no NEW for P1"
+fixc 2 send --symbol MSFT --side buy --price 100.00 --qty 4 --clordid P2 > "$RUN/p2.out" 2>&1
+cat "$RUN/p2.out"
+expect "$RUN/p2.out" "ClOrdID=P2 .*ExecType=TRADE OrdStatus=FILLED.*LastQty=4 LastPx=100" "P2 did not trade"
+fixc 1 listen --follow 3 > "$RUN/p1-listen.out" 2>&1
+cat "$RUN/p1-listen.out"
+expect "$RUN/p1-listen.out" "ClOrdID=P1 .*ExecType=TRADE OrdStatus=PARTIALLY_FILLED.*CumQty=4 LeavesQty=6" \
+  "CLIENT1 was not told of its fill while logged out, after the crash (Design.md §6.3, §8.29)"
+pass "the maker's fill reached it at its next Logon, after the crash"
 
 echo
 echo "PASS: FIX through the adapter to most-exchange and back, across a restart and a crash"

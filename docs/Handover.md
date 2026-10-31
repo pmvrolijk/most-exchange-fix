@@ -686,3 +686,57 @@ and `run-e2e.sh` passed on it twice).
   saturation the queue before the handler. Two diagnostics (A5d, A5e) showed the exchange stage
   moves with the fsync, not the threads.
 
+
+### 2n. Docker, and the crash skip that broke resends (Status §3 items 9, 10), 2026-10-31
+
+**Docker** (Design §7, `deploy/` and its README; decided with the user: a compose project here that
+joins most-exchange's `most-aeron` and `most-edge` as external networks; one adapter, participant 7;
+the image copies the host's `installDist`).
+- *Built:* `deploy/Dockerfile` (eclipse-temurin 21 JRE, uid 10001), `docker-compose.yml` (named
+  volumes for order entry's and market data's state, 1 GB `/dev/shm` for the two embedded drivers,
+  `init`, a 30 s stop grace, `restart: on-failure:10`, a TCP health check), `config/` (the node file
+  on `shard0`'s dynamic MDC endpoints, a UTC every-day calendar to match the seed's
+  `LocalDate.now()`), `deploy/fix` (the host client as CLIENT7 and FEED7), `deploy/smoke.sh`, and a
+  root `.dockerignore` (the checkout's `build/` is 9 GB).
+- *Verified* against most-exchange's dev stack, its installs of 2026-10-15: a 35=D, a cross from
+  participant 8 through `most send`, the fill at the next Logon, 35=y and 35=W; `docker compose
+  restart` (`adapter: stopped`, no skip); a SIGKILL of the JVM (7 mark-file refusals, healthy in
+  21 s, MsgSeqNum moved on 10,000).
+- *Found on the way:* `most send --qty` is the raw `int64` (4 shares is `400000000`); the stack's
+  `most` image predates `cancel-all`; and wiping the adapter's volume while the exchange keeps
+  participant 7's orders repeats their `clOrdId`s, with the guard gone with the store (README).
+
+**§8.29: after the crash skip, a 35=8 written offline was never resent.** Found by the smoke run
+straight after the SIGKILL.
+- *Seen* (`FixArchivePrinter` in the container): the 35=8 at 10 020 archived; the client's
+  ResendRequest 7=10020 answered without it; the same after a clean restart.
+- *Reproduced outside Docker, spec first:* `e2e/run-e2e.sh` step 9 (a fill for a logged-out client
+  after step 8's crash; MSFT added, a book step 8's load never touches) failed, steps 1–8 passing.
+  `OrderEntryBackendTest` "after an unclean stop a report written offline is still resent at the
+  client's next Logon" failed at the resend.
+- *Cause, from Artio 0.182's source:* `ReplayQuery.skipToStart`/`jumpPosition` jumps through the
+  replay index by `(begin − seq)` records, assuming one per MsgSeqNum. `lastSentMsgSeqNum(+10 000)`
+  left a hole, so every later lookup ran off the end and Artio gap-filled. Not shown by spike (h2),
+  whose one resend landed on the Heartbeat by a nine-record jump.
+- *Decided* (the user, the recommendation): the skip is 10 000 Heartbeats written offline and
+  archived before the bind. Rejected: patching Artio (pinned release); a new `sequenceIndex`
+  (gap-fills every archived report from before the crash). CLAUDE.md 12, R§13 and Design §8.21
+  updated, the old mechanism struck through.
+- *The check:* both tests pass; the skip's own test now expects the Logon at +10 001, one gap fill
+  still covering it. `./gradlew build` green (order-entry 246). `e2e/run-e2e.sh` 9 of 9. In Docker,
+  on fresh volumes: a SIGKILL, then `deploy/smoke.sh` twice.
+- *Not done:* an index that already has a hole is not repaired (only the dev volume had one, now
+  removed); reporting the lookup to Artio upstream is the user's call.
+
+### 2o. The GitHub Action (Status §3 item 8), 2026-10-31
+
+- *Decided* (the user): the regular tests only; nothing of most-exchange runs in CI.
+- *Built:* `.github/workflows/ci.yml`, one job: temurin 21, `gradle/actions/setup-gradle`,
+  `./gradlew build --continue`, the test reports uploaded. The SDK read with `GITHUB_ACTOR` and
+  `GITHUB_TOKEN` (`packages: read`), or an `SDK_PACKAGES_TOKEN` secret.
+- *The check:* not yet run on GitHub. The same command in a clean Linux container, credentials from
+  the environment only: 366 tests, 0 failures, after one fix it found.
+- *Found:* `TraceTest`'s full-ring test failed on Linux, 2 runs of 3: 9 events neither written nor
+  counted. `Trace.close()` drained until a read returned 0, and Agrona's read returns 0 for a block
+  that is only the wrap's padding. Now it drains until the ring is empty; the test runs 20 rounds
+  and failed on macOS too before the fix (Design §9.3).

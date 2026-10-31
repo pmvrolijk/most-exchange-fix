@@ -1040,6 +1040,14 @@ The archive's recorded position (§6.2) then means durable.
     driver** (decided 2026-10-25, §3.5). The Aeron **version** is the exchange's, pinned (R§2);
   - gateway placement (independent or co-located, most-exchange Design.md §7);
   - the native image.
+- **Docker** (built 2026-10-31, `deploy/`, its README; decided with the user): one adapter per
+  participant (§8.27), participant 7 in the dev stack. A compose project of its own that joins
+  most-exchange's `most-aeron` and `most-edge` networks as external ones, so most-exchange is
+  unchanged. The image copies the host's `installDist` onto a JRE, as most-exchange's JVM images
+  do, with no Gradle or registry token inside Docker. The embedded drivers' directories are on a
+  1 GB `/dev/shm`; order entry's archive, Artio's logs and the store are on a named volume, market
+  data's on another. SIGTERM is the clean stop (§8.21), with a 30 s grace period. After a crash,
+  `restart: on-failure` outlasts the archive's mark file (§6.4).
 
 ## 8. Open items
 
@@ -1303,10 +1311,12 @@ The archive's recorded position (§6.2) then means durable.
         library holds offline at startup, before the acceptor binds. A clean restart stays
         invisible to clients. Rejected: at every start (one gap fill per client per restart, to
         save a flag);
-      - **by a fixed 10 000**, the setter, then a Heartbeat written offline (h2b). One gap fill
-        covers any distance, so the margin costs only numbers: a 32-bit MsgSeqNum allows ~200 000
-        crashes between end-of-day resets. Rejected: a node-file key, until a rate or a disk makes
-        the archive trail the socket that far;
+      - **by a fixed 10 000**, ~~the setter, then a Heartbeat written offline (h2b)~~ **written
+        as 10 000 Heartbeats offline, archived before the bind** (superseded 2026-10-31, §8.29: the
+        setter left a hole in Artio's replay index, and every later resend became a gap fill). One
+        gap fill covers any distance, so the margin costs only numbers: a 32-bit MsgSeqNum allows
+        ~200 000 crashes between end-of-day resets. Rejected: a node-file key, until a rate or a
+        disk makes the archive trail the socket that far;
       - **(h3): a spike of a make-up first.** The library may notice a number Artio never
         delivered and ask for it itself, the client's PossDup resend then caught by the store.
         Rejected for now: accepting it, and leaving the client to find the request with a 35=H.
@@ -1493,6 +1503,48 @@ The archive's recorded position (§6.2) then means durable.
     market data's off (`logOutboundMessages(false)`) would answer a client's ResendRequest with a gap
     fill instead of the 35=X it missed, a change to what a client sees, so not taken here.
 
+29. ~~**After the crash skip, a 35=8 sent offline is never resent**~~ **Fixed 2026-10-31: the
+    skip is written as 10 000 Heartbeats** (found the same day by `deploy/smoke.sh`, in Docker,
+    then reproduced by `e2e/run-e2e.sh` step 9). Participant 7's
+    adapter was SIGKILLed while idle and restarted; it moved MsgSeqNum on from 9 to 10 009, then a
+    Heartbeat (§8.21). The client logged on across the jump, and sent a 35=D and a 35=F online,
+    answered. Then, with the client logged out, a fill for its resting order was written to the
+    offline session as 35=8 at 10 020.
+    - **Seen** (archives read with Artio's `FixArchivePrinter` in the container): the 35=8 at 10 020
+      is in the outbound archive. At its next Logon (10 021) the client sent a ResendRequest
+      7=10020, 16=0. It printed no 35=8, and its next Logon asked for nothing, so the request was
+      answered without the report: most likely a gap fill.
+    - **Persists across a clean restart:** two fills sent offline afterwards (10 034, 10 035) were
+      lost the same way. Before the crash the same sequence worked: 35=8s at 4 and 7 came back
+      PossDup at the client's next Logon.
+    - **What is affected:** the client never sees the fill. The adapter has consumed its
+      `reportSeq` (the 35=8 is archived), and a 35=AF or 35=H states the order correctly. A broken
+      guaranteed delivery all the same (§6.2–§6.3).
+    - **Not covered so far:** spike (h2) checked the gap fill at the first Logon after the skip,
+      never a report sent after it. `e2e/run-e2e.sh` step 8 ends with the crash.
+    - **The cause, from Artio 0.182's source** (`ReplayQuery.skipToStart`, `jumpPosition`): to
+      answer a ResendRequest, Artio scans the session's replay index from its oldest record, and
+      from a record below the one asked for it jumps `(begin − seq)` records ahead. That assumes one
+      record per MsgSeqNum. `Session.lastSentMsgSeqNum(from + 10 000)` left a 10 000-number hole:
+      a request for 10 020, read from record 1, jumped past the end of the index, found nothing, and
+      was answered with a gap fill. The first Logon after the skip worked by chance: a request for
+      10 jumped nine records and landed on the Heartbeat at 10 010. The hole stays until the
+      index's ring (262 144 records per session) has wrapped past it, or the sequence is reset.
+    - **Decided 2026-10-31** (the user, the recommendation; `decision-fork`): **write the skip as
+      10 000 Heartbeats** on the offline session, all archived before the bind, so the index has
+      no hole and Artio's lookup is unchanged. Each crash costs a session ~0.7 MB of archive and
+      10 000 of its index records, at startup. Rejected: patching Artio's `ReplayQuery` (a patched
+      build against the pinned release, CLAUDE.md 6, carried through every bump); a new
+      `sequenceIndex` at the skip (Artio then gap-fills everything from before the crash, so an
+      archived 35=8 the client never had is lost, CLAUDE.md 13).
+    - **Verified:** `OrderEntryBackendTest` "after an unclean stop a report written offline is
+      still resent at the client's next Logon", written first and failing on the setter; the client
+      still sees one gap fill for the 10 000 Heartbeats (the skip's own test). `e2e/run-e2e.sh`
+      step 9 (9 of 9). In Docker: a SIGKILL, then `deploy/smoke.sh` twice.
+    - **Not done:** an index that already has a hole is not repaired. Only the Docker dev volume
+      had one; `docker compose down -v`. Worth reporting to Artio: its own lookup breaks on any
+      outbound MsgSeqNum the index skips.
+
 ## 9. Control and metrics
 
 One JDK `HttpServer` (no web framework, native-image friendly), on a management address. Decided
@@ -1549,7 +1601,10 @@ on); first readings in Measurements A5.
   is written on the order-entry library thread, which never waits for it. A full ring drops the
   event and counts it; the count is in the file.
 - **A drainer thread** copies the ring to the file and writes nothing else; at close it drains what
-  is left and stamps the header with the drop count and a clean end.
+  is left, until the ring is empty, and stamps the header with the drop count and a clean end.
+  (Fixed 2026-10-31, found by the CI build on Linux: close drained until a read returned 0, and
+  Agrona's read returns 0 when the block before the wrap is only padding, so up to a ring of events
+  after it was lost, neither written nor counted.)
 - **Events**, each with `System.nanoTime()`, the participant and the exchange `clOrdId` (whose low
   32 bits are the client's MsgSeqNum, CLAUDE.md 8):
 
