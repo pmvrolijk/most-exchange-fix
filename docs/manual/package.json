@@ -1,0 +1,17 @@
+{
+  "name": "most-fix-manuals",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Build the Operator's Manual and the Rules of Engagement PDFs from docs/manual",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "operator": "node build.mjs operator",
+    "roe": "node build.mjs roe",
+    "html": "node build.mjs --html-only"
+  },
+  "dependencies": {
+    "markdown-it": "^14.1.0",
+    "puppeteer-core": "^23.0.0"
+  }
+}

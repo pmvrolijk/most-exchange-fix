@@ -1047,7 +1047,7 @@ The archive's recorded position (§6.2) then means durable.
   do, with no Gradle or registry token inside Docker. The embedded drivers' directories are on a
   1 GB `/dev/shm`; order entry's archive, Artio's logs and the store are on a named volume, market
   data's on another. SIGTERM is the clean stop (§8.21), with a 30 s grace period. After a crash,
-  `restart: on-failure` outlasts the archive's mark file (§6.4).
+  `restart: unless-stopped` outlasts the archive's mark file (§6.4); not `on-failure:N`, which Docker counts over the container's life.
 
 ## 8. Open items
 

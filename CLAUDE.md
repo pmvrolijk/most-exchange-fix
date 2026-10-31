@@ -11,6 +11,7 @@ Do not change a rule without reading its section there.
 | **Why a rule exists** | [`docs/Rationale.md`](docs/Rationale.md) |
 | **How a change happened** | [`docs/Handover.md`](docs/Handover.md) — archive, §2a– |
 | **What an adapter must do** | `../most-exchange/docs/Adapters.md` — the exchange's contract, which this repo implements |
+| **The manuals** | `docs/OperatorManual.pdf` and `docs/RulesOfEngagement.pdf`, from `docs/manual/` (its README). Change them with the Design |
 
 `docs/Design.md` is the specification. Read it before implementing anything, and update it in the
 same commit when the design changes.

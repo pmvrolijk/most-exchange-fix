@@ -694,7 +694,7 @@ joins most-exchange's `most-aeron` and `most-edge` as external networks; one ada
 the image copies the host's `installDist`).
 - *Built:* `deploy/Dockerfile` (eclipse-temurin 21 JRE, uid 10001), `docker-compose.yml` (named
   volumes for order entry's and market data's state, 1 GB `/dev/shm` for the two embedded drivers,
-  `init`, a 30 s stop grace, `restart: on-failure:10`, a TCP health check), `config/` (the node file
+  `init`, a 30 s stop grace, `restart: unless-stopped` (first `on-failure:10`, whose count is per container, not per crash), a TCP health check), `config/` (the node file
   on `shard0`'s dynamic MDC endpoints, a UTC every-day calendar to match the seed's
   `LocalDate.now()`), `deploy/fix` (the host client as CLIENT7 and FEED7), `deploy/smoke.sh`, and a
   root `.dockerignore` (the checkout's `build/` is 9 GB).
@@ -740,3 +740,31 @@ straight after the SIGKILL.
   counted. `Trace.close()` drained until a read returned 0, and Agrona's read returns 0 for a block
   that is only the wrap's padding. Now it drains until the ring is empty; the test runs 20 rounds
   and failed on macOS too before the fix (Design §9.3).
+- *Then:* green on GitHub (the user). Its notices: actions moved to Node 24 majors (checkout v7,
+  setup-java v6, upload-artifact v7, gradle/actions v5), the runner pinned to `ubuntu-24.04`.
+  gradle/actions v6 refused (the user): its caching is proprietary, under Gradle's Terms of Use.
+
+### 2p. The Operator's Manual and the Rules of Engagement (Status §3 item 11), 2026-10-31
+
+- *Asked* (the user): an Operator's Manual from Markdown to PDF as most-exchange's, its section
+  headings, covering setup, configuration, the dev stack and how it fits most-exchange's,
+  production, troubleshooting and every configuration key with an index; and a participant's Rules
+  of Engagement: the FIX session, messages and tags, order types, troubleshooting.
+- *Built:* `docs/manual/`: most-exchange's `manual.css`, its callouts, figures and index styles;
+  `build.mjs` builds `operator` and `roe` (one Chrome for both). Operator's Manual: 7 chapters,
+  38 pages. Rules of Engagement: 8 chapters, 31 pages. Four SVG diagrams in most-exchange's style.
+- *Sources:* Design §2–§7 and §9; every configuration key from the code's parsers; every reject Text
+  from `Texts`; the exchange's `RejectReason` from its SBE schema; transcripts from `deploy/fix`
+  and raw FIX from the container's archives with `FixArchivePrinter` (both engines). Log lines
+  shown only for their shape are written as formats with placeholders. Two drafts that edited real
+  output were redone with fresh captures.
+- *Checked:* both PDFs looked at page by page where figures, raw FIX and indexes are; three figure
+  fixes. A script resolves every cited section number to a heading: 0 unresolved.
+- *Incident on the way:* the CI-check container (§2o) took Docker Desktop's VM out of memory, and
+  the exchange's shard processes and the adapter died at once (SIGSEGV in mapped Aeron files). The
+  adapter's `restart: on-failure:10` had been spent by earlier crash tests (Docker counts it per
+  container), so it stayed down: now `unless-stopped`. Both stacks restarted; the engine restored
+  from its snapshot, the adapter moved MsgSeqNum on 10,000 as designed.
+- *Licence:* the covers' CC BY 4.0 line came from most-exchange; the user chose to keep it, so
+  `docs/` is CC BY 4.0 as the exchange's: `docs/LICENSE` and a paragraph in `README.md`.
+- *Not settled:* whether the exchange rejects an off-tick price is not stated in the RoE.

@@ -52,8 +52,10 @@ services:
     init: true
     stop_grace_period: 30s
     # After a kill the archive refuses its own mark file for ~10 s (Design.md §6.4), and the adapter
-    # exits. Docker's restart back-off outlasts that; a configuration error stops after ten tries.
-    restart: on-failure:10
+    # exits. Docker's restart back-off outlasts that. Not on-failure:N: Docker counts N over the
+    # container's life, not per crash, so a third crash found the budget spent and stayed down.
+    # A configuration error shows as Restarting, its reason in `docker logs`.
+    restart: unless-stopped
     healthcheck:
       # The acceptor binds last, once both backends run (AdapterMain), so an open port is a start.
       test: ["CMD", "bash", "-c", "</dev/tcp/127.0.0.1/9876"]

@@ -18,9 +18,12 @@ own engine; the adapter has its latency tooling, a baseline and a trace ring.**
   stack, verified with a cross, market data, a clean restart and a crash. Its smoke run found a
   delivery defect, **fixed the same day** (item 10, Design §8.29): after a crash restart's MsgSeqNum
   skip, a 35=8 sent to a logged-out client was never resent. The skip is now 10,000 Heartbeats.
-- **Next, in the user's order: a GitHub Action that builds and tests (item 8, with a go).** §8.24
-  waits for the Linux run. Several sessions per participant (§8.27) is a low-priority roadmap item.
-- **Committed** through the trace ring (`358d7b5`); the Status rewrite, Docker and the §8.29 fix are not.
+- **The GitHub Action** is green on GitHub (item 8). **The Operator's Manual and the Rules of
+  Engagement** are written and built (item 11, `docs/manual/`).
+- **Next:** nothing queued by the user. §8.24 waits for the Linux run; several sessions per
+  participant (§8.27) is a low-priority roadmap item; the control API and metrics (Design §9) are
+  the largest gap the manuals list.
+- **Committed** through the trace ring (`358d7b5`) and the CI workflow; check `git status` for the rest (Docker, §8.29, the CI action bumps, the manuals).
 
 The user's frame, 2026-10-31: production is Linux; 300–1,000 orders/s per connection is fine, and
 3,500–5,000/s through one adapter is the target worth reaching. Each participant gets a dedicated
@@ -151,7 +154,7 @@ There is no remote yet.
 | | |
 | --- | --- |
 | Branch | `master`; the user commits |
-| Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
+| Licence | AGPL-3.0-or-later (`LICENSE.md`); `docs/` CC BY 4.0 (`docs/LICENSE`), as the exchange's; the SDK it links is Apache-2.0 |
 | Modules | 5 — `fix-session`, `order-entry`, `market-data`, `adapter` (the process), `tools` (`bin/fix`: the e2e's client, `perf` and `report`); packages `nl.lamia.most.exchange.fixadapter.*` |
 | Tests | `fix-session` 49, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 246 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 10; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` 25 (pacing 8, the mix and the raw reader 9, the report 7, `fix perf` end to end 1). `./gradlew build` green 2026-10-31. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29, 3 of 3 on 2026-10-30, and 5 of 5 on 2026-10-31 on the shared `e2e/exchange.sh`, the last two with market data on its own port; 1 of 1 with step 9 (§8.29) on 2026-10-31. `e2e/run-perf.sh`: Measurements A1–A4, X1–X2 on 2026-10-31. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT from GitHub Packages (`pmvrolijk/most-exchange`), republished 2026-10-30 with `DepthFeedListener` (most-exchange `3afef4f`), Artio 0.182, rocksdbjni 11.8.1 |
@@ -632,9 +635,11 @@ the remote and a GitHub Action** (the user's order, 2026-10-31). Then §8.24's i
      Linux container, an empty Gradle home, credentials from `GITHUB_ACTOR`/`GITHUB_TOKEN` only:
      the SDK resolved, 366 tests, 0 failures. The first such run found `Trace.close()`'s lost events
      (item 6a), fixed.
-   - **Not known until it runs on GitHub:** whether the job's own `GITHUB_TOKEN` may read
-     most-exchange's Maven package. If the first run fails resolving `nl.lamia.most.exchange`, add
-     the `SDK_PACKAGES_TOKEN` secret.
+   - **Ran green on GitHub** (the user, 2026-10-31), with the job's own `GITHUB_TOKEN`. Its notices
+     led to: checkout v7, setup-java v6, upload-artifact v7 (all Node 24), the runner pinned to
+     `ubuntu-24.04` (ubuntu-latest moves to 26.04), and **gradle/actions v5, not v6** (the user's
+     call: v6's caching is a proprietary component under Gradle's Terms of Use). Not yet run on
+     GitHub with these versions.
 9. ~~**A deployment setup with Docker**~~ **Done 2026-10-31**, uncommitted (Design §7; `deploy/`
    and its README). Decided with the user: a compose project here that joins most-exchange's
    networks as external ones; one adapter, participant 7, order entry on 9876 and market data on
@@ -646,6 +651,24 @@ the remote and a GitHub Action** (the user's order, 2026-10-31). Then §8.24's i
    - Also found: `most send --qty` is most-exchange's raw `int64` (4 shares is `400000000`); and
      wiping the adapter's volume while the exchange keeps the participant's orders repeats their
      `clOrdId`s (deploy/README.md). The dev stack's `most` image predates `cancel-all`.
+11. ~~**Documentation: the Operator's Manual and the Rules of Engagement**~~ **Done 2026-10-31**,
+    uncommitted (the user's request; `docs/manual/` and its README). most-exchange's toolchain and
+    stylesheet (markdown-it, headless Chrome), `build.mjs` generalised to two documents:
+    `docs/OperatorManual.pdf` (38 pages, most-exchange's seven chapter headings: introduction,
+    development and the dev stack beside most-exchange's, production, every configuration key,
+    operations, troubleshooting, an index of terms, commands and keys) and
+    `docs/RulesOfEngagement.pdf` (31 pages: the FIX session, every order-entry and market-data
+    message and tag, order types and states, every reject code and Text, troubleshooting, an index
+    of tags, messages and terms). Transcripts and raw FIX are real, from the Docker stack and its
+    archive; four diagrams. Every cited section number resolves (checked by script).
+    - ~~**Cover licence:**~~ **Done** (2026-10-31, the user: keep CC BY 4.0). `docs/` is CC BY 4.0,
+      as most-exchange's: `docs/LICENSE` (the Creative Commons text, as the exchange's) and a
+      paragraph in `README.md`; the code stays AGPL.
+    - **Found while writing:** the compose file's `restart: on-failure:10` counts restarts over the
+      container's life, so after a third crash it stayed down; now `unless-stopped`. And running the
+      CI check in a Linux container (item 8) exhausted Docker Desktop's 8 GB VM and crashed both
+      stacks (SIGSEGV in Aeron's mapped files); both restarted, the adapter's crash recovery as
+      designed. Not verified in the manuals: whether the exchange rejects an off-tick price.
 10. ~~**§8.29: a 35=8 sent offline after the crash skip is never resent**~~ **Fixed 2026-10-31**,
     uncommitted (Design §8.21, §8.29; CLAUDE.md 12; R§13). Cause, from Artio 0.182's source:
     `ReplayQuery.jumpPosition` assumes one replay-index record per MsgSeqNum, and the

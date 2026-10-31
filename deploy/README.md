@@ -57,7 +57,7 @@ Participant 7 is one of `gw-0`'s, in most-exchange's `config/shard-0-participant
   marks the clean stop (Design.md §8.21); the grace period is 30 s. Verified: `adapter: stopped`,
   and the next start moves no MsgSeqNum on.
 - **A crash** (verified with a SIGKILL of the JVM in the container): the archive refuses its own
-  mark file for ~10 s (Design.md §6.4) and the adapter exits. `restart: on-failure:10` and Docker's
+  mark file for ~10 s (Design.md §6.4) and the adapter exits. `restart: unless-stopped` and Docker's
   back-off outlast that: it came back after 7 refusals in 21 s, moved MsgSeqNum on 10,000, and the
   client logged on across the jump.
   - **Found by it, and fixed:** the jump used to leave a hole in Artio's replay index, after which
