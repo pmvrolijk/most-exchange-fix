@@ -18,7 +18,7 @@ same commit when the design changes.
 This is the **FIX adapter** for most-exchange, AGPL-3.0-or-later like the exchange: an Artio acceptor in front of the exchange's order
 entry gateways and market data feeds. Kotlin, packages `nl.lamia.most.exchange.fixadapter.*`. Modules:
 `fix-session` (the acceptor, logon and routing by role), the backends `order-entry` and
-`market-data` (still a scaffold), `adapter` (the process) and `tools` (`bin/fix`, the e2e's client).
+`market-data` (35=x/V in, 35=y/W/X out, from the SDK's depth listener), `adapter` (the process) and `tools` (`bin/fix`, the e2e's client).
 
 ## Commands
 

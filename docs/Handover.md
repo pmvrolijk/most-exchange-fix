@@ -549,3 +549,48 @@ gap fill.
 **The e2e after the skip:** 7 runs of 8 pass. The 8th: an id collision raised by the startup
 replay after the crash blocked CLIENT1, and its load looped on reconnects (now capped at 5). Not
 explained: afterwards the store and the archive agreed one for one.
+
+### 2l. The startup replay's routing, and market data (Status §3 item 7), 2026-10-30
+
+**The e2e's unexplained collision** (Design §8.17, §8.21; Rationale §15; CLAUDE.md 11).
+- *Problem:* one run in eight blocked CLIENT1 with an id collision raised by the startup replay,
+  though the store and the archive agreed one for one.
+- *Found* by reading Artio 0.182: every offline session is handed over with `NO_CONNECTION_ID`, the
+  catch-up replay is rewritten to it, and the library routes by connection id to the subscriber
+  stored last. With both startup requests out at once, CLIENT2's archived 35=Ds reached CLIENT1's
+  handler and were rebuilt as participant 1001's. Artio's replay span is also filtered by session
+  only, not by sequence number.
+- *Built:* the startup requests one at a time; a replayed message whose SenderCompID is not its
+  session's client refuses the start.
+- *The check:* a test with two sessions losing rows failed every time before the fix, with the 8th
+  run's log line; two mutations caught; `run-e2e.sh` 3 of 3, though no run left a 35=D to rebuild.
+
+**Market data**, five slices (Design §4, §5.4, §8.22, §8.23).
+- *Decided first* (`decision-fork`, each the recommendation): 35=X from a listener added to the SDK;
+  market-data sessions transient; one engine, the archive coupling measured later; a client whose
+  35=X Artio refuses gets a fresh 35=W.
+- *Built:*
+  - the dictionary's 35=x/V/y/W/X/Y, with 969 from FIX 5.0 (FIX 4.4 has no tick tag);
+  - `DepthFeedListener` in most-exchange's `client` (`3afef4f`, published);
+  - `FixAcceptor.persistenceByRole`; `SessionRejects`, shared by both backends;
+  - `SecurityLists`, `Subscriptions` and `MarketDataBackend`;
+  - the backend on its own thread in `bin/adapter`;
+  - `bin/fix securities` and `bin/fix md`;
+  - most-exchange's market-data process and step 3b in `run-e2e.sh`.
+- *Found:*
+  - an empty directory is indistinguishable from none (`isReady`), so 560=2 is never sent;
+  - a 35=V instrument entry must start with Symbol, the group's delimiter;
+  - the e2e showed every client getting the same 35=W every 500 ms, because a quiet book's repeated
+    snapshot was installed over the trusted one. Now a book trusted again and exactly as its clients
+    hold it resumes the 35=X, with no fresh 35=W.
+- *The check:* tests from the clause before the code, except `SecurityLists` (written first, then
+  tested from the clause):
+  - `SubscriptionsTest` 23, `MarketDataBackendTest` 6, `SecurityListsTest` 5, `AdapterTest` +2,
+    `SequenceTest` +1, `DictionaryTest` +8, the SDK's assembler +7;
+  - every mutation caught or shown equivalent (one guard removed as dead);
+  - `run-e2e.sh` 3 of 3 with one 35=W per subscription.
+- *A process defect, found and fixed:* the mutation script read stale results when a mutation, or
+  a test, failed to compile under `-Werror`. It now detects compile errors. The results above are
+  from the corrected script.
+- *Not done:* nothing measured, neither latency nor the archive coupling (§8.22) nor the SDK book's
+  allocation (§8.23); a market-data-only adapter (order entry is still required).

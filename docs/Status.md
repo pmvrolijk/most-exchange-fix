@@ -3,16 +3,24 @@
 Where the adapter stands, what is open, and what to do next. **This is the session entry point** —
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
-Last updated 2026-10-30. **`fix-session` is implemented: the acceptor (2026-10-15) and the FIX
-dictionary (2026-10-20). `order-entry` has its order store, its inbound path, its outbound path and
-durable delivery (2026-10-25, slices 1–4 of §3 item 5): a client's 35=D reaches its shard's gateway
-over Aeron, the exchange's reports and fates come back as 35=8 and 35=9, logged on or not, and a
-`reportSeq` is consumed only once the archive has its 35=8. Since 2026-10-27 a request goes out only
-once the archive has its 35=D/F (4b), rows a host crash lost are rebuilt from the archive at
-startup (4c), and 35=H and 35=AF are answered from the store (slice 5). `market-data` is still to
-build, and there is no runnable adapter yet (no `main`).** 2026-10-20: the dictionary is FIX 4.4's own,
-cut to the handled message types, and Artio was found not to validate application messages, so the
-backend must (CLAUDE.md non-negotiable 9, Design §5.4, Rationale §8).
+Last updated 2026-10-30. **Both backends are built, and `bin/adapter` runs them.** `fix-session`:
+the acceptor and the FIX 4.4 dictionary, now with market data's messages. `order-entry`: the store,
+inbound, outbound, durable delivery, recovery of lost rows, 35=H/35=AF, the MsgSeqNum skip after a
+crash, the library's own ResendRequest, and (2026-10-30) the startup replay one session at a time
+(CLAUDE.md 11, R§15), which explained the e2e's id collision. `market-data` (2026-10-30, §3 item 7):
+35=x → 35=y, 35=V → 35=W/35=X from the SDK's new `DepthFeedListener`, transient sessions, a fresh
+35=W after a resync or for a client that fell behind. `e2e/run-e2e.sh` drives both against
+most-exchange's real processes, its market-data process included: 3 runs of 3.
+**Next: §3 item 6, the paced sender and the latency report**, which also measures Design §8.22
+(market data sharing order entry's fsynced archive).
+
+Decided 2026-10-30 (Design §4; each the recommendation):
+- **35=X from a listener on the SDK's assembler**, added to most-exchange's `client` and published.
+- **Market-data sessions are transient**: MsgSeqNum 1 at every Logon, subscriptions in memory.
+- **One engine for both backends**; the archive coupling is measured before it is relied on (§8.22).
+- **A client whose 35=X Artio refuses gets a fresh 35=W** once it can; not logged out.
+- **Skipped (the user's call):** reporting (h3), (h4) and the shared offline connection id to Artio;
+  the three-member failover run.
 
 Decided 2026-10-26–27 (Design §6.1, §8.17, §8.20; Rationale §12), each the recommendation:
 - **A request is sent only once the archive has its 35=D/F** (CLAUDE.md non-negotiables 2, 11).
@@ -101,8 +109,8 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 5 — `fix-session`, `order-entry`, `market-data`, `adapter` (the process), `tools` (`bin/fix`); packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 35, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 244 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 5; `market-data` 1; `tools` none (the e2e drives it). `./gradlew build` green 2026-10-30. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29 and 3 of 3 on 2026-10-30. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
-| Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT (`20261015.110512`) from GitHub Packages (`pmvrolijk/most-exchange`), Artio 0.182, rocksdbjni 11.8.1 |
+| Tests | `fix-session` 42, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 244 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 7; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` none (the e2e drives it). `./gradlew build` green 2026-10-30. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29 and 3 of 3 on 2026-10-30. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
+| Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT from GitHub Packages (`pmvrolijk/most-exchange`), republished 2026-10-30 with `DepthFeedListener` (most-exchange `3afef4f`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
 
@@ -139,9 +147,10 @@ Each changes what gets built (`decision-fork`):
 
 ## 3. To do next
 
-In order. The SDK changes and the spikes come before code, because they decide whether
-`order-entry`'s persistence design stands. `fix-session` does not depend on them, so it may run in
-parallel with item 2.
+In order. Items 1–5 and 7 are done; **6 is next**, because §8.22 (market data on order entry's
+archive) and §8.23 (the SDK book's allocation) need its measurements before market data is relied
+on under load. 8 needs a go. (Originally: the SDK changes and the spikes came before code, because
+they decided whether `order-entry`'s persistence design stood.)
 
 1. ~~**Switch the build to GitHub Packages**~~ **Done 2026-10-15.** `mostSdk.url` points at
    `maven.pkg.github.com/pmvrolijk/most-exchange`; `githubUser` + `githubPackagesToken` (classic,
@@ -503,7 +512,7 @@ parallel with item 2.
       `DirectoryBroadcast` moved to `fix-session`'s test fixtures. Tests: `SequenceTest` +1,
       `DictionaryTest` +1, `SecurityListsTest` 5, `MarketDataBackendTest` 5; 9 mutations, all caught
       (two only after a test was changed: a sort hidden by HashMap order, a refusal hidden by a Logout).
-   4. ~~**Subscriptions**~~ **Done 2026-10-30**, uncommitted (Design §4, "Subscriptions"). Decided
+   4. ~~**Subscriptions**~~ **Done 2026-10-30**, committed `c97ca06` (Design §4, "Subscriptions"). Decided
       first: a client whose 35=X Artio refuses gets a fresh 35=W once it can (the recommendation;
       rejected: logging it out). Specified, then built: `Subscriptions` (owns the SDK's assembler, is
       its listener; every 35=W from the duty cycle; FIX 4.4's MDReqRejReason; New/Change/Delete per
@@ -511,7 +520,7 @@ parallel with item 2.
       `MarketDataBackend`, `FeedModel` in the tests. Tests: `SubscriptionsTest` 20,
       `MarketDataBackendTest` +1 (35=V through to 35=W and 35=X over Aeron). 11 mutations, all
       caught (one only after a trade was added to the resync test).
-   5. ~~**Wiring**~~ **Done 2026-10-30**, uncommitted. `Adapter` runs the market-data backend on its
+   5. ~~**Wiring**~~ **Done 2026-10-30**, committed `c97ca06`. `Adapter` runs the market-data backend on its
       own thread when a market-data session is configured, its `fix.md.*` keys read before anything
       opens (order entry is still required). `bin/fix` gained `securities` (35=x) and `md` (35=V),
       both logging on with 141=Y, and prints 35=y/W/X/Y with their groups. `e2e/run-e2e.sh` starts
