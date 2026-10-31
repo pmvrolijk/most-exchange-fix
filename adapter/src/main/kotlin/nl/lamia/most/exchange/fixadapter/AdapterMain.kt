@@ -21,10 +21,10 @@ import java.util.Properties
 import kotlin.system.exitProcess
 
 /**
- * The adapter's process (Design.md §1, §7): the node file in, then the acceptor, the order-entry
- * backend on its own thread, the market-data backend on another when a market-data session is
- * configured (§4), and only then the bind, so no Logon reaches an adapter about to refuse to start
- * (§3.2).
+ * The adapter's process (Design.md §1, §7): the node file in, then order entry's acceptor and its
+ * backend on its own thread; when a market-data session is configured, market data's own acceptor
+ * (its port, its unsynced archive, §4) and its backend on another; and only then the binds, so no
+ * Logon reaches an adapter about to refuse to start (§3.2).
  *
  * `fix.*` system properties override the node file's keys (§2).
  */
@@ -38,10 +38,20 @@ class Adapter(private val properties: Properties, private val log: (String) -> U
     private val sessions = ConfiguredSessions.load(node.sessionsFile)
 
     /** Market data's keys, read only when a market-data session is configured, and before anything opens. */
-    private val marketDataConfig: MarketDataConfig? =
-        if (sessions.all.any { it.role == Role.MARKET_DATA }) MarketDataConfig.parse(properties) else null
+    private val hasMarketData = sessions.all.any { it.role == Role.MARKET_DATA }
+    private val marketDataConfig: MarketDataConfig? = if (hasMarketData) MarketDataConfig.parse(properties) else null
+    val marketDataNode: FixNodeConfig? = if (hasMarketData) FixNodeConfig.parseMarketData(properties) else null
 
-    val acceptor = FixAcceptor(node, sessions, bindAtStartup = false)
+    /** Order entry's engine: the order-entry sessions only, its archive fsynced (§6.4). */
+    val acceptor = FixAcceptor(node, sessions.ofRole(Role.ORDER_ENTRY), bindAtStartup = false)
+
+    /** Market data's own engine (§4): the market-data sessions only, emptied at start. */
+    val marketDataAcceptor: FixAcceptor? = try {
+        marketDataNode?.let { FixAcceptor(it, sessions.ofRole(Role.MARKET_DATA), bindAtStartup = false, transient = true) }
+    } catch (e: Throwable) {
+        CloseHelper.quietClose(acceptor)
+        throw e
+    }
 
     private var backend: OrderEntryBackend? = null
     private var runner: AgentRunner? = null
@@ -56,21 +66,21 @@ class Adapter(private val properties: Properties, private val log: (String) -> U
             runner = AgentRunner(idle, { e -> log("order-entry: ${e.stackTraceToString()}") }, null, backend)
                 .also { AgentRunner.startOnThread(it) }
             marketDataConfig?.let { config ->
-                val md = MarketDataBackend(acceptor, config, log = log).also { marketDataBackend = it }
+                val md = MarketDataBackend(checkNotNull(marketDataAcceptor), config, log = log).also { marketDataBackend = it }
                 // Its own idle strategy: one instance per thread.
                 marketDataRunner = AgentRunner(idleStrategy(properties.getProperty(IDLE_STRATEGY)), { e -> log("market-data: ${e.stackTraceToString()}") }, null, md)
                     .also { AgentRunner.startOnThread(it) }
             }
             acceptor.bind()
+            marketDataAcceptor?.bind()
         } catch (e: Throwable) {
             close()
             throw e
         }
-        val roles = acceptor.sessions.all.groupingBy { it.role }.eachCount()
         log(
-            "adapter: started, listening on ${node.bindAddress}:${node.port}; " +
-                "${roles[Role.ORDER_ENTRY] ?: 0} order-entry sessions, ${roles[Role.MARKET_DATA] ?: 0} market-data; " +
-                "trading date ${calendar.asInt}, idle ${idle.alias()}",
+            "adapter: started, listening on ${node.bindAddress}:${node.port} for ${acceptor.sessions.all.size} order-entry sessions" +
+                (marketDataNode?.let { md -> ", ${md.bindAddress}:${md.port} for ${marketDataAcceptor?.sessions?.all?.size} market-data" } ?: "") +
+                "; trading date ${calendar.asInt}, idle ${idle.alias()}",
         )
     }
 
@@ -82,7 +92,7 @@ class Adapter(private val properties: Properties, private val log: (String) -> U
      */
     override fun close() {
         val started = backend != null
-        val closed = runCatching { CloseHelper.closeAll(marketDataRunner, runner, marketDataBackend, backend, acceptor) }
+        val closed = runCatching { CloseHelper.closeAll(marketDataRunner, runner, marketDataBackend, backend, marketDataAcceptor, acceptor) }
         closed.exceptionOrNull()?.let { log("adapter: not a clean stop: ${it.stackTraceToString()}") }
         if (started && closed.isSuccess) OrderStore.markStoppedCleanly(orderEntryConfig.storeDir)
     }

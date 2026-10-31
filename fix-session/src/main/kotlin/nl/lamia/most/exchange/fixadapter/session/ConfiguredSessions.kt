@@ -38,6 +38,9 @@ class ConfiguredSessions(val all: List<ConfiguredSession>) {
     /** The session with these CompIDs, as the adapter sends them, or null. */
     fun find(senderCompId: String, targetCompId: String): ConfiguredSession? = byCompIds[senderCompId to targetCompId]
 
+    /** The sessions of [role]: what that role's engine lets in (Design.md §4). */
+    fun ofRole(role: Role): ConfiguredSessions = ConfiguredSessions(all.filter { it.role == role })
+
     companion object {
         private const val PREFIX = "session."
         private val HEX = HexFormat.of()

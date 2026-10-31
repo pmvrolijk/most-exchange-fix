@@ -29,7 +29,7 @@
 #
 # Knobs: PERF_RATES (default "1000 5000 10000" per second), PERF_SECONDS (20 per run),
 #        PERF_WARMUP_SECONDS (2), PERF_MIX (passive=60,cross=20,cancel=20), PERF_DISCARD_SECONDS (10),
-#        PERF_DIR, FIX_PORT (default 29881), MOST_EXCHANGE (default ../most-exchange).
+#        PERF_DIR, FIX_PORT (default 29882), FIX_MD_PORT (default FIX_PORT + 1), MOST_EXCHANGE.
 set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -37,7 +37,7 @@ ME="$(cd "${MOST_EXCHANGE:-$ROOT/../most-exchange}" && pwd)"
 RUN="${PERF_DIR:-$ROOT/build/perf}"
 LOGS="$RUN/logs"
 AERON_DIR="$RUN/exchange-aeron"
-FIX_PORT="${FIX_PORT:-29881}"
+FIX_PORT="${FIX_PORT:-29882}"
 read -r -a RATES <<< "${PERF_RATES:-1000 5000 10000}"
 SECONDS_PER_RUN="${PERF_SECONDS:-20}"
 WARMUP_SECONDS="${PERF_WARMUP_SECONDS:-2}"
@@ -98,7 +98,7 @@ for r in "${RATES[@]}"; do
   # The same rate again, with market-data sessions subscribed to the run's whole book (§8.22).
   MD_PIDS=()
   for n in $(seq 1 "$MD_SESSIONS"); do
-    "$FIX" md --port "$FIX_PORT" --sender "FEED$n" --user "feed$n" --password "feed$n-secret" --state "$RUN/clients/feed$n" \
+    "$FIX" md --port "$FIX_MD_PORT" --sender "FEED$n" --user "feed$n" --password "feed$n-secret" --state "$RUN/clients/feed$n" \
       --symbol "M$r" --depth 0 --id "MD-$r-$n" --follow $((SECONDS_PER_RUN + 10)) --quiet > "$LOGS/md-$r-$n.out" 2>&1 &
     MD_PIDS+=($!); PIDS+=($!)
   done

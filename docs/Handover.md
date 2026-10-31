@@ -651,3 +651,16 @@ and `run-e2e.sh` passed on it twice).
 - *The check of the last:* a mutation giving crosses the passive orders' SMP id is caught; a real run
   at 1,000/s filled every cross on one session. The one or two fills a run that no cross targeted
   are the adapter holding a cancel of an unacknowledged order (Design §10.1), traced in the log.
+
+**Market data's own engine, the same day** (Status §3 item 8a; Design §2, §4; CLAUDE.md 14; R§16).
+- *Decided:* by the user, on A3 (above).
+- *Specified first:* the `fix.md.*` keys in Design §2's table; in §4, a session at the other role's
+  port refused as unknown, and the engine emptied at start; §8.28, its archive's growth within a run.
+- *Built:* `FixNodeConfig.parseMarketData` (port and directories required, none order entry's,
+  fileSyncLevel 0 by default), `ConfiguredSessions.ofRole`, `FixAcceptor(transient = true)`, and the
+  adapter's second acceptor, bound after the backends with the first. `FixAcceptor`'s new parameter
+  went before `configureDriver`, which callers pass as a trailing lambda.
+- *The check:* 6 tests (the keys, their clashes, the roles' sessions, the refusal at the other port,
+  the emptying, the missing port); 5 mutations, each caught. The e2e passed with FEED1 on 29881.
+- *Measured* (A4, quiet): +0.45 ms p50 and nothing at p99 at 1,000/s, where shared it was +2.0 and
+  +5.5 ms; at saturation still ~8% of capacity, as shared, so that share was never the archive's.

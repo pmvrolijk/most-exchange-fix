@@ -15,7 +15,7 @@ p99 to order entry and take ~8% of its capacity.
 
 Decided 2026-10-31 (the user, on A3):
 - **Market data gets its own engine**, its own port, an archive at fileSyncLevel 0 (Design §4,
-  superseding "one engine"). Not yet built.
+  superseding "one engine"). Built the same day (item 8a; CLAUDE.md 14, R§16).
 - **One session for both roles is scrapped** (§8.26): order entry and market data are on separate
   ports.
 - **The sender's crosses carry a SelfMatchPreventionID** (2362) other than its passive orders', on
@@ -23,7 +23,10 @@ Decided 2026-10-31 (the user, on A3):
 - The deployment: **a dedicated adapter per participant**, which may hold several of its sessions.
   Several order-entry sessions for one participant are refused today; Design §8.27 is the decision
   that comes first.
-**Next: market data's own engine (decided below), then the trace ring, then §8.24 and §8.27.**
+**Market data has its own engine** (built 2026-10-31, §3 item 8a): its own port and an unsynced
+archive. Measured (A4), the latency coupling is mostly gone below saturation; the ~8% of capacity
+market data takes at saturation is the laptop's (CPU or disk), not the archive's.
+**Next: the trace ring (§3 item 6a), then §8.24 (with the user's Linux run) and §8.27.**
 
 The user's frame, 2026-10-31: production is Linux, and a Linux run is planned; 300–1,000 orders/s
 per connection is fine, and 3,500–5,000/s through one adapter is the target worth reaching. Raised,
@@ -148,7 +151,7 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 5 — `fix-session`, `order-entry`, `market-data`, `adapter` (the process), `tools` (`bin/fix`: the e2e's client, `perf` and `report`); packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 42, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 244 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 7; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` 24 (pacing 8, the mix and the raw reader 9, the report 6, `fix perf` end to end 1). `./gradlew build` green 2026-10-31. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29, 3 of 3 on 2026-10-30, and 2 of 2 on 2026-10-31 on the shared `e2e/exchange.sh`. `e2e/run-perf.sh`: 3 runs on 2026-10-31 (Measurements A1, A2, X1). The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
+| Tests | `fix-session` 45, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 244 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 10; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` 24 (pacing 8, the mix and the raw reader 9, the report 6, `fix perf` end to end 1). `./gradlew build` green 2026-10-31. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29, 3 of 3 on 2026-10-30, and 4 of 4 on 2026-10-31 on the shared `e2e/exchange.sh`, the last with market data on its own port. `e2e/run-perf.sh`: Measurements A1–A4, X1–X2 on 2026-10-31. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT from GitHub Packages (`pmvrolijk/most-exchange`), republished 2026-10-30 with `DepthFeedListener` (most-exchange `3afef4f`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -557,11 +560,16 @@ they decided whether `order-entry`'s persistence design stood.)
    - **Still open:** (a) **The trace ring** (Design §9.2), to say where the adapter's time goes;
      `fix report` reads it beside the sender's log. (b) The 2.25 s gap in every stream at 10,000/s
      (A1c), unexplained, and taken on a loaded machine.
-8a. **Market data's own engine** (Design §4, decided 2026-10-31): a second acceptor in the adapter
-   process, its own port, directories and an archive at fileSyncLevel 0, holding the market-data
-   sessions; order entry's keeps the order-entry ones. The `fix.md.*` keys gain the port and
-   directories; `e2e/exchange.sh` and `run-perf.sh` the second port. Then the A3 pairs again: the
-   coupling should be gone.
+8a. ~~**Market data's own engine**~~ **Done 2026-10-31**, uncommitted (Design §2, §4; CLAUDE.md 14;
+   R§16; Handover §2m). A second `FixAcceptor` in the adapter's process from `fix.md.port`,
+   `fix.md.logDir`, `fix.md.archiveDir` (required with a market-data session), `fix.md.aeronDir`
+   (default `fix.aeronDir-md`), `fix.md.fileSyncLevel` (default 0); emptied at every start
+   (`transient`); each acceptor holds its role's sessions (`ConfiguredSessions.ofRole`), so a
+   session at the other role's port is refused as unknown. The scripts' `FIX_MD_PORT` (FIX_PORT + 1).
+   6 tests; 5 mutations, each caught. Measured (A4): the coupling below saturation mostly gone.
+   - **Still open:** the ~8% of capacity at saturation (A4e–f), on a host that is not a laptop;
+     market data's archive grows within a run (Design §8.28).
+6a. **The trace ring** (Design §9.2), item 6's leftover: where the adapter's time goes, for §8.24.
 7. **`market-data`:** 35=y from the directory, then 35=V/W/X from `DepthFeedAssembler`. Started
    2026-10-30. Decided first (`decision-fork`, each the recommendation, Design §4): 35=X
    from a listener added to the SDK's assembler; market-data sessions transient (MsgSeqNum 1 at every

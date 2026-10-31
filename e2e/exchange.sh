@@ -6,7 +6,8 @@
 # The sourcing script sets ROOT, ME, RUN, LOGS, AERON_DIR and FIX_PORT, and SECURITIES (default AAPL)
 # and MAX_ORDERS if it needs others; then calls start_exchange and start_adapter. Participants 7 and 8
 # are the adapter's sessions; 20 and 21 are for `most load` straight to the gateway (run-perf.sh).
-# FEED1 is the e2e's market-data session; FEED2-4 are more, for run-perf.sh's market-data leg.
+# FEED1 is the e2e's market-data session; FEED2-4 are more, for run-perf.sh's market-data leg. They
+# log on at market data's own port, FIX_MD_PORT (default FIX_PORT + 1; Design.md §4).
 # FIX_FILE_SYNC_LEVEL (default 1) and FIX_IDLE_STRATEGY (default backoff) are the adapter's, for a
 # measured diff only: below 1 the adapter's persistence argument does not hold (CLAUDE.md 7, 11).
 
@@ -16,6 +17,7 @@ GATEWAY="$ME/gateway/build/install/gateway/bin/gateway"
 DISCOVERY="$ME/discovery/build/install/discovery/bin/discovery"
 MARKETDATA="$ME/market-data/build/install/market-data/bin/market-data"
 ADAPTER="$ROOT/adapter/build/install/adapter/bin/adapter"
+FIX_MD_PORT="${FIX_MD_PORT:-$((FIX_PORT + 1))}"
 FIX="$ROOT/tools/build/install/fix/bin/fix"
 for bin in "$MOST" "$ENGINE" "$GATEWAY" "$MARKETDATA" "$DISCOVERY" "$ADAPTER" "$FIX"; do
   [ -x "$bin" ] || { echo "missing $bin: see the prerequisites at the top of $0" >&2; exit 2; }
@@ -215,6 +217,10 @@ fix.sessionsFile=$RUN/sessions.properties
 fix.storeDir=$RUN/adapter/store
 fix.directoryChannel=$DIR_SUB
 fix.directoryStreamId=100
+fix.md.port=$FIX_MD_PORT
+fix.md.logDir=$RUN/adapter/md-logs
+fix.md.archiveDir=$RUN/adapter/md-archive
+fix.md.aeronDir=$RUN/adapter/md-aeron
 fix.md.l1.channel=$(MD_SUB 40201)
 fix.md.l1.streamId=31
 fix.md.l2.channel=$(MD_SUB 40202)

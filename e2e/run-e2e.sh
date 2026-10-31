@@ -14,7 +14,7 @@
 # Prerequisites:  ./gradlew :adapter:installDist :tools:installDist   (here)
 #                 ./gradlew installDist                                (in ../most-exchange)
 #
-# Knobs: MOST_EXCHANGE (default ../most-exchange), E2E_DIR, FIX_PORT (default 29880),
+# Knobs: MOST_EXCHANGE (default ../most-exchange), E2E_DIR, FIX_PORT (default 29880), FIX_MD_PORT (FIX_PORT + 1),
 #        LOAD_COUNT (default 400), LOAD_RATE (default 100/s per client),
 #        E2E_PAUSE_ON_FAIL=SECONDS to keep the processes up after a failure, to inspect them.
 #
@@ -72,10 +72,11 @@ expect "$RUN/s1-listen.out" "ClOrdID=S1 .*ExecType=TRADE OrdStatus=PARTIALLY_FIL
   "CLIENT1 was not told of its fill while logged out (Design.md §6.3)"
 pass "both sides of the trade reported; the maker's while it was logged out"
 
-# fixmd <command> [options]: the FIX client as the market-data session FEED1 (141=Y at every Logon, §4).
+# fixmd <command> [options]: the FIX client as the market-data session FEED1, at market data's own
+# port (141=Y at every Logon, Design.md §4).
 fixmd() {
   local command="$1"; shift
-  "$FIX" "$command" "$@" --port "$FIX_PORT" --sender FEED1 --user feed1 --password feed1-secret --state "$RUN/clients/feed1"
+  "$FIX" "$command" "$@" --port "$FIX_MD_PORT" --sender FEED1 --user feed1 --password feed1-secret --state "$RUN/clients/feed1"
 }
 
 echo

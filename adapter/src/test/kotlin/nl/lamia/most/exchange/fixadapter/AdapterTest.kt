@@ -7,6 +7,7 @@ import nl.lamia.most.exchange.fixadapter.session.AcceptorRig
 import nl.lamia.most.exchange.fixadapter.session.Initiator
 import nl.lamia.most.exchange.fixadapter.session.TestSessions
 import nl.lamia.most.exchange.fixadapter.session.pollUntil
+import nl.lamia.most.exchange.fixadapter.session.rawLogon
 import org.agrona.concurrent.BackoffIdleStrategy
 import org.agrona.concurrent.BusySpinIdleStrategy
 import org.junit.jupiter.api.io.TempDir
@@ -19,6 +20,7 @@ import java.util.Properties
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
@@ -29,6 +31,7 @@ class AdapterTest {
     lateinit var dir: File
 
     private val port = AcceptorRig.freePort()
+    private val mdPort = AcceptorRig.freePort()
 
     private fun properties(vararg entries: Pair<String, String>) = Properties().apply {
         setProperty("fix.bindAddress", "localhost")
@@ -44,6 +47,10 @@ class AdapterTest {
         setProperty("fix.calendar.zone", "UTC")
         setProperty("fix.calendar.rollTime", "23:59")
         setProperty("fix.idleStrategy", "backoff")
+        setProperty("fix.md.port", mdPort.toString())
+        setProperty("fix.md.logDir", File(dir, "md-logs").path)
+        setProperty("fix.md.archiveDir", File(dir, "md-archive").path)
+        setProperty("fix.md.aeronDir", File(dir, "md-aeron").path)
         for ((feed, stream) in listOf("l1" to 9401, "l2" to 9402, "snapshot" to 9404)) {
             setProperty("fix.md.$feed.channel", "aeron:ipc")
             setProperty("fix.md.$feed.streamId", "$stream")
@@ -93,7 +100,7 @@ class AdapterTest {
             assertTrue(adapter.marketData != null, "the market-data backend runs")
             Initiator(File(dir, "client")).use { client ->
                 pollUntil(client, what = "the client's library connected") { client.library.isConnected }
-                val logon = client.logon(port, TestSessions.FEED1, "feed1", TestSessions.FEED_SECRET)
+                val logon = client.logon(mdPort, TestSessions.FEED1, "feed1", TestSessions.FEED_SECRET)
                 pollUntil(client, what = "logon") { !logon.isExecuting }
                 val session = checkNotNull(logon.resultIfPresent()) { "logon: ${logon.state()} ${logon.error()}" }
                 val request = SecurityListRequestEncoder().securityReqID("SL-1").securityListRequestType(4)
@@ -102,6 +109,38 @@ class AdapterTest {
                 assertEquals("4", client.received.getValue(session.id()).first { it.msgType == "y" }[560])
             }
         }
+    }
+
+    @Test
+    fun `each role logs on at its own port, and at the other is refused as an unknown session`() {
+        // Design.md §4: market data has its own engine and port; each engine holds its role's sessions.
+        // That each logs on at its own is the two tests above.
+        Adapter(properties()).use {
+            val feedAtOrderEntry = rawLogon(port, TestSessions.FEED1, TestSessions.ADAPTER, "feed1", TestSessions.FEED_SECRET)
+            assertTrue(feedAtOrderEntry.closed && feedAtOrderEntry.messages.none { it.msgType == "A" }, "FEED1 at order entry's port: $feedAtOrderEntry")
+            val clientAtMarketData = rawLogon(mdPort, TestSessions.CLIENT1, TestSessions.ADAPTER, "client1", TestSessions.SECRET1)
+            assertTrue(clientAtMarketData.closed && clientAtMarketData.messages.none { it.msgType == "A" }, "CLIENT1 at market data's port: $clientAtMarketData")
+        }
+    }
+
+    @Test
+    fun `market data's engine starts with its logs and archive emptied, and order entry's are kept`() {
+        // Design.md §2, §4: nothing in market data's is ever replayed; order entry's are durable (§6.4).
+        val markers = listOf("md-logs", "md-archive", "logs", "archive").associateWith { File(File(dir, it).apply { mkdirs() }, "marker") }
+        markers.values.forEach { it.writeText("from the last run") }
+        Adapter(properties()).use {
+            assertFalse(markers.getValue("md-logs").exists(), "market data's logs emptied")
+            assertFalse(markers.getValue("md-archive").exists(), "market data's archive emptied")
+            assertTrue(markers.getValue("logs").exists(), "order entry's logs kept")
+            assertTrue(markers.getValue("archive").exists(), "order entry's archive kept")
+        }
+    }
+
+    @Test
+    fun `a market-data session configured without market data's port refuses to start before anything is opened`() {
+        val e = assertFailsWith<IllegalArgumentException> { Adapter(properties("fix.md.port" to "")) }
+        assertTrue("fix.md.port" in e.message.orEmpty(), e.message)
+        assertFalse(listening(), "nothing listens")
     }
 
     @Test

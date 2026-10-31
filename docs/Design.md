@@ -177,6 +177,10 @@ Decided 2026-10-15. Properties files, as the exchange's processes use.
   | `fix.shard.<id>.gateway.<n>.orderEntryChannel`, `…orderEntryStreamId`, `…executionReportChannel`, `…executionReportStreamId` | Optional: a shard's gateways, `n` from 0, in the order the SDK tries them. Listed, they replace the directory's one endpoint for that shard (§3.5) |
   | `fix.calendar.zone`, `fix.calendar.rollTime`, `fix.calendar.weekdays`, `fix.calendar.holidaysFile` | The trading calendar (§3.6). The first two required for order entry |
   | `fix.idleStrategy` | The library threads' idle strategy (§7): `busyspin`, the default, `yielding`, `backoff` or `sleeping` |
+  | `fix.md.bindAddress`, `fix.md.port` | Where market data's own engine listens (§4). The port is required when a market-data session is configured, and must not be `fix.port`; `bindAddress` defaults to `fix.bindAddress` |
+  | `fix.md.logDir`, `fix.md.archiveDir` | Market data's engine's logs and recordings. Required when a market-data session is configured, and neither may be order entry's. **Emptied at every start**: market-data sessions keep nothing across a Logon (§4) |
+  | `fix.md.aeronDir` | Its media driver's directory. Defaults to `fix.aeronDir` plus `-md` |
+  | `fix.md.fileSyncLevel` | Its archive's fsync level, default **0** (§4) |
 
 - **The sessions file** has one block of `session.<name>.*` keys per session. The name is only a
   label:
@@ -487,7 +491,17 @@ only: the `expireDate` of a day order (59=0 or absent).
     entry ~2–2.5 ms p50, 5–8 ms p99 and ~8% of its capacity (Measurements A3). Artio archives an
     engine's messages all or none, so the only way out of order entry's archive is another engine.
     fileSyncLevel 0 loses nothing: market-data sessions keep nothing across a Logon. A participant
-    gets one port for order entry and another for market data. Not yet built (Status §3).
+    gets one port for order entry and another for market data. **As built** (2026-10-31): a second
+    acceptor in the adapter's process, its own media driver, archive and engine from the `fix.md.*`
+    keys (§2), holding the market-data sessions only; order entry's holds the order-entry ones. **A
+    session logs on at its role's port.** At the other, its Logon is refused as any unknown
+    session's is. Market data's engine starts with its logs and archive emptied: nothing in them is
+    ever replayed, since a market-data session starts at MsgSeqNum 1 at every Logon, and emptying
+    them bounds their growth to one run. Within a run it is not bounded (§8.28).
+    **Measured** (Measurements A4): with its own engine, four feed sessions cost order entry +0.45 ms
+    p50 and nothing at p99 at 1,000/s (shared: +2.0 and +5.5 ms), +0.85 and +2.6 ms at 3,000/s
+    (shared: +2.4 and +7.7). At saturation it still takes ~8% (4,215 → 3,887 requests/s), as shared:
+    that share is the machine's, CPU or the disk, not the archive's. One laptop.
   - **The feeds are the node file's**: the L1, L2 and snapshot channels and stream ids, as
     most-exchange's own processes configure them (`md.l1`, `md.l2`, `md.snapshot`). The directory
     carries order-entry routes only.
@@ -1417,7 +1431,9 @@ The archive's recorded position (§6.2) then means durable.
       entry's archive on a shared engine. The user expects a dedicated market-data session per
       participant (§8.26).
     - **Decided 2026-10-31 (the user): market data gets its own engine**, its own port, an archive at
-      fileSyncLevel 0 (§4). Not yet built.
+      fileSyncLevel 0 (§4). **Built and measured the same day** (Measurements A4): the latency
+      coupling is mostly gone below saturation; the ~8% of capacity at saturation is not the
+      archive's. Closed, but for that 8% on a host that is not a laptop.
 
 23. **Market data's path allocates, in the SDK's book** (found 2026-10-30, slice 4). `AggregatedBook`
     stores a `Level` object per update and its `levels()` returns a new list, which the 35=X for
@@ -1464,6 +1480,12 @@ The archive's recorded position (§6.2) then means durable.
     sessions need a decision first: which session a report goes to (the one that sent the order,
     found from the store's row), what a mass status (35=AF) on one session covers, and what a
     session that is logged out while another is logged on is owed. A `decision-fork` before code.
+
+28. **Market data's archive grows without bound within a run** (2026-10-31). It records every 35=W
+    and 35=X its engine sends, at ~200 bytes each: ~0.8 MB/s for four busy feed sessions. Emptied at
+    each start (§4), never during a run. Artio archives all or none of an engine's messages; turning
+    market data's off (`logOutboundMessages(false)`) would answer a client's ResendRequest with a gap
+    fill instead of the 35=X it missed, a change to what a client sees, so not taken here.
 
 ## 9. Control and metrics
 

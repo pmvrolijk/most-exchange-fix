@@ -37,6 +37,11 @@ class FixAcceptor(
     val config: FixNodeConfig,
     val sessions: ConfiguredSessions = ConfiguredSessions.load(config.sessionsFile),
     bindAtStartup: Boolean = true,
+    /**
+     * Market data's engine (Design.md §4): its logs and archive are emptied at start, since nothing
+     * in them is ever replayed. Order entry's never are (§6.4).
+     */
+    transient: Boolean = false,
     configureDriver: (MediaDriver.Context, Archive.Context) -> Unit = { _, _ -> },
 ) : AutoCloseable {
 
@@ -52,7 +57,7 @@ class FixAcceptor(
             val archiveContext = Archive.Context()
                 .aeronDirectoryName(config.aeronDir)
                 .archiveDir(config.archiveDir)
-                .deleteArchiveOnStart(false)
+                .deleteArchiveOnStart(transient)
                 .fileSyncLevel(config.fileSyncLevel)
                 // Aeron 1.53 refuses a catalog synced less than the recordings it describes.
                 .catalogFileSyncLevel(config.fileSyncLevel)
@@ -71,7 +76,7 @@ class FixAcceptor(
                 bindAtStartup(bindAtStartup)
                 libraryAeronChannel(IPC)
                 logFileDir(config.logDir.path)
-                deleteLogFileDirOnStart(false)
+                deleteLogFileDirOnStart(transient)
                 // Artio's default is one path in the temp directory for every engine on the host.
                 monitoringFile(File(config.logDir, "engine-monitoring").path)
                 // Artio's default resets sequence numbers at every logon (Design §2); market data's do (§4).

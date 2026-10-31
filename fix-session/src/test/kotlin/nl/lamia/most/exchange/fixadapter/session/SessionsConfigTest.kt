@@ -72,4 +72,14 @@ class SessionsConfigTest {
         val error = assertFailsWith<IllegalArgumentException> { sessions(*lines) }
         assertTrue(mentioning in error.message.orEmpty(), "'${error.message}' should mention $mentioning")
     }
+
+    @Test
+    fun `each engine holds the sessions of its role only`() {
+        // Design.md §4: order entry's acceptor and market data's each authenticate their own role's.
+        val sessions = sessions(*oe1, *md1)
+        assertEquals(listOf("OE1"), sessions.ofRole(Role.ORDER_ENTRY).all.map { it.name })
+        assertEquals(listOf("MD1"), sessions.ofRole(Role.MARKET_DATA).all.map { it.name })
+        assertNull(sessions.ofRole(Role.ORDER_ENTRY).find(senderCompId = "MOST", targetCompId = "FEED1"))
+        assertNull(sessions.ofRole(Role.MARKET_DATA).find(senderCompId = "MOST", targetCompId = "CLIENT1"))
+    }
 }

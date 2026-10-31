@@ -27,6 +27,12 @@ Quoting only the first hides the queueing at exactly the rates worth measuring.
 | A3f | 2026-10-31 | `0cd88a2`+ | as A1a | yes, as A3e | JVM 21.0.11 | as A3b: 117,815 35=X each | 5000/s | 5000/s sent; **3,922 requests/s answered** | saturated, 6.5 / 8.2 s | saturated | straight after A3e: market data takes ~8% of the capacity |
 | X2a | 2026-10-31 | most-exchange `b5d457a` | as A1a | yes, as A3a | JVM 21.0.11 | as X1a | 1000/s | 1000/s | 1.26 / 2.63 ms | 1.34 / 2.71 ms | the same run as A3a–A3d |
 | X2b | 2026-10-31 | most-exchange `b5d457a` | as A1a | yes, as A3a | JVM 21.0.11 | as X1a | 3000/s | 3000/s | 458 / 843 µs | 466 / 852 µs | as X2a |
+| A4a | 2026-10-31 | `1f456e0`+ | as A1a | yes (load avg 2.5–5.3) | JVM 21.0.11 | as A3a, but **market data on its own engine**: port, media driver and archive at fileSyncLevel 0 (Design §4) | 1000/s | 1000/s | 14.63 / 20.98 ms | 14.63 / 20.98 ms | the pair's first half |
+| A4b | 2026-10-31 | `1f456e0`+ | as A1a | yes, as A4a | JVM 21.0.11 | as A4a, and 4 feed sessions as A3b: 24,066 35=X each | 1000/s | 1000/s | 15.08 / 20.62 ms | 15.09 / 20.62 ms | straight after A4a |
+| A4c | 2026-10-31 | `1f456e0`+ | as A1a | yes, as A4a | JVM 21.0.11 | as A4a | 3000/s | 3000/s; keeps up | 17.19 / 23.94 ms | 17.19 / 23.95 ms | |
+| A4d | 2026-10-31 | `1f456e0`+ | as A1a | yes, as A4a | JVM 21.0.11 | as A4b: 72,033 35=X each | 3000/s | 3000/s; keeps up | 18.04 / 26.57 ms | 18.04 / 26.57 ms | straight after A4c |
+| A4e | 2026-10-31 | `1f456e0`+ | as A1a | load avg 6–8.7 | JVM 21.0.11 | as A4a | 5000/s | 5000/s sent; **4,215 requests/s answered** | saturated | saturated | |
+| A4f | 2026-10-31 | `1f456e0`+ | as A1a | load avg 6–8.7 | JVM 21.0.11 | as A4b: 114,683 35=X each | 5000/s | 5000/s sent; **3,887 requests/s answered** | saturated | saturated | straight after A4e |
 
 ### What A1–A2 and X1 say (2026-10-31)
 
@@ -63,3 +69,15 @@ A3c), and take ~8% of the saturated capacity (A3f against A3e). The feeds kept u
   answers 4,255 requests/s (A3e), not 3,530.
 - Artio archives an engine's messages all or none (`logInboundMessages`/`logOutboundMessages`), so
   market data cannot be left out of order entry's archive while they share an engine.
+
+### What A4 says (2026-10-31): market data on its own engine
+
+The A3 pairs again, with market data on its own engine (Design §4), the same machine, quiet, the same
+hour. **Below saturation the coupling is mostly gone**: the four feed sessions' cost to order entry
+falls from +2.0 ms p50 and +5.5 ms p99 to +0.45 ms and none at 1,000/s (A4b against A4a), and from
++2.4 and +7.7 ms to +0.85 and +2.6 ms at 3,000/s (A4d against A4c). **At saturation it is not**:
+4,215 against 3,887 requests/s, the same ~8% as A3 (A4f against A4e). So that share was never the
+shared archive. On this laptop it is the machine: market data's engine threads and four feed JVMs
+beside the exchange's spinning processes (load average to 8.7, the sender's own lateness doubled), or
+its archive's writes on the disk order entry fsyncs. These runs do not separate the two.
+

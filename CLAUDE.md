@@ -111,6 +111,12 @@ entry gateways and market data feeds. Kotlin, packages `nl.lamia.most.exchange.f
     numbered within that stored gap: Artio archives what it marked invalid and replays it as valid,
     and rebuilt, it would be rejected "not sequenced". (Design.md §2, §8.21) → R§14
 
+14. **Market data runs on its own engine, never on order entry's.** The adapter's market-data
+    sessions belong to a second acceptor, on its own port, with an archive at fileSyncLevel 0 that is
+    emptied at every start; order entry's acceptor holds the order-entry sessions only. Order
+    entry's fsynced archive gates every 35=D and `reportSeq` (7, 11), so market data on it slows the
+    order path. (Design.md §4) → R§16
+
 ## Provenance
 
 ## Skills

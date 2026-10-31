@@ -577,3 +577,28 @@ it is dropped as a report for a lost row (R§10), and that client never hears of
   archived messages, for its own participant`, which failed every time before the fix. An Artio bump
   (non-negotiable 6) runs it with the rest of the build. It belongs with (h3) and (h4) on the list
   to report to Artio.
+
+## 16. Market data has its own engine
+
+Decided 2026-10-31 by the user, on the measurement of Design §8.22 (Measurements A3, A4).
+
+One Artio engine served both backends, and its archive, fsynced for order entry (R§4, R§11, R§12),
+recorded every 35=W and 35=X too. A 35=D waits for the archive before it is sent, and a `reportSeq`
+waits for it before it is consumed, so market data's volume sat in order entry's path. Measured with
+four feed sessions at ~4,000 35=X/s: +2 ms p50 and +5.5 ms p99 at 1,000 orders/s. Artio archives an
+engine's messages all or none (`logInboundMessages`, `logOutboundMessages`), so the only way out of
+order entry's archive is another engine.
+
+- **Its own port.** A session logs on at its role's port and is refused at the other as an unknown
+  session, because each engine authenticates only its role's sessions. The user's deployment has a
+  participant run a dedicated market-data session beside its order-entry one, so the second port
+  costs nothing in practice; one session for both roles was scrapped with it (Design §8.26).
+- **fileSyncLevel 0, and emptied at start.** A market-data session starts at MsgSeqNum 1 at every
+  Logon and is never resent anything from before it (Design §4), so nothing in its archive is read
+  after a restart. Fsyncing it buys nothing; keeping it across restarts only grows it.
+- **Not taken: no archive at all** (`logOutboundMessages(false)`). A client's ResendRequest within a
+  session would then get a gap fill instead of the 35=X it missed, a change to what a client sees
+  (Design §8.28).
+- **What it did not fix:** at saturation market data still takes ~8% of order entry's capacity on the
+  laptop (A4). That share is CPU or the disk, not the archive.
+
