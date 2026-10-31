@@ -594,3 +594,44 @@ explained: afterwards the store and the archive agreed one for one.
   from the corrected script.
 - *Not done:* nothing measured, neither latency nor the archive coupling (§8.22) nor the SDK book's
   allocation (§8.23); a market-data-only adapter (order entry is still required).
+
+### 2m. The latency tooling and the first baseline (Status §3 item 6), 2026-10-31
+
+**The tooling** (Design §10; decided with the user: `fix perf` is its own command, and pacing and its
+deviation are measured "so we can correctly attribute"; the FIX↔Kafka gateway's `analyze_trace.py`
+as the report's model).
+- *Specified first* in Design §10: a schedule fixed before the first send; lateness as queued, sender
+  late and pushed back, traced to its root as a sender share and a system share; the order mix and
+  the sender's predicted book; the log's records; the report's attribution and output.
+- *Built:* `tools`' `perf` package (`Schedule`, `Pacer`, `Lateness`, `OrderMix`, `RawFix`,
+  `PerfLog`, `Perf`) and `report` package (`Analysis`, `Report`, `Html`, `Charts`); HdrHistogram
+  2.2.2 for the `.hgrm` files, `tools` only. `FixClient` gained a raw handler, a busy-spin option
+  and several sessions.
+- *The check:* 24 tests, the expected values worked out by hand from the clauses; 16 mutations, each
+  caught (one first "caught" by a compile error, rewritten). Among them: the schedule re-based on the
+  send, the first attempt taken at the last try, queueing all owed to the sender, a resting fill
+  timed from its own send, the discard pass left in the throughput, a full log overwriting its last
+  record, an allocating receive path, a CDN script, crosses on the maker's session. The mix and the
+  raw reader allocate 0 bytes per message (measured after the JIT's two tier changes, which cost a few
+  hundred bytes each); the paced send thread ~10 KB per run whatever its length, Artio's first use.
+  The report was looked at, light, dark and at 500 px.
+
+**Found by looking at a rendered report, and fixed in the spec first:**
+- Every message showed ~1 µs "pushed back" with no refusal: Artio's encode in the `trySend` that took
+  it. Now a fourth part, **send cost**, owed to the sender. The clean run's 35% "system" became 0%.
+- Service times of 2 µs, below any round trip: a resting fill paired with the *latest* cross before
+  it was timed from the second of two crosses on one order. Now paired in order (the analyzer's
+  greedy pairing).
+
+**The baseline** (`e2e/run-perf.sh`; `e2e/exchange.sh` now holds the startup both e2e scripts share,
+and `run-e2e.sh` passed on it twice).
+- *Found:* every cross came back CANCELED. most-exchange's SMP id defaults to the participant, so a
+  participant never trades with itself. The sender now has a maker (CLIENT1) and a taker (CLIENT2),
+  and the test venue model applies the same rule. Also found: the engine checks an ISIN's check
+  digit, so the extra securities' ISINs carry one.
+- *Measured* (Measurements A1–A2, X1, same day, same processes, machine not idle): through the
+  adapter at fileSyncLevel 1, 15 ms p50 at 1,000/s, saturated at 3,500–5,400 requests/s with no
+  back-pressure seen by the client; `most load` straight to the gateway, 0.16–1.1 ms p50 up to
+  10,000/s; the adapter at fileSyncLevel 0, 1.7 ms at 1,000/s and 0.36 ms at 5,000/s. The sender's
+  own lateness p99 stayed under 25 µs. Recorded as Design §8.24; nothing decided.
+- *Not done:* §8.22's run with a market-data subscriber; the trace ring; the 2.25 s gap at 10,000/s.

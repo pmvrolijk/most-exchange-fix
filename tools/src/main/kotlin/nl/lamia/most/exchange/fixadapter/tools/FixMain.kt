@@ -6,6 +6,8 @@ import nl.lamia.most.exchange.fixadapter.codecs.builder.SecurityListRequestEncod
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderCancelRequestEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderMassStatusRequestEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderStatusRequestEncoder
+import nl.lamia.most.exchange.fixadapter.tools.perf.Perf
+import nl.lamia.most.exchange.fixadapter.tools.report.Report
 import uk.co.real_logic.artio.fields.UtcTimestampEncoder
 import java.io.File
 import java.math.BigDecimal
@@ -32,6 +34,17 @@ Commands:
   load         --symbol S --count N --rate PER_SECOND --price-min P --price-max P [--qty-min Q] [--qty-max Q]
                [--cancel-pct N] [--prefix ID] [--drain SECONDS] [--reconnect SECONDS] [--settle SECONDS] [--verbose]
 
+Measuring (Design.md §10):
+  perf         --symbol S --mid P --log FILE (--rate PER_SECOND --count N | --schedule "<delayMicros> <count>[,...]")
+               [--mix passive=60,cross=20,cancel=20] [--tick 0.01] [--levels 5] [--qty 10] [--warmup N]
+               [--prefix ID] [--drain SECONDS] [--settle SECONDS] [--busy-spin] [--seed N] [--exchange TEXT]
+               [--log-records N] --taker-sender ID --taker-user NAME (--taker-password S | --taker-password-file F)
+               Paced new orders, crosses and cancels; every send and report to a memory-mapped log. The
+               connection options are the maker's (passive orders, cancels); the taker, another
+               participant, sends the crosses: one participant cannot trade with itself
+  report       --log FILE [--compare FILE] [--out DIR] [--exchange TEXT]     (no connection options)
+               The latency report: report.html, .hgrm and CSV in --out (default: beside the log)
+
 Market data, as a market-data session (it starts at MsgSeqNum 1 at every Logon, so these log on with 141=Y):
   securities   [--id ID] [--follow SECONDS]                                                    35=x, all securities
   md           --symbol S[,S...] [--depth 0|1] [--entries bid,offer,trade] [--snapshot] [--id ID] [--follow SECONDS]
@@ -41,19 +54,21 @@ Every application message received is printed on one line (ExecutionReport ... E
 --follow defaults to 3 seconds."""
 
 fun main(argv: Array<String>) {
+    // Numbers in logs, tables and reports read the same on every machine: 1.000, never 1,000.
+    java.util.Locale.setDefault(java.util.Locale.ROOT)
     if (argv.isEmpty() || argv[0] in setOf("-h", "--help", "help")) {
         println(USAGE)
         exitProcess(if (argv.isEmpty()) 2 else 0)
     }
     val command = argv[0]
     val args = try {
-        Args.parse(argv.drop(1), flags = setOf("reset", "verbose", "snapshot"))
+        Args.parse(argv.drop(1), flags = setOf("reset", "verbose", "snapshot", "busy-spin"))
     } catch (e: IllegalArgumentException) {
         System.err.println("fix: ${e.message}")
         exitProcess(2)
     }
     val code = try {
-        run(command, args)
+        run(command, args, argv.drop(1))
     } catch (e: IllegalArgumentException) {
         System.err.println("fix: ${e.message}")
         2
@@ -64,7 +79,8 @@ fun main(argv: Array<String>) {
     exitProcess(code)
 }
 
-private fun run(command: String, args: Args): Int {
+private fun run(command: String, args: Args, argv: List<String>): Int {
+    if (command == "report") return Report.run(args)
     val logon = Logon(
         host = args.string("host", "localhost"),
         port = args.int("port"),
@@ -78,6 +94,7 @@ private fun run(command: String, args: Args): Int {
     val state = File(args.required("state"))
     val followMs = (args.double("follow", 3.0) * 1000).toLong()
     if (command == "load") return Load(args).run(state, logon)
+    if (command == "perf") return Perf(args, redacted(argv)).run(state, logon)
 
     val encoder = when (command) {
         "send" -> newOrder(args)
@@ -110,6 +127,10 @@ private fun run(command: String, args: Args): Int {
     }
     return 0
 }
+
+/** The command line for a log's header, without the password. */
+private fun redacted(argv: List<String>): String =
+    argv.mapIndexed { i, a -> if (i > 0 && argv[i - 1] in setOf("--password", "--taker-password")) "***" else a }.joinToString(" ")
 
 private val timestamp = UtcTimestampEncoder()
 

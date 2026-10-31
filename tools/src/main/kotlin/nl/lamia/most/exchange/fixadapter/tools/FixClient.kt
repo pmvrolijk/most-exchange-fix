@@ -10,6 +10,7 @@ import io.aeron.logbuffer.ControlledFragmentHandler.Action
 import nl.lamia.most.exchange.fixadapter.codecs.FixDictionaryImpl
 import org.agrona.CloseHelper
 import org.agrona.DirectBuffer
+import org.agrona.concurrent.BusySpinIdleStrategy
 import uk.co.real_logic.artio.builder.Encoder
 import uk.co.real_logic.artio.engine.EngineConfiguration
 import uk.co.real_logic.artio.engine.FixEngine
@@ -36,23 +37,35 @@ class Logon(
     val reset: Boolean = false,
 )
 
+/** A valid application or session message as Artio hands it over: the raw bytes, nothing parsed. */
+fun interface RawHandler {
+    fun onMessage(buffer: DirectBuffer, offset: Int, length: Int)
+}
+
 /**
  * One FIX client session (Design.md §10.1): its own media driver, Artio engine and library under
  * [stateDir]. MsgSeqNum is persisted there, so a later run with the same directory continues the
  * session as a real client would, and is resent what it missed while away.
  *
+ * With [busySpin], the driver, the archive and the engine spin rather than back off (`fix perf`).
+ *
  * Single-threaded: call everything from the thread that made it.
  */
-class FixClient(stateDir: File, private val onMessage: (FixMessage) -> Unit) : AutoCloseable {
+class FixClient(stateDir: File, busySpin: Boolean, private val onRaw: RawHandler) : AutoCloseable {
+    constructor(stateDir: File, onMessage: (FixMessage) -> Unit) :
+        this(stateDir, false, RawHandler { buffer, offset, length -> onMessage(FixMessage.parse(buffer.getStringWithoutLengthAscii(offset, length))) })
+
     private val aeronDir = File(stateDir, "aeron").path
 
     // An archive, as a real client's engine keeps one: it holds what the client sent, to answer the
     // adapter's ResendRequest, and the sequence numbers that carry the session across runs.
     private val driver = ArchivingMediaDriver.launch(
         MediaDriver.Context().aeronDirectoryName(aeronDir).threadingMode(ThreadingMode.SHARED)
-            .dirDeleteOnStart(true).dirDeleteOnShutdown(true),
+            .dirDeleteOnStart(true).dirDeleteOnShutdown(true)
+            .apply { if (busySpin) sharedIdleStrategy(BusySpinIdleStrategy()) },
         Archive.Context().aeronDirectoryName(aeronDir).archiveDir(File(stateDir, "archive"))
             .threadingMode(ArchiveThreadingMode.SHARED).deleteArchiveOnStart(false)
+            .apply { if (busySpin) idleStrategySupplier { BusySpinIdleStrategy() } }
             .controlChannelEnabled(false).replicationChannel("aeron:udp?endpoint=localhost:0")
             .archiveClientContext(AeronArchive.Context().controlResponseChannel("aeron:ipc")),
     )
@@ -65,6 +78,10 @@ class FixClient(stateDir: File, private val onMessage: (FixMessage) -> Unit) : A
             // Artio's default is one path in the temp directory, shared by every engine on the host.
             monitoringFile(File(stateDir, "engine-monitoring").path)
             acceptorfixDictionary(FixDictionaryImpl::class.java)
+            if (busySpin) {
+                framerIdleStrategy(BusySpinIdleStrategy())
+                archiverIdleStrategy(BusySpinIdleStrategy())
+            }
             aeronContext().aeronDirectoryName(aeronDir)
             aeronArchiveContext()
                 .aeronDirectoryName(aeronDir)
@@ -88,10 +105,12 @@ class FixClient(stateDir: File, private val onMessage: (FixMessage) -> Unit) : A
         throw e
     }
 
+    /** The session logged on last; [sessions] has every one this client holds. */
     var session: Session? = null
         private set
+    val sessions = ArrayList<Session>()
 
-    /** The current session's disconnect has been seen; cleared by the next [logon]. */
+    /** A session's disconnect has been seen; cleared by the next [logon]. */
     var disconnected = false
         private set
 
@@ -128,6 +147,8 @@ class FixClient(stateDir: File, private val onMessage: (FixMessage) -> Unit) : A
         pollUntil("the logon") { !reply.isExecuting }
         val session = reply.resultIfPresent() ?: throw IllegalStateException("logon refused: ${reply.state()} ${reply.error() ?: ""}")
         this.session = session
+        sessions.removeIf { !it.isConnected }
+        sessions += session
         disconnected = false
         return session
     }
@@ -143,7 +164,11 @@ class FixClient(stateDir: File, private val onMessage: (FixMessage) -> Unit) : A
     fun trySend(encoder: Encoder): Boolean = checkNotNull(session).trySend(encoder) > 0
 
     fun logout() {
-        val session = session ?: return
+        for (s in sessions) logout(s)
+        session?.let { if (it !in sessions) logout(it) }
+    }
+
+    private fun logout(session: Session) {
         if (!session.isConnected) return
         pollUntil("the logout to be sent", 5_000L) { session.startLogout() > 0 || !session.isConnected }
         runCatching { pollUntil("the logout", 10_000L) { !session.isConnected } }
@@ -159,7 +184,7 @@ class FixClient(stateDir: File, private val onMessage: (FixMessage) -> Unit) : A
             buffer: DirectBuffer, offset: Int, length: Int, libraryId: Int, session: Session,
             sequenceIndex: Int, messageType: Long, timestampInNs: Long, position: Long, messageInfo: OnMessageInfo,
         ): Action {
-            if (messageInfo.isValid) onMessage(FixMessage.parse(buffer.getStringWithoutLengthAscii(offset, length)))
+            if (messageInfo.isValid) onRaw.onMessage(buffer, offset, length)
             return Action.CONTINUE
         }
 

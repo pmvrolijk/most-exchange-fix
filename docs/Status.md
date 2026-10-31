@@ -3,7 +3,27 @@
 Where the adapter stands, what is open, and what to do next. **This is the session entry point** —
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
-Last updated 2026-10-30. **Both backends are built, and `bin/adapter` runs them.** `fix-session`:
+Last updated 2026-10-31. **Both backends are built, `bin/adapter` runs them, and the adapter has
+its first latency baseline: the fsynced archive is its bottleneck.** `fix perf` and `fix report`
+(§3 item 6) measured it against most-exchange's real processes beside `most load` straight to the
+gateway, the same day (Measurements A1–A2, X1): at fileSyncLevel 1 the adapter answers 1,000/s at a
+15 ms p50 and saturates at 3,500–5,400 requests/s; the gateway alone keeps up at 10,000/s under
+0.2 ms; at fileSyncLevel 0 the adapter keeps up at 5,000/s at 0.36 ms. Open as Design §8.24, not
+decided. The laptop's figures only (macOS fsync), and the machine was not idle.
+**Next: §3 item 6's two leftovers, §8.22's run and the trace ring, then §8.24.**
+
+Decided 2026-10-31 (Design §10; with the user):
+- **`fix perf` is its own command**; `load` stays the e2e's.
+- **Lateness from the schedule, attributed**: queued, sender late, pushed back and send cost, and
+  traced to its root as a sender share and a system share. The user asked for pacing and its
+  deviation, "so we can correctly attribute".
+- **The baseline in the e2e's topology, UDP** (the user's call): one machine, one cluster member,
+  adapter at fileSyncLevel 1 with back-off idling.
+- Found, not decided: **two participants for the sender**, a maker and a taker. most-exchange's
+  self-match prevention cancels a participant's cross on its own order, so one session's crosses
+  never filled.
+
+2026-10-30: **Both backends are built, and `bin/adapter` runs them.** `fix-session`:
 the acceptor and the FIX 4.4 dictionary, now with market data's messages. `order-entry`: the store,
 inbound, outbound, durable delivery, recovery of lost rows, 35=H/35=AF, the MsgSeqNum skip after a
 crash, the library's own ResendRequest, and (2026-10-30) the startup replay one session at a time
@@ -108,8 +128,8 @@ There is no remote yet.
 | --- | --- |
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
-| Modules | 5 — `fix-session`, `order-entry`, `market-data`, `adapter` (the process), `tools` (`bin/fix`); packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 42, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 244 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 7; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` none (the e2e drives it). `./gradlew build` green 2026-10-30. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29 and 3 of 3 on 2026-10-30. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
+| Modules | 5 — `fix-session`, `order-entry`, `market-data`, `adapter` (the process), `tools` (`bin/fix`: the e2e's client, `perf` and `report`); packages `nl.lamia.most.exchange.fixadapter.*` |
+| Tests | `fix-session` 42, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 244 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 7; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` 24 (pacing 8, the mix and the raw reader 9, the report 6, `fix perf` end to end 1). `./gradlew build` green 2026-10-31. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29, 3 of 3 on 2026-10-30, and 2 of 2 on 2026-10-31 on the shared `e2e/exchange.sh`. `e2e/run-perf.sh`: 3 runs on 2026-10-31 (Measurements A1, A2, X1). The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT from GitHub Packages (`pmvrolijk/most-exchange`), republished 2026-10-30 with `DepthFeedListener` (most-exchange `3afef4f`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -147,9 +167,10 @@ Each changes what gets built (`decision-fork`):
 
 ## 3. To do next
 
-In order. Items 1–5 and 7 are done; **6 is next**, because §8.22 (market data on order entry's
-archive) and §8.23 (the SDK book's allocation) need its measurements before market data is relied
-on under load. 8 needs a go. (Originally: the SDK changes and the spikes came before code, because
+In order. Items 1–7 are done, but for item 6's two leftovers, which come next: §8.22 (market data on
+order entry's archive) needs its run before market data is relied on under load, and the trace ring
+is what says where the adapter's time goes before §8.24 (the fsync's cost) can be decided. 8 needs a
+go. (Originally: the SDK changes and the spikes came before code, because
 they decided whether `order-entry`'s persistence design stood.)
 
 1. ~~**Switch the build to GitHub Packages**~~ **Done 2026-10-15.** `mostSdk.url` points at
@@ -492,8 +513,25 @@ they decided whether `order-entry`'s persistence design stood.)
       - **Fixed on the way:** Artio's monitoring files were host-wide; now in `fix.logDir`.
       - ~~The three-member failover run (a `run-failover.sh` for the adapter, listed gateways)~~
         **Skipped 2026-10-30** (the user's call).
-6. **Tooling** (Design §10): the paced FIX sender and the HTML latency report, with service and
-   response time per outcome. Then a baseline measurement (`perf-claim`).
+6. ~~**Tooling**~~ **Done 2026-10-31**, uncommitted (Design §10; Handover §2m). `fix perf`, the
+   measuring sender: a schedule fixed before the first send, a maker and a taker session, the mix of
+   passive orders, crosses and cancels predicted from what it sends, and a memory-mapped log written
+   without allocating per message. `fix report`: each report timed against the request that caused
+   it (a resting fill against its cross), service and response time per outcome, lateness in four
+   parts with its sender and system shares, throughput with gap percentiles, and a self-contained
+   HTML page (inline SVG, light, dark and print, provenance first) with `.hgrm`, CSV, a comparison of
+   two runs and the Measurements row. `e2e/run-perf.sh` runs the baseline beside `most load`;
+   `e2e/exchange.sh` is now the startup both scripts share. 24 tests, 16 mutations, each caught.
+   - **Found while building:** without a separate send cost, Artio's encode (~1 µs) read as the
+     system's; and a resting fill paired with the *latest* cross was timed from the wrong one, at
+     2 µs. Both fixed in the spec first, then the code. Every cross through most-exchange was
+     cancelled until the taker was a second participant.
+   - **Measured** (Measurements A1–A2, X1): the adapter, not the exchange, is the bottleneck, and the
+     archive's fsync is most of it (Design §8.24).
+   - **Still open:** (a) **§8.22's run**: the baseline at 1,000/s with a market-data client subscribed
+     to the same securities, against A1a. (b) **The trace ring** (Design §9.2), to say where the rest
+     of the adapter's time goes; `fix report` reads it beside the sender's log. (c) The 2.25 s gap in
+     every stream at 10,000/s (A1c), unexplained. (d) More than two sessions in the sender.
 7. **`market-data`:** 35=y from the directory, then 35=V/W/X from `DepthFeedAssembler`. Started
    2026-10-30. Decided first (`decision-fork`, each the recommendation, Design §4): 35=X
    from a listener added to the SDK's assembler; market-data sessions transient (MsgSeqNum 1 at every

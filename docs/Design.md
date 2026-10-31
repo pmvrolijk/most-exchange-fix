@@ -1412,6 +1412,18 @@ The archive's recorded position (§6.2) then means durable.
     MarketDepth 1 and every 35=W read. Allocation-free market data needs a change to most-exchange's
     `client` (non-negotiable 4), as §8.16 does for the directory. Not measured.
 
+24. **The fsynced archive caps the adapter** (found 2026-10-31, Measurements A1–A2, X1). On the
+    developer laptop (macOS, APFS), in the e2e topology, the adapter at fileSyncLevel 1 answers 1,000
+    orders/s at a 15 ms p50 and saturates between 3,500 and 5,400 requests/s, while the exchange
+    behind it keeps up at 10,000/s with a p50 under 0.2 ms. At fileSyncLevel 0, nothing else changed,
+    the p50 at 1,000/s is 1.7 ms and 5,000/s keeps up. Both waits are this design's: a 35=D goes out
+    only once the archive has it (§6.1, CLAUDE.md 11), and a `reportSeq` is consumed only behind it
+    (§6.2, CLAUDE.md 7). Not decided, and not to be traded away without a `decision-fork`. Still to
+    measure first: the same runs on a Linux host with an NVMe drive (macOS's `force` is a plain
+    `fsync`); where in the adapter the rest of the gap to the gateway goes (the trace ring, §9.2);
+    and whether the archive's fsyncs batch under load as the design assumed, or one stream's sync
+    serialises the other's.
+
 ## 9. Control and metrics
 
 One JDK `HttpServer` (no web framework, native-image friendly), on a management address. Decided
@@ -1467,31 +1479,111 @@ Decided 2026-10-09 as written here.
 the adapter's dictionary that the e2e scripts drive. `send`, `cancel`, `status` (35=H),
 `mass-status` (35=AF), `listen`, and `load`, which paces new orders and cancels, logs on again
 after a drop (`--reconnect`), and prints each order's outcome as the client last heard it. Its
-MsgSeqNum persists in `--state`, so a later run continues the session. It records no latencies:
-the rest of this section is still to build.
+MsgSeqNum persists in `--state`, so a later run continues the session. It records no latencies.
 
-- An Artio **initiator**, built from the same dictionary and engine code as the adapter. One or more
-  sessions.
-- **Paced:** a target rate, or a `<delayMicros> <count>` schedule. Every message has a **scheduled
-  send time**, so response time is measured from the schedule and not only from the actual send.
+**The measuring sender is a separate command, `fix perf`** (decided 2026-10-31 with the user);
+`load` stays the e2e's. Specified, then built, 2026-10-31; `e2e/run-perf.sh` runs it against
+most-exchange (Measurements A1–A2):
+
+- An Artio **initiator**, built from the same dictionary and engine code as the adapter, with **two
+  sessions of two participants** on one engine and one thread: the **maker** sends the passive orders
+  and the cancels, the **taker** the crosses (`--taker-sender`, `--taker-user`, `--taker-password`).
+  most-exchange prevents a participant trading with itself (an order's SMP id defaults to its
+  participant), so one session's cross is cancelled, never filled: found 2026-10-31 in the first
+  baseline, where every cross came back CANCELED.
+- **The schedule is fixed before the first send.** Message *i*'s scheduled send time is
+  *S<sub>i</sub>* = *T*<sub>0</sub> + *offset<sub>i</sub>*, from `--rate N` (*offset<sub>i</sub>* =
+  *i* · 10⁹ / *N* ns) or `--schedule "<delayMicros> <count>[,<delayMicros> <count>...]"`, steps run
+  in order, the first message at offset 0. It is never re-based on an actual send: a sender behind
+  its schedule sends at once, back to back, until it has caught up, and its lateness counts.
   Coordinated omission is never hidden (`perf-claim`).
-- **Order mix:** passive new orders, cancels of them, and crossing orders that trade, in configured
-  proportions, so every report type is exercised.
-- A busy-spinning send thread, which may be pinned. It records, per message: `clOrdId`, the
-  scheduled and actual send time, and each 35=8's arrival with its ExecType and OrdStatus. These go
-  to a binary, memory-mapped log, so the sender does no formatting while it runs.
+- **The deviation from the schedule is measured and attributed.** Per message: *S*, the first
+  attempt *A* (just before the first `trySend`), the last attempt *T* (just before the `trySend`
+  Artio took), the send *Z* (just after it), and the number of refusals between. With *Z*<sub>−1</sub>
+  the previous message's send, its **lateness** *Z* − *S* is four parts, each ≥ 0, which sum to it:
+  - **queued** = max(*S*, *Z*<sub>−1</sub>) − *S*: waiting behind the message before it;
+  - **sender late** = *A* − max(*S*, *Z*<sub>−1</sub>): the sender's thread was elsewhere (a poll,
+    a GC, the OS, deciding the message), so the generator was the bottleneck;
+  - **pushed back** = *T* − *A*: Artio refused it. That is the client's own engine or anything after
+    it (the TCP connection, the adapter) not keeping up;
+  - **send cost** = *Z* − *T*: the `trySend` that took it, Artio encoding the message on the sender's
+    thread. The generator's own cost, about a microsecond (found 2026-10-31: before it was split
+    out, every message showed that much "pushed back" with no refusal).
+
+  Queueing is inherited, so the report also traces it to its root. Each message's lateness *L* is
+  split into a **sender share** and a **system share**: *L*<sup>sender</sup> = sender late + send
+  cost + queued · *L*<sub>−1</sub><sup>sender</sup> / *L*<sub>−1</sub>, and *L*<sup>system</sup> =
+  pushed back + queued · *L*<sub>−1</sub><sup>system</sup> / *L*<sub>−1</sub> (queued ≤
+  *L*<sub>−1</sub>, because *S* ≥ *S*<sub>−1</sub>). Response time is then lateness + service time,
+  every part of it named: the generator, the system under test, or the round trip.
+- **Order mix**, `--mix passive=P,cross=C,cancel=X` in percent, so every report type is exercised.
+  The symbol is assumed to be the sender's alone: another participant's orders in the band change
+  what trades.
+  - A **passive** order rests: a buy at `--mid` − *k* · `--tick`, a sell at `--mid` + *k* · `--tick`,
+    *k* from 1 to `--levels`, alternating sides, `--qty` each.
+  - A **crossing** order takes the sender's best resting order on the other side (price, then time),
+    at its price, for half its quantity rounded up or what remains of it, whichever is less: the
+    first cross of a resting order is a partial fill of it and a fill of the aggressor, the next fills
+    it. Crosses alternate buy and sell; one with nothing opposite takes the other side.
+  - A **cancel** cancels the sender's oldest resting order.
+  - The sender's book is predicted from what it sends, not what it has heard, so the mix does not
+    wait for acks. A cross or cancel with nothing to act on is sent as a passive order and counted.
+- **ClOrdID is `<prefix><index>`**, the message's index in the run, cancels included. A received
+  message names its request by tag 11 (and 41), and the log stores no strings.
+- **One thread** sends and polls the library (Artio's library is single-threaded), busy-spinning.
+  `--busy-spin` also spins the client's engine and media driver. Pinning is the OS's (`taskset`);
+  the JVM does not pin.
+- **The log** is a memory-mapped file, `--log FILE`, sized for the run before the first send: a
+  header (format version; the wall clock and `nanoTime` at *T*<sub>0</sub>; the arguments and the
+  provenance, as text), then fixed-size records, one per message sent (index, kind, side, the index
+  it acts on, *S*, *A*, *Z*, the send cost *Z* − *T*, refusals) and one per 35=8, 35=9, 35=3 and 35=j received (its arrival,
+  the indexes in 11 and 41, MsgType, ExecType, OrdStatus, PossDup, OrdStatusUnknown). Neither path
+  formats or allocates: the receive path reads those tags off the raw bytes. A full log stops
+  recording and says so in its trailer; it never drops a record silently. Every time is
+  `System.nanoTime()`, one clock. An arrival is when the library hands the message over, so the
+  client's own engine is inside every service time.
+- **A discard pass**, `--warmup N`: the first *N* messages of the schedule, in the log and flagged,
+  which the report leaves out of every series on the same cutoff (`perf-claim`).
 
 ### 10.2 The latency report
 
-- Reads the sender's log, and optionally the adapter's trace ring (§9.2).
-- Per outcome: new ack, partial fill, fill, cancel ack, reject, cancel reject. For each, both
-  **service time** (from the actual send) and **response time** (from the scheduled send).
-- **Output:** one self-contained HTML file, with no external requests, containing:
-  - the HDR percentile distribution, on a log scale;
-  - the CDF;
-  - latency against time, as a scatter per outcome, with throughput beside it;
-  - a table of percentiles.
+`fix report --log LOG [--compare LOG2] [--out DIR] [--exchange TEXT]`. Specified, then built,
+2026-10-31, after the
+FIX↔Kafka gateway's `analyze_trace.py`. Reads the sender's log, and later the adapter's trace ring
+(§9.2), which is not built.
 
-  Also `.hgrm` and CSV, and a comparison of two runs.
-- Every report carries its provenance header: commit, machine, JVM or native, rate offered and
-  achieved, and exchange configuration. That is the row `docs/Measurements.md` needs.
+- **Each message received is attributed to the request that caused it:**
+  - new ack (150=0), reject (150=8), the aggressor's partial fill and fill (150=F, 39=1 or 2), cancel
+    ack (150=4), and cancel reject (35=9) to the request named by tag 11;
+  - a **resting** order's partial fill and fill to the crosses that targeted it, in order: each to
+    the earliest of them not yet matched that was sent before it (the FIX↔Kafka gateway's greedy
+    pairing). Its own send is long past, and timing it from there measures the book, not the path.
+    These are outcomes of their own. (Found 2026-10-31: matched to the *latest* cross instead, the
+    first cross's fill, arriving just after the second was sent, was timed from the second at 2 µs.)
+  - A PossDup, an OrdStatusUnknown=Y, a restatement, a 35=3 and a 35=j are counted, not timed, and
+    so is a message that names no request of the run: never dropped without a count.
+  - The discard pass's requests are cut from every series at once: the latencies, the lateness and
+    the throughput.
+- **Per outcome**, both **service time** (from *Z*) and **response time** (from *S*); per request
+  kind, the lateness with its three parts and its two shares (§10.1), and the refusals.
+- **Output**, in `--out`: `report.html`, one self-contained file with inline SVG and an inline
+  script for the hover layer only (every value it shows is also in a table), no external requests,
+  legible in light and dark and in print:
+  - the provenance header (below) and a summary line: offered and achieved rate, every outcome's
+    service and response p50 and p99, and the lateness by share;
+  - tables of percentiles (p50, p90, p99, p99.9, p99.99, max, count) per outcome, service and
+    response;
+  - the pacing table: lateness and each part and share, per request kind;
+  - the throughput table per stream (scheduled, sent, each outcome's arrivals): count, span, rate,
+    and the gap between events at p50, p99 and max. A stage that stalls keeps its mean rate while its
+    gap p99 and max blow out;
+  - the HDR percentile distribution, on a log scale; the CDF; a log-binned histogram;
+  - latency against time, a scatter per outcome, with throughput beside it; and the lateness
+    against time by share.
+
+  Also an `.hgrm` per outcome and series, and a CSV of every timed sample. With `--compare`, the two
+  runs' percentiles side by side with the change, their distributions overlaid, and a warning where
+  their provenance differs.
+- **The provenance header**: commit (`git describe --dirty`), machine (host, OS, CPUs), JVM, the
+  sender's arguments, the rate offered and achieved, and the exchange configuration, which the
+  sender cannot know and `--exchange` states. It prints the row `docs/Measurements.md` needs.

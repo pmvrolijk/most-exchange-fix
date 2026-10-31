@@ -1,5 +1,5 @@
 // Test tooling (docs/Design.md §10): `fix`, an Artio initiator on the adapter's dictionary, which the
-// e2e scripts drive. Its latency log and the HTML report are still to come (Status §3, item 6).
+// e2e scripts drive; `fix perf`, the measuring sender, and `fix report`, its latency report.
 
 plugins {
     application
@@ -7,6 +7,7 @@ plugins {
 
 dependencies {
     implementation(project(":fix-session"))
+    implementation(libs.hdrhistogram)
     testImplementation(testFixtures(project(":fix-session")))
 }
 
