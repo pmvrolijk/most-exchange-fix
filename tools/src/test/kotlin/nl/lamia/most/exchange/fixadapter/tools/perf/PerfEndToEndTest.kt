@@ -87,8 +87,7 @@ class PerfEndToEndTest {
 
     private fun perf(vararg extra: String): Pair<Perf, Int> {
         val argv = listOf("--symbol", "TEST", "--mid", "100", "--tick", "0.01", "--levels", "5", "--qty", "10",
-            "--log", File(dir, "run.log").path, "--settle", "0.5", "--drain", "10",
-            "--taker-sender", TestSessions.CLIENT2, "--taker-user", "client2", "--taker-password", TestSessions.SECRET2) + extra
+            "--log", File(dir, "run.log").path, "--settle", "0.5", "--drain", "10") + extra
         val perf = Perf(Args.parse(argv, setOf("busy-spin")), argv.joinToString(" "))
         val logon = Logon("localhost", port, TestSessions.CLIENT1, TestSessions.ADAPTER, "client1", TestSessions.SECRET1, reset = true)
         return perf to perf.run(File(dir, "client"), logon)
@@ -134,7 +133,7 @@ class PerfEndToEndTest {
         assertTrue(perf.senderAllocated in 0 until 16 * 1024, "the send thread allocated ${perf.senderAllocated} bytes")
     }
 
-    /** A FIX 4.4 limit order book, from the specification, with most-exchange's self-match prevention per session. */
+    /** A FIX 4.4 limit order book, from the specification, with most-exchange's self-match prevention by SMP id. */
     private class Venue(acceptor: FixAcceptor) : AutoCloseable {
         private val claims = RoleClaims(acceptor.sessions, Role.ORDER_ENTRY) { s, reply -> error("claim of ${s.name} failed: ${reply.state()}") }
         private val library: FixLibrary = FixLibrary.connect(acceptor.libraryConfiguration(claims).apply {
@@ -142,8 +141,11 @@ class PerfEndToEndTest {
         })
         private val outbox = ArrayDeque<Pair<Session, Encoder>>()
 
-        /** An order and the session it came on: its reports go back there, whoever traded with it. */
-        private class Order(val session: Session, val clOrdId: String, val side: Char, val price: BigDecimal, val qty: Long) {
+        /**
+         * An order, the session it came on (its reports go back there, whoever traded with it), and its
+         * SMP id: its 2362, else its session's, as most-exchange's defaults to the participant.
+         */
+        private class Order(val session: Session, val smpId: String, val clOrdId: String, val side: Char, val price: BigDecimal, val qty: Long) {
             var leaves = qty
             val cum get() = qty - leaves
         }
@@ -175,16 +177,16 @@ class PerfEndToEndTest {
 
         private fun onNewOrder(session: Session, m: FixMessage) {
             val side = m[54]!![0]
-            val o = Order(session, m[11]!!, side, BigDecimal(m[44]!!), BigDecimal(m[38]!!).longValueExact())
+            val o = Order(session, m[2362] ?: "session ${session.id()}", m[11]!!, side, BigDecimal(m[44]!!), BigDecimal(m[38]!!).longValueExact())
             report(o, '0', '0')
             val book = if (side == '1') asks else bids
             while (o.leaves > 0 && book.isNotEmpty()) {
                 val best = book[0]
                 val crosses = if (side == '1') best.price <= o.price else best.price >= o.price
                 if (!crosses) break
-                if (best.session === o.session) {
-                    // Self-match prevention, as most-exchange's default: one participant never trades with
-                    // itself, and the aggressor is cancelled.
+                if (best.smpId == o.smpId) {
+                    // Self-match prevention, as most-exchange's default: two orders of one SMP id never
+                    // trade, and the aggressor is cancelled.
                     o.leaves = 0
                     report(o, '4', '4')
                     return

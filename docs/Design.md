@@ -481,9 +481,13 @@ only: the `expireDate` of a day order (59=0 or absent).
     session; the client subscribes again and gets a fresh 35=W. Order-entry sessions stay
     persistent. Rejected: persistent numbers with 35=W/X/y gap-filled on replay, which keeps
     sequence state that serves market data nothing.
-  - **One engine, as decided 2026-10-03.** Its archive records every 35=W/X too; the coupling with
-    the order path is §8.22, measured before market data is relied on under load. Rejected for now:
-    a second Artio engine for market data.
+  - ~~**One engine, as decided 2026-10-03.**~~ **Superseded 2026-10-31 (the user, on §8.22's
+    measurement): market data has its own engine, on its own port, with an archive at fileSyncLevel
+    0.** The shared engine's fsynced archive recorded every 35=W/X, and four feed sessions cost order
+    entry ~2–2.5 ms p50, 5–8 ms p99 and ~8% of its capacity (Measurements A3). Artio archives an
+    engine's messages all or none, so the only way out of order entry's archive is another engine.
+    fileSyncLevel 0 loses nothing: market-data sessions keep nothing across a Logon. A participant
+    gets one port for order entry and another for market data. Not yet built (Status §3).
   - **The feeds are the node file's**: the L1, L2 and snapshot channels and stream ids, as
     most-exchange's own processes configure them (`md.l1`, `md.l2`, `md.snapshot`). The directory
     carries order-entry routes only.
@@ -1406,6 +1410,14 @@ The archive's recorded position (§6.2) then means durable.
     market data can delay report delivery. To measure with the latency tooling (§10) under a market
     data load before relying on it; the remedy, if needed, is a second engine for market data, with
     its own port and an unsynced archive.
+    - **Measured 2026-10-31** (Measurements A3): four market-data sessions taking ~4,000 35=X/s add
+      ~2–2.5 ms at p50 and 5–8 ms at p99 to order entry at 1,000–3,000/s, and take ~8% of its
+      saturated capacity (4,255 → 3,922 requests/s). On the laptop, where the fsync dominates (§8.24).
+      Artio archives an engine's messages all or none, so market data cannot be kept out of order
+      entry's archive on a shared engine. The user expects a dedicated market-data session per
+      participant (§8.26).
+    - **Decided 2026-10-31 (the user): market data gets its own engine**, its own port, an archive at
+      fileSyncLevel 0 (§4). Not yet built.
 
 23. **Market data's path allocates, in the SDK's book** (found 2026-10-30, slice 4). `AggregatedBook`
     stores a `Level` object per update and its `levels()` returns a new list, which the 35=X for
@@ -1414,7 +1426,8 @@ The archive's recorded position (§6.2) then means durable.
 
 24. **The fsynced archive caps the adapter** (found 2026-10-31, Measurements A1–A2, X1). On the
     developer laptop (macOS, APFS), in the e2e topology, the adapter at fileSyncLevel 1 answers 1,000
-    orders/s at a 15 ms p50 and saturates between 3,500 and 5,400 requests/s, while the exchange
+    orders/s at a 15 ms p50 and saturates at ~4,250 requests/s (A3e, a quiet machine; 3,500–5,400 in
+    A1, a loaded one), while the exchange
     behind it keeps up at 10,000/s with a p50 under 0.2 ms. At fileSyncLevel 0, nothing else changed,
     the p50 at 1,000/s is 1.7 ms and 5,000/s keeps up. Both waits are this design's: a 35=D goes out
     only once the archive has it (§6.1, CLAUDE.md 11), and a `reportSeq` is consumed only behind it
@@ -1423,6 +1436,34 @@ The archive's recorded position (§6.2) then means durable.
     `fsync`); where in the adapter the rest of the gap to the gateway goes (the trace ring, §9.2);
     and whether the archive's fsyncs batch under load as the design assumed, or one stream's sync
     serialises the other's.
+    - **The user's frame (2026-10-31):** production runs on Linux, where the fsync costs less, and a
+      run on a Linux host is planned. One connection offered 300–1,000 orders/s is fine; what is worth
+      reaching is **3,500–5,000 requests/s through one adapter**, at fileSyncLevel 1.
+
+25. **An order-entry throttle, optional, per session** (raised by the user 2026-10-31). A configured
+    cap on a session's request rate, so that one connection cannot take the adapter's capacity
+    (§8.24). Not designed: what a request over the cap gets (a reject with its reason, or held), and
+    whether the cap is per session or per participant.
+
+26. ~~**Order entry and market data on one session**~~ **Scrapped 2026-10-31 (the user): order
+    entry and market data are on separate ports** (§4, §8.22), so one session cannot carry both.
+    The record as raised, the same day: Today a session
+    has one role (§2), so a participant runs an order-entry session and a separate market-data one,
+    which the user expects of most: a dedicated market-data session feeding a pricing service. A
+    lower-tier participant may want one session for both, for convenience. Not built, and not a
+    configuration change: Artio gives a session to one library, and the two backends are two
+    libraries, so one library would have to serve both roles for such a session. Separate sessions
+    still share one engine and its fsynced archive (§8.22), which the expected deployment, a busy
+    market-data session per participant, makes more pressing.
+
+27. **A dedicated adapter per participant, which may hold several of its sessions** (the user's
+    deployment, 2026-10-31). Each participant gets its own adapter, for isolation, and may have more
+    than one order-entry session on it. Today the configuration refuses two order-entry sessions for
+    one participant, because reports route back to one session per participant (§2, §3.3): a 35=8
+    goes to the participant's session, and the `reportSeq` ledger is the participant's. Several
+    sessions need a decision first: which session a report goes to (the one that sent the order,
+    found from the store's row), what a mass status (35=AF) on one session covers, and what a
+    session that is logged out while another is logged on is owed. A `decision-fork` before code.
 
 ## 9. Control and metrics
 
@@ -1485,12 +1526,13 @@ MsgSeqNum persists in `--state`, so a later run continues the session. It record
 `load` stays the e2e's. Specified, then built, 2026-10-31; `e2e/run-perf.sh` runs it against
 most-exchange (Measurements A1–A2):
 
-- An Artio **initiator**, built from the same dictionary and engine code as the adapter, with **two
-  sessions of two participants** on one engine and one thread: the **maker** sends the passive orders
-  and the cancels, the **taker** the crosses (`--taker-sender`, `--taker-user`, `--taker-password`).
-  most-exchange prevents a participant trading with itself (an order's SMP id defaults to its
-  participant), so one session's cross is cancelled, never filled: found 2026-10-31 in the first
-  baseline, where every cross came back CANCELED.
+- An Artio **initiator**, built from the same dictionary and engine code as the adapter, **one
+  session**. most-exchange prevents an order trading with another of the same SMP id, which defaults
+  to the participant: found 2026-10-31 in the first baseline, where every cross came back CANCELED.
+  So **a passive order carries SelfMatchPreventionID (2362) 1 and a cross 2** (`--smp-ids 1,2`), and
+  they trade (the user's suggestion, 2026-10-31). ~~Two sessions of two participants, a maker and a
+  taker~~ (built the same day, superseded: two connections also let a cross overtake the order it
+  targets).
 - **The schedule is fixed before the first send.** Message *i*'s scheduled send time is
   *S<sub>i</sub>* = *T*<sub>0</sub> + *offset<sub>i</sub>*, from `--rate N` (*offset<sub>i</sub>* =
   *i* · 10⁹ / *N* ns) or `--schedule "<delayMicros> <count>[,<delayMicros> <count>...]"`, steps run
@@ -1528,6 +1570,10 @@ most-exchange (Measurements A1–A2):
   - A **cancel** cancels the sender's oldest resting order.
   - The sender's book is predicted from what it sends, not what it has heard, so the mix does not
     wait for acks. A cross or cancel with nothing to act on is sent as a passive order and counted.
+  - **The prediction misses one case, by design of the adapter** (found 2026-10-31): a cancel of an
+    order the exchange has not yet acknowledged is held until it is (§3.3), so a cross sent after the
+    cancel can reach the book first and trade with the order the cancel was for. The report counts
+    that fill as one no cross targeted: one or two a run of 10,000.
 - **ClOrdID is `<prefix><index>`**, the message's index in the run, cancels included. A received
   message names its request by tag 11 (and 41), and the log stores no strings.
 - **One thread** sends and polls the library (Artio's library is single-threaded), busy-spinning.

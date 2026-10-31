@@ -7,6 +7,7 @@ import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderCancelRequestEncode
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderMassStatusRequestEncoder
 import nl.lamia.most.exchange.fixadapter.codecs.builder.OrderStatusRequestEncoder
 import nl.lamia.most.exchange.fixadapter.tools.perf.Perf
+import nl.lamia.most.exchange.fixadapter.tools.perf.RawFix
 import nl.lamia.most.exchange.fixadapter.tools.report.Report
 import uk.co.real_logic.artio.fields.UtcTimestampEncoder
 import java.io.File
@@ -38,16 +39,16 @@ Measuring (Design.md §10):
   perf         --symbol S --mid P --log FILE (--rate PER_SECOND --count N | --schedule "<delayMicros> <count>[,...]")
                [--mix passive=60,cross=20,cancel=20] [--tick 0.01] [--levels 5] [--qty 10] [--warmup N]
                [--prefix ID] [--drain SECONDS] [--settle SECONDS] [--busy-spin] [--seed N] [--exchange TEXT]
-               [--log-records N] --taker-sender ID --taker-user NAME (--taker-password S | --taker-password-file F)
-               Paced new orders, crosses and cancels; every send and report to a memory-mapped log. The
-               connection options are the maker's (passive orders, cancels); the taker, another
-               participant, sends the crosses: one participant cannot trade with itself
+               [--log-records N] [--smp-ids 1,2]
+               Paced new orders, crosses and cancels; every send and report to a memory-mapped log.
+               Passive orders and crosses carry different SelfMatchPreventionIDs (2362), so the
+               participant's crosses trade with its own resting orders
   report       --log FILE [--compare FILE] [--out DIR] [--exchange TEXT]     (no connection options)
                The latency report: report.html, .hgrm and CSV in --out (default: beside the log)
 
 Market data, as a market-data session (it starts at MsgSeqNum 1 at every Logon, so these log on with 141=Y):
   securities   [--id ID] [--follow SECONDS]                                                    35=x, all securities
-  md           --symbol S[,S...] [--depth 0|1] [--entries bid,offer,trade] [--snapshot] [--id ID] [--follow SECONDS]
+  md           --symbol S[,S...] [--depth 0|1] [--entries bid,offer,trade] [--snapshot] [--id ID] [--follow SECONDS] [--quiet]
                35=V: snapshot plus updates, unless --snapshot
 
 Every application message received is printed on one line (ExecutionReport ... ExecType=TRADE ...).
@@ -62,7 +63,7 @@ fun main(argv: Array<String>) {
     }
     val command = argv[0]
     val args = try {
-        Args.parse(argv.drop(1), flags = setOf("reset", "verbose", "snapshot", "busy-spin"))
+        Args.parse(argv.drop(1), flags = setOf("reset", "verbose", "snapshot", "busy-spin", "quiet"))
     } catch (e: IllegalArgumentException) {
         System.err.println("fix: ${e.message}")
         exitProcess(2)
@@ -118,7 +119,9 @@ private fun run(command: String, args: Args, argv: List<String>): Int {
         "md" -> marketDataRequest(args)
         else -> throw IllegalArgumentException("unknown command: $command\n$USAGE")
     }
+    val quiet = args.flag("quiet")
     args.rejectUnused()
+    if (quiet) return quietly(state, logon, encoder, followMs)
     FixClient(state) { m -> if (!Describe.isSessionLevel(m)) println(Describe.line(m)) }.use { client ->
         client.logon(logon)
         println("logged on as ${logon.senderCompId}")
@@ -128,9 +131,33 @@ private fun run(command: String, args: Args, argv: List<String>): Int {
     return 0
 }
 
+/**
+ * `--quiet`: counts what arrives by MsgType instead of printing it, so the client costs the machine
+ * little (run-perf.sh's market-data sessions, Design.md §8.22). Says when the first 35=W arrives,
+ * then the counts at the end.
+ */
+private fun quietly(state: File, logon: Logon, encoder: uk.co.real_logic.artio.builder.Encoder?, followMs: Long): Int {
+    val counts = LongArray(128)
+    val fix = RawFix("\u0000")
+    FixClient(state, false, RawHandler { buffer, offset, length ->
+        fix.parse(buffer, offset, length)
+        if (!fix.longMsgType) {
+            val type = fix.msgType.toInt() and 0x7f
+            if (counts[type]++ == 0L && type == 'W'.code) println("first 35=W")
+        }
+    }).use { client ->
+        client.logon(logon)
+        println("logged on as ${logon.senderCompId}")
+        encoder?.let(client::send)
+        client.pollFor(followMs)
+    }
+    println("received " + "WXYy83j".filter { counts[it.code] > 0 }.map { "35=$it ${counts[it.code]}" }.ifEmpty { listOf("nothing") }.joinToString(", "))
+    return 0
+}
+
 /** The command line for a log's header, without the password. */
 private fun redacted(argv: List<String>): String =
-    argv.mapIndexed { i, a -> if (i > 0 && argv[i - 1] in setOf("--password", "--taker-password")) "***" else a }.joinToString(" ")
+    argv.mapIndexed { i, a -> if (i > 0 && argv[i - 1] == "--password") "***" else a }.joinToString(" ")
 
 private val timestamp = UtcTimestampEncoder()
 

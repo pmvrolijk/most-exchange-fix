@@ -6,6 +6,7 @@
 # The sourcing script sets ROOT, ME, RUN, LOGS, AERON_DIR and FIX_PORT, and SECURITIES (default AAPL)
 # and MAX_ORDERS if it needs others; then calls start_exchange and start_adapter. Participants 7 and 8
 # are the adapter's sessions; 20 and 21 are for `most load` straight to the gateway (run-perf.sh).
+# FEED1 is the e2e's market-data session; FEED2-4 are more, for run-perf.sh's market-data leg.
 # FIX_FILE_SYNC_LEVEL (default 1) and FIX_IDLE_STRATEGY (default backoff) are the adapter's, for a
 # measured diff only: below 1 the adapter's persistence argument does not hold (CLAUDE.md 7, 11).
 
@@ -186,6 +187,21 @@ session.M1.targetCompId=FEED1
 session.M1.username=feed1
 session.M1.passwordSha256=$(sha256 "feed1-secret")
 session.M1.role=market-data
+session.M2.senderCompId=MOST
+session.M2.targetCompId=FEED2
+session.M2.username=feed2
+session.M2.passwordSha256=$(sha256 "feed2-secret")
+session.M2.role=market-data
+session.M3.senderCompId=MOST
+session.M3.targetCompId=FEED3
+session.M3.username=feed3
+session.M3.passwordSha256=$(sha256 "feed3-secret")
+session.M3.role=market-data
+session.M4.senderCompId=MOST
+session.M4.targetCompId=FEED4
+session.M4.username=feed4
+session.M4.passwordSha256=$(sha256 "feed4-secret")
+session.M4.role=market-data
 EOF
 
 cat > "$RUN/adapter.properties" <<EOF

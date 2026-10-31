@@ -10,7 +10,9 @@ import io.aeron.logbuffer.ControlledFragmentHandler.Action
 import nl.lamia.most.exchange.fixadapter.codecs.FixDictionaryImpl
 import org.agrona.CloseHelper
 import org.agrona.DirectBuffer
+import org.agrona.concurrent.BackoffIdleStrategy
 import org.agrona.concurrent.BusySpinIdleStrategy
+import org.agrona.concurrent.IdleStrategy
 import uk.co.real_logic.artio.builder.Encoder
 import uk.co.real_logic.artio.engine.EngineConfiguration
 import uk.co.real_logic.artio.engine.FixEngine
@@ -51,7 +53,7 @@ fun interface RawHandler {
  *
  * Single-threaded: call everything from the thread that made it.
  */
-class FixClient(stateDir: File, busySpin: Boolean, private val onRaw: RawHandler) : AutoCloseable {
+class FixClient(stateDir: File, private val busySpin: Boolean, private val onRaw: RawHandler) : AutoCloseable {
     constructor(stateDir: File, onMessage: (FixMessage) -> Unit) :
         this(stateDir, false, RawHandler { buffer, offset, length -> onMessage(FixMessage.parse(buffer.getStringWithoutLengthAscii(offset, length))) })
 
@@ -116,19 +118,23 @@ class FixClient(stateDir: File, busySpin: Boolean, private val onRaw: RawHandler
 
     fun poll(): Int = library.poll(10)
 
+    // Waiting, the client backs off rather than holding a core, unless it was asked to spin: a feed
+    // that spins is a CPU load the measured adapter wears as its own (Design.md §8.22).
+    private val idle: IdleStrategy = if (busySpin) BusySpinIdleStrategy() else BackoffIdleStrategy()
+
     /** Polls until [condition], or throws after [timeoutMs] naming [what]. */
     fun pollUntil(what: String, timeoutMs: Long = 15_000L, condition: () -> Boolean) {
         val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs)
         while (!condition()) {
             check(System.nanoTime() < deadline) { "timed out waiting for $what" }
-            if (poll() == 0) Thread.onSpinWait()
+            idle.idle(poll())
         }
     }
 
     /** Polls for [ms] whatever happens. */
     fun pollFor(ms: Long) {
         val until = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(ms)
-        while (System.nanoTime() < until) if (poll() == 0) Thread.onSpinWait()
+        while (System.nanoTime() < until) idle.idle(poll())
     }
 
     fun logon(logon: Logon): Session {

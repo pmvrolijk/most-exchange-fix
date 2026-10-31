@@ -635,3 +635,19 @@ and `run-e2e.sh` passed on it twice).
   10,000/s; the adapter at fileSyncLevel 0, 1.7 ms at 1,000/s and 0.36 ms at 5,000/s. The sender's
   own lateness p99 stayed under 25 µs. Recorded as Design §8.24; nothing decided.
 - *Not done:* §8.22's run with a market-data subscriber; the trace ring; the 2.25 s gap at 10,000/s.
+
+**§8.22's run, the same day** (Measurements A3, X2; Design §4, §8.22).
+- *Built:* `run-perf.sh`'s `PERF_MD=1` leg, each rate again on its own security while FEED1–4
+  subscribe to its whole book, and its comparison report; `fix md --quiet`.
+- *Three attempts not recorded, each confounded by the machine:* the feed clients printed every
+  message; then each spun a core while idle (the `fix` client now backs off unless asked to spin);
+  then IntelliJ took ~4 cores. The user closed IntelliJ and Firefox.
+- *Measured, quiet:* market data on order entry's engine adds ~2–2.5 ms p50 and 5–8 ms p99 at 1,000
+  and 3,000/s, and takes ~8% of the saturated capacity (4,255 → 3,922 requests/s). Also: A1's
+  saturation figures were the loaded machine's; 3,000/s keeps up.
+- *Decided (the user):* market data gets its own engine, port and an archive at fileSyncLevel 0;
+  one session for both roles is scrapped; a dedicated adapter per participant (§8.27, a decision
+  first); the sender's crosses carry another SelfMatchPreventionID instead of a taker session.
+- *The check of the last:* a mutation giving crosses the passive orders' SMP id is caught; a real run
+  at 1,000/s filled every cross on one session. The one or two fills a run that no cross targeted
+  are the adapter holding a cancel of an unacknowledged order (Design §10.1), traced in the log.

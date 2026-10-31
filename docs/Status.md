@@ -6,11 +6,30 @@ read this, not the handover. [`Handover.md`](Handover.md) is the archive of work
 Last updated 2026-10-31. **Both backends are built, `bin/adapter` runs them, and the adapter has
 its first latency baseline: the fsynced archive is its bottleneck.** `fix perf` and `fix report`
 (§3 item 6) measured it against most-exchange's real processes beside `most load` straight to the
-gateway, the same day (Measurements A1–A2, X1): at fileSyncLevel 1 the adapter answers 1,000/s at a
-15 ms p50 and saturates at 3,500–5,400 requests/s; the gateway alone keeps up at 10,000/s under
-0.2 ms; at fileSyncLevel 0 the adapter keeps up at 5,000/s at 0.36 ms. Open as Design §8.24, not
-decided. The laptop's figures only (macOS fsync), and the machine was not idle.
-**Next: §3 item 6's two leftovers, §8.22's run and the trace ring, then §8.24.**
+gateway, the same day (Measurements A1–A3, X1–X2): at fileSyncLevel 1 the adapter answers 1,000 and
+3,000/s at a 15–18 ms p50 and saturates at ~4,250 requests/s on a quiet machine; the gateway alone
+keeps up at 10,000/s under 0.2 ms; at fileSyncLevel 0 the adapter keeps up at 5,000/s at 0.36 ms.
+Open as Design §8.24, not decided. The laptop's figures only (macOS fsync).
+**§8.22 measured** (A3): four market-data sessions on the same engine add ~2–2.5 ms p50 and 5–8 ms
+p99 to order entry and take ~8% of its capacity.
+
+Decided 2026-10-31 (the user, on A3):
+- **Market data gets its own engine**, its own port, an archive at fileSyncLevel 0 (Design §4,
+  superseding "one engine"). Not yet built.
+- **One session for both roles is scrapped** (§8.26): order entry and market data are on separate
+  ports.
+- **The sender's crosses carry a SelfMatchPreventionID** (2362) other than its passive orders', on
+  one session, instead of a second participant as taker. Not yet built.
+- The deployment: **a dedicated adapter per participant**, which may hold several of its sessions.
+  Several order-entry sessions for one participant are refused today; Design §8.27 is the decision
+  that comes first.
+**Next: market data's own engine (decided below), then the trace ring, then §8.24 and §8.27.**
+
+The user's frame, 2026-10-31: production is Linux, and a Linux run is planned; 300–1,000 orders/s
+per connection is fine, and 3,500–5,000/s through one adapter is the target worth reaching. Raised,
+not designed: an optional order-entry throttle (Design §8.25), and both roles on one session for
+lower-tier participants (§8.26). A participant is expected to run a dedicated market-data session
+beside its order-entry one, which makes §8.22 (one engine, one fsynced archive) more pressing.
 
 Decided 2026-10-31 (Design §10; with the user):
 - **`fix perf` is its own command**; `load` stays the e2e's.
@@ -528,10 +547,21 @@ they decided whether `order-entry`'s persistence design stood.)
      cancelled until the taker was a second participant.
    - **Measured** (Measurements A1–A2, X1): the adapter, not the exchange, is the bottleneck, and the
      archive's fsync is most of it (Design §8.24).
-   - **Still open:** (a) **§8.22's run**: the baseline at 1,000/s with a market-data client subscribed
-     to the same securities, against A1a. (b) **The trace ring** (Design §9.2), to say where the rest
-     of the adapter's time goes; `fix report` reads it beside the sender's log. (c) The 2.25 s gap in
-     every stream at 10,000/s (A1c), unexplained. (d) More than two sessions in the sender.
+   - ~~**§8.22's run**~~ **Done 2026-10-31** (Measurements A3, `PERF_MD=1`): market data on order
+     entry's engine costs it ~2–2.5 ms p50, 5–8 ms p99 and ~8% of its capacity. Decided: market data
+     gets its own engine (Design §4). Three earlier attempts were confounded by the machine (the
+     feed clients' CPU, then IntelliJ) and are not recorded; `fix md --quiet` and an idle client
+     that backs off came of them.
+   - **Also 2026-10-31:** the sender is one session again, its crosses carrying another
+     SelfMatchPreventionID (the user's suggestion), superseding the maker and taker.
+   - **Still open:** (a) **The trace ring** (Design §9.2), to say where the adapter's time goes;
+     `fix report` reads it beside the sender's log. (b) The 2.25 s gap in every stream at 10,000/s
+     (A1c), unexplained, and taken on a loaded machine.
+8a. **Market data's own engine** (Design §4, decided 2026-10-31): a second acceptor in the adapter
+   process, its own port, directories and an archive at fileSyncLevel 0, holding the market-data
+   sessions; order entry's keeps the order-entry ones. The `fix.md.*` keys gain the port and
+   directories; `e2e/exchange.sh` and `run-perf.sh` the second port. Then the A3 pairs again: the
+   coupling should be gone.
 7. **`market-data`:** 35=y from the directory, then 35=V/W/X from `DepthFeedAssembler`. Started
    2026-10-30. Decided first (`decision-fork`, each the recommendation, Design §4): 35=X
    from a listener added to the SDK's assembler; market-data sessions transient (MsgSeqNum 1 at every

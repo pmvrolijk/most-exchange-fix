@@ -9,7 +9,6 @@ import nl.lamia.most.exchange.fixadapter.tools.RawHandler
 import org.agrona.DirectBuffer
 import uk.co.real_logic.artio.builder.Encoder
 import uk.co.real_logic.artio.fields.UtcTimestampEncoder
-import uk.co.real_logic.artio.session.Session
 import java.io.File
 import java.math.BigDecimal
 import java.net.InetAddress
@@ -44,20 +43,18 @@ class Perf(args: Args, private val argv: String) {
     private val seed = args.int("seed", 42)
     private val exchange = args.string("exchange", "")
     private val capacity = args.optional("log-records")?.toLong() ?: (schedule.count * 5L + 1024)
-    // The taker: crosses go on a second participant's session, or most-exchange's self-match
-    // prevention cancels them (Design.md §10.1).
-    private val takerSender = args.optional("taker-sender")
-    private val takerUser = args.optional("taker-user")
-    private val takerPassword = args.optional("taker-password") ?: args.optional("taker-password-file")?.let { File(it).readText().trim() }
+    // SelfMatchPreventionID (2362) on passive orders and on crosses: different, or most-exchange's
+    // self-match prevention cancels every cross on the participant's own orders (Design.md §10.1).
+    private val smpIds = args.string("smp-ids", "1,2").split(',').map {
+        it.trim().toLongOrNull()?.takeIf { v -> v > 0 } ?: throw IllegalArgumentException("--smp-ids takes two positive integers, not $it")
+    }
 
     init {
         require(warmup in 0 until schedule.count) { "--warmup must be below the message count" }
         require(prefixText.isNotEmpty() && !prefixText.last().isDigit()) { "--prefix must not end with a digit" }
         require(prefixText.length + 9 <= 20) { "--prefix is too long for a ClOrdID" }
         require(tick.signum() > 0) { "--tick must be above 0" }
-        require(mixPercent[1] == 0 || (takerSender != null && takerUser != null && takerPassword != null)) {
-            "crosses need a taker: --taker-sender, --taker-user and --taker-password (one participant cannot trade with itself)"
-        }
+        require(smpIds.size == 2 && smpIds[0] != smpIds[1]) { "--smp-ids takes two different ids: the passive orders', the crosses'" }
         require(mid.subtract(tick.multiply(BigDecimal(levels))).signum() > 0) { "--mid is too close to 0 for --levels ticks" }
         args.rejectUnused()
     }
@@ -77,14 +74,8 @@ class Perf(args: Args, private val argv: String) {
         var sent = 0
         FixClient(state, busySpin, sender).use { client ->
             sender.client = client
-            val taker = takerSender?.let {
-                client.logon(Logon(logon.host, logon.port, it, logon.targetCompId, takerUser!!, takerPassword!!, logon.reset))
-            }
-            val maker = client.logon(logon)
-            sender.maker = maker
-            sender.taker = taker ?: maker
-            println("perf: logged on as ${logon.senderCompId}${takerSender?.let { " (maker) and $it (taker)" } ?: ""}; " +
-                "${schedule.count} messages, $schedule, mix $mixSpec, warmup $warmup")
+            client.logon(logon)
+            println("perf: logged on as ${logon.senderCompId}; ${schedule.count} messages, $schedule, mix $mixSpec, warmup $warmup")
             if (warmup == 0) println("perf: no discard pass (--warmup): the first messages carry the cold JVM")
             client.pollFor(settleMs)
             val t0Wall = System.currentTimeMillis()
@@ -117,7 +108,8 @@ class Perf(args: Args, private val argv: String) {
         return listOf(
             "command" to "fix perf $argv",
             "started" to Instant.now().toString(),
-            "sender" to logon.senderCompId + (takerSender?.let { " (maker), $it (taker)" } ?: ""),
+            "sender" to logon.senderCompId,
+            "smpIds" to smpIds.joinToString(",") + " (passive, cross)",
             "target" to "${logon.host}:${logon.port} ${logon.targetCompId}",
             "symbol" to symbol,
             "schedule" to schedule.toString(),
@@ -143,9 +135,6 @@ class Perf(args: Args, private val argv: String) {
 
     private inner class Sender(private val log: PerfLogWriter) : PacedSender, RawHandler {
         lateinit var client: FixClient
-        lateinit var maker: Session
-        lateinit var taker: Session
-        private var preparedOn: Session? = null
         private val mix = OrderMix(schedule.count, levels, qty)
         private val random = Random(seed)
         private val prefix = prefixText.toByteArray(Charsets.US_ASCII)
@@ -156,6 +145,10 @@ class Perf(args: Args, private val argv: String) {
         private val newOrder = NewOrderSingleEncoder()
         private val cancel = OrderCancelRequestEncoder()
         private var prepared: Encoder = newOrder
+        private val smpPassive = smpIds[0].toString().toByteArray(Charsets.US_ASCII)
+        private val smpPassiveLength = smpPassive.size
+        private val smpCross = smpIds[1].toString().toByteArray(Charsets.US_ASCII)
+        private val smpCrossLength = smpCross.size
         private val fix = RawFix(prefixText)
         private val answered = BooleanArray(schedule.count)
         private var sentCount = 0
@@ -184,7 +177,6 @@ class Perf(args: Args, private val argv: String) {
                 cancel.transactTime(timestamp.buffer(), tsLength)
                 cancel.orderQtyData().orderQty(mix.targetQty, 0)
                 prepared = cancel
-                preparedOn = maker
             } else {
                 newOrder.reset()
                 newOrder.clOrdID(clOrdId, length)
@@ -194,12 +186,12 @@ class Perf(args: Args, private val argv: String) {
                 newOrder.instrument().symbol(symbolBytes)
                 newOrder.orderQtyData().orderQty(mix.orderQty, 0)
                 newOrder.price(midMantissa + mix.priceTicks * tickMantissa, scale)
+                newOrder.selfMatchPreventionID(if (mix.kind == Kind.CROSS) smpCross else smpPassive, if (mix.kind == Kind.CROSS) smpCrossLength else smpPassiveLength)
                 prepared = newOrder
-                preparedOn = if (mix.kind == Kind.CROSS) taker else maker
             }
         }
 
-        override fun trySend(): Boolean = preparedOn!!.trySend(prepared) > 0
+        override fun trySend(): Boolean = client.trySend(prepared)
 
         override fun sent(index: Int, scheduledNs: Long, firstAttemptNs: Long, lastAttemptNs: Long, sentNs: Long, refusals: Int) {
             var flags = 0

@@ -19,6 +19,14 @@ Quoting only the first hides the queueing at exactly the rates worth measuring.
 | X1a | 2026-10-31 | most-exchange `b5d457a` | as A1a | no (load avg ~10) | JVM 21.0.11 | as A1a, the same processes; **no adapter**: most-exchange's `most load` straight to the gateway, participants 20–21 | 1000/s | 1000/s | 1.09 / 3.37 ms | 1.29 / 3.68 ms | `run-perf.sh` direct leg, 18,000 measured; ack. Its pacing p99 436 µs |
 | X1b | 2026-10-31 | most-exchange `b5d457a` | as A1a | no (load avg ~10) | JVM 21.0.11 | as X1a | 5000/s | 5000/s | 219 / 575 µs | 227 / 590 µs | as X1a, 90,000 measured |
 | X1c | 2026-10-31 | most-exchange `b5d457a` | as A1a | no (load avg ~10) | JVM 21.0.11 | as X1a | 10000/s | 10000/s | 158 µs / 1.17 ms | 158 µs / 1.25 ms | as X1a, 180,000 measured |
+| A3a | 2026-10-31 | `0cd88a2`+ | as A1a | **yes** (IntelliJ and Firefox closed; load avg 2.7–6.9, the exchange's own spinning) | JVM 21.0.11 | as A1a; market data running, no subscriber | 1000/s | 1000/s | 15.11 / 20.56 ms | 15.11 / 20.56 ms | `PERF_MD=1 run-perf.sh`, the pair's first half; 18,000 measured. Sender late p99 3 µs |
+| A3b | 2026-10-31 | `0cd88a2`+ | as A1a | yes, as A3a | JVM 21.0.11 | as A3a, and **4 market-data sessions** (`fix md --quiet`, FEED1–4) subscribed to the run's whole book, depth 0: 24,072 35=X each, ~1,000/s each | 1000/s | 1000/s | 17.14 / 26.03 ms | 17.14 / 26.03 ms | straight after A3a, on a security of its own. p99.9 40.6 ms against A3a's 23.5 |
+| A3c | 2026-10-31 | `0cd88a2`+ | as A1a | yes, as A3a | JVM 21.0.11 | as A3a | 3000/s | 3000/s; keeps up | 17.71 / 24.31 ms | 17.71 / 24.32 ms | 54,000 measured |
+| A3d | 2026-10-31 | `0cd88a2`+ | as A1a | yes, as A3a | JVM 21.0.11 | as A3b: 72,042 35=X each | 3000/s | 3000/s; keeps up | 20.08 / 32.06 ms | 20.08 / 32.06 ms | straight after A3c |
+| A3e | 2026-10-31 | `0cd88a2`+ | as A1a | yes, load avg 4.6–7.6 | JVM 21.0.11 | as A3a | 5000/s | 5000/s sent; **4,255 requests/s answered** | saturated, 6.7 / 9.4 s | saturated | supersedes A1b's 3,530/s, taken at load avg ~10 |
+| A3f | 2026-10-31 | `0cd88a2`+ | as A1a | yes, as A3e | JVM 21.0.11 | as A3b: 117,815 35=X each | 5000/s | 5000/s sent; **3,922 requests/s answered** | saturated, 6.5 / 8.2 s | saturated | straight after A3e: market data takes ~8% of the capacity |
+| X2a | 2026-10-31 | most-exchange `b5d457a` | as A1a | yes, as A3a | JVM 21.0.11 | as X1a | 1000/s | 1000/s | 1.26 / 2.63 ms | 1.34 / 2.71 ms | the same run as A3a–A3d |
+| X2b | 2026-10-31 | most-exchange `b5d457a` | as A1a | yes, as A3a | JVM 21.0.11 | as X1a | 3000/s | 3000/s | 458 / 843 µs | 466 / 852 µs | as X2a |
 
 ### What A1–A2 and X1 say (2026-10-31)
 
@@ -40,3 +48,18 @@ keeps up at 0.36 ms.
   (0.2 ms at p50, 3 ms at p99 at 5,000/s) needs the adapter's trace ring (Design §9.2), which is not
   built.
 - The 2.25 s gap in every stream at 10,000/s (A1c) is not explained.
+
+### What A3 says (2026-10-31): market data on order entry's engine (Design §8.22)
+
+Each pair ran back to back on the same processes, on a quiet machine. **Market data on the same
+engine costs order entry**: four feed sessions taking ~4,000 35=X/s, about twice the order path's own
+traffic through the archive, add ~2–2.5 ms at p50 and 5–8 ms at p99 (A3b against A3a, A3d against
+A3c), and take ~8% of the saturated capacity (A3f against A3e). The feeds kept up: every 35=X arrived.
+
+- **Three earlier attempts are not recorded.** In the first, the four feed clients printed every
+  message; in the second they spun a core each while idle; in the third IntelliJ took ~4 cores. Each
+  showed the same direction, larger. `fix md --quiet` and an idle client that backs off came of them.
+- **A1's saturation was the loaded machine's**: 3,000/s keeps up when quiet (A3c), and 5,000/s
+  answers 4,255 requests/s (A3e), not 3,530.
+- Artio archives an engine's messages all or none (`logInboundMessages`/`logOutboundMessages`), so
+  market data cannot be left out of order entry's archive while they share an engine.
