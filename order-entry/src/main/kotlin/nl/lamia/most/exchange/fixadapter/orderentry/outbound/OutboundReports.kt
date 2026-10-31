@@ -1,5 +1,7 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.outbound
 
+import nl.lamia.most.exchange.fixadapter.trace.Trace
+import nl.lamia.most.exchange.fixadapter.trace.TraceFormat
 import nl.lamia.most.exchange.client.OrderFate
 import nl.lamia.most.exchange.client.ReportAction
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.StatusUnknownText
@@ -40,6 +42,9 @@ class OutboundReports(
     private val delivery: Delivery,
     private val log: (String) -> Unit = {},
 ) {
+    /** The trace ring (Design.md §9.3); the backend sets it. */
+    var trace: Trace = Trace.OFF
+
     private val execution = OutgoingExecution()
     private val cancelReject = OutgoingCancelReject()
     private val notional = Notional()
@@ -74,6 +79,9 @@ class OutboundReports(
     fun onReport(shardId: Int, report: ClientExecutionReportDecoder): ReportAction {
         this.shardId = shardId
         val participantId = report.participantId()
+        if (trace.enabled) {
+            trace.event(TraceFormat.REPORT, participantId, report.clOrdId(), System.nanoTime(), report.reportSeq(), report.execType().value())
+        }
         val row = store.find(participantId, report.clOrdId())
         if (row == null) {
             lostRows++
@@ -264,6 +272,7 @@ class OutboundReports(
     /** A sequenced report's 35=8 is on its way: its `reportSeq` waits for the archive (§6.2). */
     private fun delivered(report: ClientExecutionReportDecoder, position: Long) {
         val reportSeq = report.reportSeq()
+        if (trace.enabled) trace.event(TraceFormat.OUT, report.participantId(), report.clOrdId(), System.nanoTime(), reportSeq, shardId.toByte())
         if (reportSeq > 0L) delivery.sent(shardId, report.participantId(), reportSeq, position)
     }
 

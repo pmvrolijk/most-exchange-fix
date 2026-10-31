@@ -32,6 +32,7 @@ object Html {
         provenance(run)
         latencyTable(run)
         pacingTable(run)
+        run.trace?.let { traceSection(it) }
         throughputTable(run)
         charts(run)
         if (other != null) compare(run, logName, other, otherName.orEmpty())
@@ -107,6 +108,38 @@ object Html {
             append("<td>").append(p.refusals).append("</td></tr>")
         }
         append("</tbody></table></div>")
+    }
+
+    private fun StringBuilder.traceSection(t: TraceJoin) {
+        append("<h2>Inside the adapter (µs), from its trace</h2>")
+        append("<p class=\"note\">Each request's service time cut at the adapter's stages (Design §9.3), joined by MsgSeqNum for participant ")
+            .append(t.participant).append(": ").append(t.joined).append(" requests joined, ").append(t.missing)
+            .append(" not. The stages add up to the service time to the first report; <b>durable</b> is off the client's path. ")
+            .append("Both sides' clocks are this host's: a trace from another host does not compare.</p>")
+        if (t.dropped > 0 || !t.clean) {
+            append("<p class=\"warn\"><b>Note</b> The trace dropped ").append(t.dropped).append(" events")
+                .append(if (t.clean) "" else ", and had not been closed (the adapter still running, or killed)").append(".</p>")
+        }
+        append("<div class=\"scroll\"><table><thead><tr><th>stage</th>")
+        for (p in listOf(50.0, 90.0, 99.0, 99.9)) append("<th>p").append(pct(p)).append("</th>")
+        append("<th>max</th><th>share</th><th>count</th></tr></thead><tbody>")
+        t.stages.forEachIndexed { k, (name, d) ->
+            append("<tr><td><i class=\"key s").append(k + 1).append("\"></i>").append(e(name)).append("</td>")
+            for (p in listOf(50.0, 90.0, 99.0, 99.9)) append("<td>").append(Format.us(d.p(p))).append("</td>")
+            append("<td>").append(Format.us(d.max)).append("</td><td>").append("%.1f%%".format(100 * t.shares[k])).append("</td><td>").append(d.count).append("</td></tr>")
+        }
+        val d = t.durable
+        append("<tr><td><i class=\"key s8\"></i>durable (off the path)</td>")
+        for (p in listOf(50.0, 90.0, 99.0, 99.9)) append("<td>").append(Format.us(d.p(p))).append("</td>")
+        append("<td>").append(Format.us(d.max)).append("</td><td>-</td><td>").append(d.count).append("</td></tr>")
+        append("</tbody></table></div>")
+        val series = t.stages.mapIndexed { k, (name, dist) -> Triple(name, k + 1, dist.sorted) }.filter { it.third.isNotEmpty() && it.third.last() > 0 } +
+            listOfNotNull(Triple("durable", 8, d.sorted).takeIf { d.count > 0 && d.sorted.last() > 0 })
+        if (series.isNotEmpty()) {
+            append("<div class=\"grid\">")
+            append(percentileChart("trace-stages", "Stages, percentile distribution", series.map { (n, slot, v) -> Triple(n, slot, v.filter { it > 0 }.toLongArray()) }.filter { it.third.isNotEmpty() }))
+            append("</div>")
+        }
     }
 
     private fun StringBuilder.throughputTable(run: Run) {

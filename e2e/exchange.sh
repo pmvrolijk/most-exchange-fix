@@ -10,6 +10,7 @@
 # log on at market data's own port, FIX_MD_PORT (default FIX_PORT + 1; Design.md §4).
 # FIX_FILE_SYNC_LEVEL (default 1) and FIX_IDLE_STRATEGY (default backoff) are the adapter's, for a
 # measured diff only: below 1 the adapter's persistence argument does not hold (CLAUDE.md 7, 11).
+# FIX_TRACE_FILE, if set, turns the adapter's trace ring on (Design.md §9.3).
 
 MOST="$ME/tools/build/install/most/bin/most"
 ENGINE="$ME/engine/build/install/engine/bin/engine"
@@ -231,9 +232,10 @@ fix.calendar.zone=UTC
 fix.calendar.rollTime=23:59
 fix.calendar.weekdays=MON,TUE,WED,THU,FRI,SAT,SUN
 fix.idleStrategy=${FIX_IDLE_STRATEGY:-backoff}
+fix.trace.file=${FIX_TRACE_FILE:-}
 EOF
 # Shared driver and archive threads: this machine runs the whole exchange too.
-export ADAPTER_OPTS="-Daeron.threading.mode=SHARED -Daeron.archive.threading.mode=SHARED"
+export ADAPTER_OPTS="${ADAPTER_OPTS:--Daeron.threading.mode=SHARED -Daeron.archive.threading.mode=SHARED}"
 
 ADAPTER_PID=""
 ADAPTER_RUN=0

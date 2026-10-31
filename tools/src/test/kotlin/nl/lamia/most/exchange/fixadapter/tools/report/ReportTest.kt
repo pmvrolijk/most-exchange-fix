@@ -8,11 +8,14 @@ import nl.lamia.most.exchange.fixadapter.tools.perf.PerfLog
 import nl.lamia.most.exchange.fixadapter.tools.perf.PerfLogFormat
 import nl.lamia.most.exchange.fixadapter.tools.perf.PerfLogFormat.NO_INDEX
 import nl.lamia.most.exchange.fixadapter.tools.perf.PerfLogWriter
+import nl.lamia.most.exchange.fixadapter.trace.TraceFormat
+import nl.lamia.most.exchange.fixadapter.trace.TraceLog
 import org.junit.jupiter.api.Test
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
 import kotlin.test.assertContentEquals
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -199,5 +202,76 @@ class ReportTest {
         val html = File(out, "report.html").readText()
         assertTrue("Compared with b.log" in html)
         assertTrue("commit abc123 vs def456" in html)
+    }
+
+    /** A trace file written by hand (Design.md §9.3), its clocks' pair known: nanoTime 0 is epoch 1,000,000. */
+    private fun writeTrace(file: File, vararg events: TraceEvent) {
+        val b = java.nio.ByteBuffer.allocate(TraceFormat.HEADER_SIZE + events.size * TraceFormat.RECORD_SIZE).order(java.nio.ByteOrder.LITTLE_ENDIAN)
+        b.putLong(TraceFormat.H_MAGIC, TraceFormat.MAGIC).putInt(TraceFormat.H_VERSION, TraceFormat.VERSION)
+            .putInt(TraceFormat.H_RECORD_SIZE, TraceFormat.RECORD_SIZE).putLong(TraceFormat.H_START_NANO, 0L)
+            .putLong(TraceFormat.H_START_EPOCH_NANOS, EPOCH).putInt(TraceFormat.H_CLEAN, 1)
+        events.forEachIndexed { k, e ->
+            val at = TraceFormat.HEADER_SIZE + k * TraceFormat.RECORD_SIZE
+            b.put(at + TraceFormat.R_STAGE, e.stage).put(at + TraceFormat.R_EXEC_TYPE, e.byte)
+                .putLong(at + TraceFormat.R_PARTICIPANT, e.participant).putLong(at + TraceFormat.R_CL_ORD_ID, e.clOrdId)
+                .putLong(at + TraceFormat.R_TIME, e.time).putLong(at + TraceFormat.R_EXTRA, e.extra)
+        }
+        file.writeBytes(b.array())
+    }
+
+    private data class TraceEvent(val stage: Byte, val participant: Long, val clOrdId: Long, val time: Long, val extra: Long = 0L, val byte: Byte = 0)
+
+    @Test
+    fun `the adapter's trace cuts each request's service time at its stages, joined by MsgSeqNum`() {
+        val log = File(dir, "joined.log")
+        PerfLogWriter(log, 32, "count=3", warmup = 0).apply {
+            start(0, 0)
+            send(0, Kind.PASSIVE, BUY, 0, -1, 0, -1, 1000, 1000, 1100, msgSeqNum = 5)
+            receive(b('8'), b('0'), b('0'), 0, 0, NO_INDEX, 2100)
+            send(1, Kind.CANCEL, BUY, 0, 0, 0, -1, 2000, 2000, 2050, msgSeqNum = 6)
+            receive(b('8'), b('4'), b('4'), 0, 1, 0, 3000)
+            send(2, Kind.PASSIVE, SELL, 0, -1, 0, 1, 3900, 3900, 4000, msgSeqNum = 9) // not in the trace
+            receive(b('8'), b('0'), b('0'), 0, 2, NO_INDEX, 4500)
+            finish(5000)
+            close()
+        }
+        val trace = File(dir, "trace.bin")
+        val p = 7L
+        writeTrace(
+            trace,
+            // Another participant's request, the same clOrdId, first in the file: the trace holds two.
+            TraceEvent(TraceFormat.IN, 8L, 5L, 1150, EPOCH + 1120), TraceEvent(TraceFormat.GATE, 8L, 5L, 1160),
+            // #0, clOrdId 5 (sequenceIndex 0): Artio received it at 1200, the handler at 1300.
+            TraceEvent(TraceFormat.IN, p, 5L, 1300, EPOCH + 1200), TraceEvent(TraceFormat.GATE, p, 5L, 1500),
+            TraceEvent(TraceFormat.SENT, p, 5L, 1600), TraceEvent(TraceFormat.REPORT, p, 5L, 1900, 1L),
+            TraceEvent(TraceFormat.OUT, p, 5L, 2000, 1L),
+            // #1, clOrdId 6; a GATE again after a back-pressured cycle: the first counts.
+            TraceEvent(TraceFormat.IN, p, 6L, 2250, EPOCH + 2200), TraceEvent(TraceFormat.GATE, p, 6L, 2400),
+            TraceEvent(TraceFormat.GATE, p, 6L, 2420), TraceEvent(TraceFormat.SENT, p, 6L, 2450),
+            TraceEvent(TraceFormat.DURABLE, p, 0L, 2500, 2L),
+            TraceEvent(TraceFormat.REPORT, p, 6L, 2800, 2L), TraceEvent(TraceFormat.OUT, p, 6L, 2900, 2L),
+            TraceEvent(TraceFormat.DURABLE, p, 0L, 3500, 3L),
+        )
+        val a = Analysis(PerfLog.read(log))
+        assertFailsWith<IllegalArgumentException> { TraceJoin(a, TraceLog.read(trace), null) }
+        val j = TraceJoin(a, TraceLog.read(trace), p)
+        assertEquals(2, j.joined)
+        assertEquals(1, j.missing)
+        // By hand: #0 100, 100, 200, 100, 300, 100, 100 (= 2100 − 1100); #1 150, 50, 150, 50, 350, 100, 100 (= 3000 − 2050).
+        assertEquals(
+            listOf(
+                "client → engine" to listOf(100L, 150L), "engine → handler" to listOf(50L, 100L), "archive gate" to listOf(150L, 200L),
+                "send wait" to listOf(50L, 100L), "exchange" to listOf(300L, 350L), "report out" to listOf(100L, 100L),
+                "adapter → client" to listOf(100L, 100L),
+            ),
+            j.stages.map { (name, d) -> name to d.sorted.toList() },
+        )
+        assertEquals(listOf(500L, 600L), j.durable.sorted.toList(), "OUT → the first DURABLE past its reportSeq")
+        val total = 1950.0
+        assertContentEquals(doubleArrayOf(250 / total, 150 / total, 350 / total, 150 / total, 650 / total, 200 / total, 200 / total), j.shares)
+    }
+
+    private companion object {
+        const val EPOCH = 1_000_000L
     }
 }

@@ -56,10 +56,14 @@ for r in "${RATES[@]}"; do SECURITIES="$SECURITIES P$r"; done
 MAX_ORDERS=100000
 for r in "${RATES[@]}"; do [ $((r * SECONDS_PER_RUN)) -gt "$MAX_ORDERS" ] && MAX_ORDERS=$((r * SECONDS_PER_RUN)); done
 
+# The adapter's trace ring, on unless PERF_TRACE=0 (Design.md §9.3): each report cuts the service time
+# at the adapter's stages. One file for the adapter's life; the runs are told apart by MsgSeqNum.
+[ "${PERF_TRACE:-1}" = 1 ] && FIX_TRACE_FILE="$RUN/adapter/trace.bin"
+
 # shellcheck source=exchange.sh
 source "$ROOT/e2e/exchange.sh"
 
-EXCHANGE_DESC="e2e topology, one machine: one cluster member, one gateway, UDP over localhost; adapter fileSyncLevel=${FIX_FILE_SYNC_LEVEL:-1}, idle ${FIX_IDLE_STRATEGY:-backoff}, SHARED driver and archive"
+EXCHANGE_DESC="e2e topology, one machine: one cluster member, one gateway, UDP over localhost; adapter fileSyncLevel=${FIX_FILE_SYNC_LEVEL:-1}, idle ${FIX_IDLE_STRATEGY:-backoff}, adapter JVM $ADAPTER_OPTS"
 mkdir -p "$RUN/runs"
 
 # perf_run <name> <symbol> <rate> <seconds> <warmup seconds> [market data, for the description]
@@ -75,11 +79,13 @@ perf_run() {
   local code=$?
   grep -E "^perf: (sent|unanswered|the send thread|the session)" "$out" | sed 's/^/  /'
   [ "$code" -eq 0 ] || echo "  WARNING: fix perf exited $code (a message not sent, or the log full): see $out"
-  "$FIX" report --log "$RUN/runs/$name.log" --out "$RUN/runs/$name-report" > "$LOGS/report-$name.out" 2>&1 \
+  "$FIX" report --log "$RUN/runs/$name.log" --out "$RUN/runs/$name-report" ${FIX_TRACE_FILE:+--trace "$FIX_TRACE_FILE" --participant 7} \
+    > "$LOGS/report-$name.out" 2>&1 \
     || { cat "$LOGS/report-$name.out"; fail "the report on $name"; }
   grep -E "^(offered|WARNING)" "$LOGS/report-$name.out" | sed 's/^/  /'
   grep -E "^(new ack|fill|resting fill|cancel ack) +(service|response)" "$LOGS/report-$name.out" | sed 's/^/  /'
   grep -E "^all " "$LOGS/report-$name.out" | sed 's/^/  pacing: /'
+  sed -n '/^Inside the adapter/,/^durable/p' "$LOGS/report-$name.out" | grep -vE "^-+$" | sed 's/^/  /'
 }
 
 start_exchange

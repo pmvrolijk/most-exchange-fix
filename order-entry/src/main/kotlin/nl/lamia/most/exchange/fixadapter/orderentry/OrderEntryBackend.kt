@@ -1,5 +1,7 @@
 package nl.lamia.most.exchange.fixadapter.orderentry
 
+import nl.lamia.most.exchange.fixadapter.trace.Trace
+import nl.lamia.most.exchange.fixadapter.trace.TraceFormat
 import io.aeron.Aeron
 import io.aeron.FragmentAssembler
 import io.aeron.Subscription
@@ -77,6 +79,19 @@ class OrderEntryBackend(
 ) : Agent, AutoCloseable {
 
     private val config = config
+
+    /**
+     * The trace ring (Design.md §9.3), [Trace.OFF] unless set before the backend's thread starts:
+     * every event is written on that thread. The caller owns it and closes it after the backend.
+     */
+    var trace: Trace = Trace.OFF
+        set(value) {
+            field = value
+            inbound.trace = value
+            sends.trace = value
+            outbound.trace = value
+            delivery.trace = value
+        }
 
     /** What this backend opened, closed in reverse. */
     private val resources = ArrayList<AutoCloseable>()
@@ -392,6 +407,10 @@ class OrderEntryBackend(
                 return inbound.onReplayed(participantId, sequenceIndex, messageType, buffer, offset, length)
             }
             replies.session = session
+            if (trace.enabled) {
+                inbound.arrivalNs = System.nanoTime()
+                inbound.engineReceivedNs = timestampInNs
+            }
             return inbound.onMessage(participantId, replies, sequenceIndex, messageType, buffer, offset, length, position)
         }
 

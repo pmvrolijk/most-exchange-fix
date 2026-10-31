@@ -3,6 +3,7 @@ package nl.lamia.most.exchange.fixadapter.tools.report
 import nl.lamia.most.exchange.fixadapter.tools.Args
 import nl.lamia.most.exchange.fixadapter.tools.perf.Kind
 import nl.lamia.most.exchange.fixadapter.tools.perf.PerfLog
+import nl.lamia.most.exchange.fixadapter.trace.TraceLog
 import org.HdrHistogram.Histogram
 import java.io.File
 import java.io.PrintStream
@@ -60,6 +61,9 @@ class Run(val a: Analysis, exchangeOverride: String?) {
         a.measured.count { !answered[it] }
     }
 
+    /** The adapter's trace joined in (Design.md §9.3), if one was given. */
+    var trace: TraceJoin? = null
+
     val date: String = Instant.ofEpochMilli(a.log.t0WallMs).atOffset(ZoneOffset.UTC).toLocalDate().toString()
 
     /** What a reader must know before trusting the figures. */
@@ -91,9 +95,12 @@ object Report {
         val logFile = File(args.required("log"))
         val compareFile = args.optional("compare")?.let(::File)
         val exchange = args.optional("exchange")
+        val traceFile = args.optional("trace")?.let(::File)
+        val participant = args.optional("participant")?.let { it.toLongOrNull() ?: throw IllegalArgumentException("--participant must be a number, not $it") }
         val out = File(args.string("out", File(logFile.absoluteFile.parentFile, logFile.nameWithoutExtension + "-report").path))
         args.rejectUnused()
         val run = Run(Analysis(PerfLog.read(logFile)), exchange)
+        if (traceFile != null) run.trace = TraceJoin(run.a, TraceLog.read(traceFile), participant)
         val other = compareFile?.let { Run(Analysis(PerfLog.read(it)), null) }
         out.mkdirs()
         Text.print(run, System.out)
@@ -180,6 +187,19 @@ object Text {
             )
         }
         out.println(sep)
+        run.trace?.let { t ->
+            out.println("\nInside the adapter (µs), from its trace: participant ${t.participant}, ${t.joined} requests joined, ${t.missing} not")
+            if (t.dropped > 0 || !t.clean) out.println("WARNING: the trace dropped ${t.dropped} events${if (t.clean) "" else ", and had not been closed (the adapter still running, or killed)"}")
+            out.println(sep)
+            out.println("%-22s %9s %9s %9s %9s %10s %8s".format("stage", "p50", "p90", "p99", "p99.9", "max", "share"))
+            out.println(sep)
+            t.stages.forEachIndexed { k, (name, d) ->
+                out.println("%-22s %9s %9s %9s %9s %10s %7.1f%%".format(name, Format.us(d.p(50.0)), Format.us(d.p(90.0)), Format.us(d.p(99.0)), Format.us(d.p(99.9)), Format.us(d.max), 100 * t.shares[k]))
+            }
+            val d = t.durable
+            out.println("%-22s %9s %9s %9s %9s %10s %8s".format("durable (off path)", Format.us(d.p(50.0)), Format.us(d.p(90.0)), Format.us(d.p(99.0)), Format.us(d.p(99.9)), Format.us(d.max), "-"))
+            out.println(sep)
+        }
         out.println("\nThroughput")
         out.println(sep)
         out.println("%-22s %8s %9s %10s %12s %12s %12s".format("stream", "count", "span (s)", "msg/s", "gap p50 µs", "gap p99 µs", "gap max µs"))

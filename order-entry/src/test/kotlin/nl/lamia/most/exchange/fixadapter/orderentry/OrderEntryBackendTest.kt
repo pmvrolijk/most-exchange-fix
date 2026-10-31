@@ -13,6 +13,9 @@ import nl.lamia.most.exchange.fixadapter.session.DirectoryBroadcast
 import nl.lamia.most.exchange.fixadapter.session.TestSecurity
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.Texts
 import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
+import nl.lamia.most.exchange.fixadapter.trace.Trace
+import nl.lamia.most.exchange.fixadapter.trace.TraceFormat
+import nl.lamia.most.exchange.fixadapter.trace.TraceLog
 import nl.lamia.most.exchange.fixadapter.orderentry.store.RowKind
 import nl.lamia.most.exchange.fixadapter.session.AcceptorRig
 import nl.lamia.most.exchange.fixadapter.session.FixAcceptor
@@ -414,6 +417,52 @@ class OrderEntryBackendTest {
         assertDecimal("0", full[151], "LeavesQty")
         assertDecimal("100.26", full[6], "AvgPx: (4 × 100.2 + 6 × 100.3) / 10")
         assertEquals(null, ack[31], "no LastPx on an acknowledgement")
+    }
+
+    @Test
+    fun `with the trace on, a 35=D and its report leave IN, GATE, SENT, REPORT, OUT and DURABLE, in order, under its clOrdId`() {
+        // Design.md §9.3.
+        val adapter = start()
+        val traceFile = File(dir, "trace.bin")
+        val trace = Trace.open(traceFile, 1 shl 16, adapter.rig.acceptor.engine.configuration().epochNanoClock())
+        adapter.rig.backend.trace = trace
+        adapter.awaitExchange()
+        val session = adapter.logon()
+        adapter.send(session, order("ORD-T"))
+        val msgSeqNum = session.lastSentMsgSeqNum()
+        pollUntil(*adapter.all(), what = "the order at the gateway") { adapter.gateway(0).orders.size == 1 }
+        val o = adapter.gateway(0).orders.single()
+        val reportSeq = adapter.gateway(0).report(1001L, o.clOrdId, ExecType.NEW, 5001L, price = o.price, leavesQty = o.qty, origQty = o.qty)
+        pollUntil(*adapter.all(), what = "the 35=8") { adapter.reports(session).size == 1 }
+        // The durable reportSeq moves once the archive has the 35=8 (§6.2).
+        pollUntil(*adapter.all(), what = "the reportSeq durable") { adapter.rig.backend.delivery.durable(0, 1001L) > reportSeq }
+        adapter.close()
+        trace.close()
+
+        val t = TraceLog.read(traceFile)
+        assertTrue(t.clean)
+        assertEquals(0L, t.dropped)
+        val events = (0 until t.size).filter { t.participant[it] == 1001L }
+        assertEquals(
+            listOf(TraceFormat.IN, TraceFormat.GATE, TraceFormat.SENT, TraceFormat.REPORT, TraceFormat.OUT, TraceFormat.DURABLE),
+            events.map { t.stage[it] }.distinct(),
+            events.map { TraceFormat.name(t.stage[it]) }.toString(),
+        )
+        val stages = listOf(TraceFormat.IN, TraceFormat.GATE, TraceFormat.SENT, TraceFormat.REPORT, TraceFormat.OUT, TraceFormat.DURABLE)
+        val first = stages.associateWith { stage -> events.first { t.stage[it] == stage } }
+        for (stage in listOf(TraceFormat.IN, TraceFormat.GATE, TraceFormat.SENT, TraceFormat.REPORT, TraceFormat.OUT)) {
+            assertEquals(o.clOrdId, t.clOrdId[first.getValue(stage)], TraceFormat.name(stage))
+        }
+        assertEquals(msgSeqNum.toLong(), o.clOrdId and 0xffffffffL, "the clOrdId's low 32 bits are the 35=D's MsgSeqNum (CLAUDE.md 8)")
+        val times = stages.map { t.time[first.getValue(it)] }
+        assertEquals(times.sorted(), times, "in order")
+        assertEquals(ExecType.NEW.value(), t.execType[first.getValue(TraceFormat.REPORT)])
+        assertEquals(reportSeq, t.extra[first.getValue(TraceFormat.REPORT)])
+        assertEquals(reportSeq, t.extra[first.getValue(TraceFormat.OUT)])
+        assertTrue(t.extra[first.getValue(TraceFormat.DURABLE)] > reportSeq, "DURABLE: the first-missing past the report's reportSeq")
+        val received = t.epochToNano(t.extra[first.getValue(TraceFormat.IN)])
+        val handled = t.time[first.getValue(TraceFormat.IN)]
+        assertTrue(handled - received in 0L..1_000_000_000L, "Artio's receive, converted by its own clock, before the handler: ${handled - received} ns")
     }
 
     // ================================================================ 35=H and 35=AF, §3.3

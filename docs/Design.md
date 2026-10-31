@@ -1452,6 +1452,11 @@ The archive's recorded position (§6.2) then means durable.
     `fsync`); where in the adapter the rest of the gap to the gateway goes (the trace ring, §9.2);
     and whether the archive's fsyncs batch under load as the design assumed, or one stream's sync
     serialises the other's.
+    - **Traced 2026-10-31** (§9.3, Measurements A5): below saturation the archive gate and the
+      exchange stage (`SENT` → first report) take ~8 ms each, ~90% of the service time. The exchange
+      stage moves with the adapter's fsync (1.7 ms at level 0) and not with its threads; how is not
+      found. At saturation the queue is between Artio's engine and the order-entry handler: the
+      library thread's intake is the ceiling, and the fsync lowers it, by a path not found either.
     - **The user's frame (2026-10-31):** production runs on Linux, where the fsync costs less, and a
       run on a Linux host is planned. One connection offered 300–1,000 orders/s is fine; what is worth
       reaching is **3,500–5,000 requests/s through one adapter**, at fileSyncLevel 1.
@@ -1473,7 +1478,8 @@ The archive's recorded position (§6.2) then means durable.
     market-data session per participant, makes more pressing.
 
 27. **A dedicated adapter per participant, which may hold several of its sessions** (the user's
-    deployment, 2026-10-31). Each participant gets its own adapter, for isolation, and may have more
+    deployment, 2026-10-31). **Several sessions per participant: a possible roadmap item, low
+    priority** (the user, 2026-10-31); one session per participant stands until then. Each participant gets its own adapter, for isolation, and may have more
     than one order-entry session on it. Today the configuration refuses two order-entry sessions for
     one participant, because reports route back to one session per participant (§2, §3.3): a 35=8
     goes to the participant's session, and the `reportSeq` ledger is the participant's. Several
@@ -1529,8 +1535,45 @@ management address only.
   | `tick_to_trade` | Artio's receive timestamp of the 35=D → its first 35=8 written |
   | `archive_lag` | the 35=8 written → the archive's recorded position past it |
 
-- **A trace ring** (carried over): per-message stage events on a ring, drained to a file
-  off the library thread, for §10.2 to read beside the sender's own log.
+  The stage table above predates the archive gate (§6.1): a 35=D now waits for the archive before
+  `newOrder`, which `order_out` would hide. The trace ring below names it.
+
+### 9.3 The trace ring
+
+Specified 2026-10-31, built before the rest of §9 to say where order entry's time goes (§8.24).
+**Built the same day** (`fix-session`'s `trace` package; `fix report --trace`; `run-perf.sh` turns it
+on); first readings in Measurements A5.
+
+- **On when `fix.trace.file` names a file**, off otherwise; off, it costs one branch per event. The
+  ring is `fix.trace.ringBytes` long (default 16 MiB), Agrona's one-to-one ring buffer: every event
+  is written on the order-entry library thread, which never waits for it. A full ring drops the
+  event and counts it; the count is in the file.
+- **A drainer thread** copies the ring to the file and writes nothing else; at close it drains what
+  is left and stamps the header with the drop count and a clean end.
+- **Events**, each with `System.nanoTime()`, the participant and the exchange `clOrdId` (whose low
+  32 bits are the client's MsgSeqNum, CLAUDE.md 8):
+
+  | Event | When | Its extra |
+  | --- | --- | --- |
+  | `IN` | a 35=D or 35=F, valid and not replayed, is stored and queued to send (§3.3) | Artio's receive timestamp (its epoch clock) |
+  | `GATE` | the send queue first finds it past the archive's recorded position (§6.1) | |
+  | `SENT` | the SDK took it (`SENT`) | |
+  | `REPORT` | the SDK hands over a report for it | its `reportSeq`; ExecType in the record |
+  | `OUT` | a report's 35=8 is taken by Artio, its `reportSeq` handed to delivery (§6.2) | its `reportSeq`; the shard in the record |
+  | `DURABLE` | the durable first-missing `reportSeq` advances (§6.2); no `clOrdId` | the new first-missing; the shard in the record |
+
+- **The file**: a header (format version, record size, `nanoTime` and the epoch clock at start, read
+  off the engine's own `EpochNanoClock`, so Artio's receive timestamp converts; another instance's
+  offset differs by up to a millisecond, found 2026-10-31, the drop count, a clean-end flag), then fixed records. Its
+  times are `System.nanoTime()`, the host's one monotonic clock, so they compare with the sender's
+  log **on the same host only**.
+- **`fix report --trace FILE`** joins it to the sender's log by MsgSeqNum (the sender logs its own
+  per message), for the participant the trace holds, or `--participant` if it holds several. Per
+  request, the time between stages: **wire in** (the sender's send → `IN`), **engine** (Artio's
+  receive → `IN`), **archive gate** (`IN` → `GATE`), **send wait** (`GATE` → `SENT`), **exchange**
+  (`SENT` → its first `REPORT`), **report out** (`REPORT` → `OUT`), **wire out** (`OUT` → the
+  sender's arrival), and **durable** (`OUT` → the `DURABLE` past its `reportSeq`, off the client's
+  path). A table and a distribution per stage, and what share of the response time each takes.
 
 ## 10. Test tooling (`tools`)
 

@@ -1,5 +1,7 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.delivery
 
+import nl.lamia.most.exchange.fixadapter.trace.Trace
+import nl.lamia.most.exchange.fixadapter.trace.TraceFormat
 import nl.lamia.most.exchange.client.SessionStore
 import nl.lamia.most.exchange.fixadapter.orderentry.outbound.Delivery
 import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
@@ -33,6 +35,9 @@ class ReportDelivery(
     private val store: OrderStore,
     private val archived: LongSupplier,
 ) : Delivery {
+
+    /** The trace ring (Design.md §9.3); the backend sets it. */
+    var trace: Trace = Trace.OFF
 
     /** One shard's and participant's `reportSeq`s on their way to the archive. */
     private class Track(val shardId: Int, val participantId: Long, var durable: Long) {
@@ -177,6 +182,7 @@ class ReportDelivery(
             if (position >= 0L) t.confirm(position)
             val target = minOf(t.ceiling, t.frozen, t.lowestPending())
             if (target != t.durable) {
+                if (trace.enabled) trace.event(TraceFormat.DURABLE, t.participantId, 0L, System.nanoTime(), target, t.shardId.toByte())
                 store.saveFirstMissing(t.participantId, t.shardId, target)
                 t.durable = target
                 work++

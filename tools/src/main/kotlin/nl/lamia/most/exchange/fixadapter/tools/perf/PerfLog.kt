@@ -13,7 +13,7 @@ import java.nio.file.StandardOpenOption
  * sender only stores numbers while it runs. A header, then fixed-size records:
  *
  * - **send**, one per message: index, kind, side, flags (discard pass, substituted), the index it
- *   acts on, refusals, the price in ticks, *S*, *A*, *Z*, and the send cost *Z* − *T*;
+ *   acts on, refusals, the price in ticks, *S*, *A*, *Z*, the send cost *Z* − *T*, and its MsgSeqNum;
  * - **receive**, one per 35=8, 35=9, 35=3 and 35=j: the first character of MsgType, ExecType,
  *   OrdStatus, flags (PossDup, OrdStatusUnknown), the indexes named by 11 and 41, and the arrival.
  *
@@ -21,9 +21,10 @@ import java.nio.file.StandardOpenOption
  */
 object PerfLogFormat {
     const val MAGIC = 0x4652455054534F4DL // "MOSTPERF", little-endian
-    const val VERSION = 1
+    // 2 (2026-10-31): each send carries its MsgSeqNum, to join the adapter's trace (Design.md §9.3).
+    const val VERSION = 2
     const val HEADER_SIZE = 64 * 1024
-    const val RECORD_SIZE = 48
+    const val RECORD_SIZE = 64
 
     // Header offsets.
     const val H_MAGIC = 0
@@ -57,6 +58,7 @@ object PerfLogFormat {
     const val S_SENT = 32
     const val S_PRICE_TICKS = 40
     const val S_SEND_COST = 44 // Z − T, the trySend that took it, in ns
+    const val S_MSG_SEQ_NUM = 48
 
     const val R_MSG_TYPE = 1
     const val R_EXEC_TYPE = 2
@@ -136,7 +138,7 @@ class PerfLogWriter(file: File, val capacity: Long, text: String, warmup: Int) :
 
     fun send(
         index: Int, kind: Byte, side: Byte, flags: Int, target: Int, refusals: Int, priceTicks: Int,
-        scheduledNs: Long, firstAttemptNs: Long, sentNs: Long, sendCostNs: Long = 0,
+        scheduledNs: Long, firstAttemptNs: Long, sentNs: Long, sendCostNs: Long = 0, msgSeqNum: Int = 0,
     ) {
         val at = claim()
         if (at < 0) return
@@ -153,6 +155,7 @@ class PerfLogWriter(file: File, val capacity: Long, text: String, warmup: Int) :
             buffer.putLong(at + S_SENT, sentNs)
             buffer.putInt(at + S_PRICE_TICKS, priceTicks)
             buffer.putInt(at + S_SEND_COST, sendCostNs.coerceIn(0, Int.MAX_VALUE.toLong()).toInt())
+            buffer.putInt(at + S_MSG_SEQ_NUM, msgSeqNum)
         }
         commit()
     }
@@ -218,6 +221,8 @@ class PerfLog private constructor(
         /** *T*: the `trySend` that took it began. */
         val lastAttempt = LongArray(n)
         val sent = LongArray(n)
+        /** The MsgSeqNum it went out with, 0 if not known. */
+        val msgSeqNum = IntArray(n)
 
         fun warmup(i: Int) = flags[i].toInt() and PerfLogFormat.SEND_WARMUP != 0
         fun substituted(i: Int) = flags[i].toInt() and PerfLogFormat.SEND_SUBSTITUTED != 0
@@ -277,6 +282,7 @@ class PerfLog private constructor(
                             s.firstAttempt[si] = b.getLong(at + S_FIRST_ATTEMPT)
                             s.sent[si] = b.getLong(at + S_SENT)
                             s.lastAttempt[si] = s.sent[si] - b.getInt(at + S_SEND_COST)
+                            s.msgSeqNum[si] = b.getInt(at + S_MSG_SEQ_NUM)
                             si++
                         } else {
                             v.msgType[vi] = b.getByte(at + R_MSG_TYPE)

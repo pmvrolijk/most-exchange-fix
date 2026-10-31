@@ -33,6 +33,11 @@ Quoting only the first hides the queueing at exactly the rates worth measuring.
 | A4d | 2026-10-31 | `1f456e0`+ | as A1a | yes, as A4a | JVM 21.0.11 | as A4b: 72,033 35=X each | 3000/s | 3000/s; keeps up | 18.04 / 26.57 ms | 18.04 / 26.57 ms | straight after A4c |
 | A4e | 2026-10-31 | `1f456e0`+ | as A1a | load avg 6–8.7 | JVM 21.0.11 | as A4a | 5000/s | 5000/s sent; **4,215 requests/s answered** | saturated | saturated | |
 | A4f | 2026-10-31 | `1f456e0`+ | as A1a | load avg 6–8.7 | JVM 21.0.11 | as A4b: 114,683 35=X each | 5000/s | 5000/s sent; **3,887 requests/s answered** | saturated | saturated | straight after A4e |
+| A5a | 2026-10-31 | `1f456e0`+ | as A1a | yes (load avg 1.5–5.9) | JVM 21.0.11 | as A4a, the adapter's **trace ring on** (Design §9.3) | 1000/s | 1000/s | 14.72 / 20.72 ms | 14.72 / 20.72 ms | 18,000 joined to the trace. p50 by stage: client → engine 0.18 ms, engine → handler 0.76, **archive gate 7.62**, send wait 0.0001, **exchange 7.85**, report out 0.006, adapter → client 0.045; durable 8.1 ms after the 35=8 |
+| A5b | 2026-10-31 | `1f456e0`+ | as A1a | yes, as A5a | JVM 21.0.11 | as A5a | 3000/s | 3000/s; keeps up | 17.20 / 23.92 ms | 17.20 / 23.92 ms | 54,000 joined. p50: engine → handler 1.58 ms, archive gate 8.00, exchange 8.02 |
+| A5c | 2026-10-31 | `1f456e0`+ | as A1a | yes, as A5a | JVM 21.0.11 | as A5a | 5000/s | saturated | 7.56 / 10.26 s | 7.56 / 10.26 s | 90,000 joined. **engine → handler 7.55 s p50**: the queue is between Artio's engine and the order-entry handler; archive gate 0.15 ms, exchange 8.8 ms |
+| A5d | 2026-10-31 | `1f456e0`+ | as A1a | yes | JVM 21.0.11 | as A5a, the adapter's driver and archive **DEDICATED** | 1000/s | 1000/s | 15.24 / 20.67 ms | 15.24 / 20.67 ms | 10 s run, a diagnostic: archive gate 7.60 ms, **exchange 7.90 ms**, as SHARED |
+| A5e | 2026-10-31 | `1f456e0`+ | as A1a | yes | JVM 21.0.11 | as A5a, adapter **fileSyncLevel=0** (a diff only) | 1000/s | 1000/s | 2.22 / 6.36 ms | 2.22 / 6.36 ms | 10 s run, a diagnostic: archive gate 0.024 ms, **exchange 1.68 ms**; trace taken before the clock fix, engine → handler not read |
 
 ### What A1–A2 and X1 say (2026-10-31)
 
@@ -80,4 +85,24 @@ falls from +2.0 ms p50 and +5.5 ms p99 to +0.45 ms and none at 1,000/s (A4b agai
 shared archive. On this laptop it is the machine: market data's engine threads and four feed JVMs
 beside the exchange's spinning processes (load average to 8.7, the sender's own lateness doubled), or
 its archive's writes on the disk order entry fsyncs. These runs do not separate the two.
+
+### What A5 says (2026-10-31): the adapter's own stages
+
+The trace ring (Design §9.3) joined to the sender's log, every request found, nothing dropped.
+
+- **Below saturation, two waits of ~8 ms each make ~90% of the time**: the archive gate (a 35=D
+  waits for the fsynced archive before `newOrder`, §6.1) and the exchange stage (`SENT` → the first
+  report). Everything the adapter does itself is well under a millisecond at p50.
+- **The exchange stage moves with the adapter's fsync, not its threads**: 7.9 ms with the driver and
+  archive on dedicated threads (A5d), 1.7 ms at fileSyncLevel 0 (A5e), ~1.1 ms for `most load`
+  straight to the gateway (X1a, X2a). The timeline shows requests leaving in bursts when the gate
+  opens and their reports coming back as a burst ~8 ms later. Not explained: most-exchange's cluster
+  archive does not fsync (Aeron's default level 0), so "its writes queue behind ours" is not shown.
+  A RAM disk for one side, or the exchange on another host, would separate it.
+- **At saturation the queue is between Artio's engine and the order-entry handler** (A5c): the
+  library thread takes messages in more slowly than they arrive, and nothing pushes back on the
+  client. At fileSyncLevel 0 the same rate keeps up (A2b), so the fsync slows the library thread's
+  intake too, by a path not yet found.
+- **engine → handler, 0.76 ms at 1,000/s**, is the e2e's back-off idle strategy as much as anything;
+  the adapter's default is busy-spin (§7).
 

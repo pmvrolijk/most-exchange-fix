@@ -43,7 +43,8 @@ Measuring (Design.md §10):
                Paced new orders, crosses and cancels; every send and report to a memory-mapped log.
                Passive orders and crosses carry different SelfMatchPreventionIDs (2362), so the
                participant's crosses trade with its own resting orders
-  report       --log FILE [--compare FILE] [--out DIR] [--exchange TEXT]     (no connection options)
+  report       --log FILE [--compare FILE] [--out DIR] [--exchange TEXT] [--trace FILE [--participant ID]]
+               (no connection options)
                The latency report: report.html, .hgrm and CSV in --out (default: beside the log)
 
 Market data, as a market-data session (it starts at MsgSeqNum 1 at every Logon, so these log on with 141=Y):

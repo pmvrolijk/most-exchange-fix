@@ -200,7 +200,10 @@ class Perf(args: Args, private val argv: String) {
                 flags = flags or PerfLogFormat.SEND_SUBSTITUTED
                 substituted++
             }
-            log.send(index, mix.kind, mix.side, flags, mix.target, refusals, mix.priceTicks, scheduledNs, firstAttemptNs, sentNs, sentNs - lastAttemptNs)
+            log.send(
+                index, mix.kind, mix.side, flags, mix.target, refusals, mix.priceTicks, scheduledNs, firstAttemptNs, sentNs,
+                sentNs - lastAttemptNs, client.session?.lastSentMsgSeqNum() ?: 0,
+            )
             mix.commit(index)
             this.refusals += refusals
             sentCount++

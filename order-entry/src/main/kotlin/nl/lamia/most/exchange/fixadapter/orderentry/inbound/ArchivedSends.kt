@@ -1,5 +1,7 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.inbound
 
+import nl.lamia.most.exchange.fixadapter.trace.Trace
+import nl.lamia.most.exchange.fixadapter.trace.TraceFormat
 import nl.lamia.most.exchange.client.SendResult
 import nl.lamia.most.exchange.fixadapter.orderentry.store.CancelState
 import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
@@ -32,6 +34,9 @@ class ArchivedSends(
 ) {
     private val queue = ArrayDeque<RequestRow>()
 
+    /** The trace ring (Design.md §9.3); the backend sets it. */
+    var trace: Trace = Trace.OFF
+
     /** Requests waiting for the archive or the exchange. */
     val waiting: Int get() = queue.size
 
@@ -53,8 +58,11 @@ class ArchivedSends(
             val row = queue.first()
             // 0: loaded from the store, no position in this process; it goes at once (§6.1).
             if (row.sendAfter != 0L && row.sendAfter > recordedPosition) break
+            // Past the gate: again after each back-pressured cycle, so the trace's first GATE is its own.
+            if (trace.enabled) trace.event(TraceFormat.GATE, row.participantId, row.clOrdId, System.nanoTime(), 0L)
             when (val result = toExchange(row)) {
                 SendResult.SENT -> {
+                    if (trace.enabled) trace.event(TraceFormat.SENT, row.participantId, row.clOrdId, System.nanoTime(), 0L)
                     row.sendPending = false
                     if (row.kind == RowKind.CANCEL && row.cancelState == CancelState.PARKED) {
                         row.cancelState = CancelState.SENT

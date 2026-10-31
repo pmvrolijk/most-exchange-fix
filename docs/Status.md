@@ -26,7 +26,12 @@ Decided 2026-10-31 (the user, on A3):
 **Market data has its own engine** (built 2026-10-31, §3 item 8a): its own port and an unsynced
 archive. Measured (A4), the latency coupling is mostly gone below saturation; the ~8% of capacity
 market data takes at saturation is the laptop's (CPU or disk), not the archive's.
-**Next: the trace ring (§3 item 6a), then §8.24 (with the user's Linux run) and §8.27.**
+**The trace ring is built** (2026-10-31, §3 item 6a; Design §9.3): below saturation the archive
+gate and the exchange stage take ~8 ms each, ~90% of the time; at saturation the queue is before
+the order-entry handler (Measurements A5, Design §8.24).
+**Next, in the user's order (2026-10-31): a deployment setup with Docker, then a GitHub Action that
+builds and tests (item 8, now with a go).** §8.24 waits for
+the user's Linux run. Several sessions per participant (§8.27) is a low-priority roadmap item.
 
 The user's frame, 2026-10-31: production is Linux, and a Linux run is planned; 300–1,000 orders/s
 per connection is fine, and 3,500–5,000/s through one adapter is the target worth reaching. Raised,
@@ -151,7 +156,7 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); the SDK it links is Apache-2.0 |
 | Modules | 5 — `fix-session`, `order-entry`, `market-data`, `adapter` (the process), `tools` (`bin/fix`: the e2e's client, `perf` and `report`); packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 45, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 244 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 10; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` 24 (pacing 8, the mix and the raw reader 9, the report 6, `fix perf` end to end 1). `./gradlew build` green 2026-10-31. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29, 3 of 3 on 2026-10-30, and 4 of 4 on 2026-10-31 on the shared `e2e/exchange.sh`, the last with market data on its own port. `e2e/run-perf.sh`: Measurements A1–A4, X1–X2 on 2026-10-31. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
+| Tests | `fix-session` 49, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 245 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 10; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` 25 (pacing 8, the mix and the raw reader 9, the report 7, `fix perf` end to end 1). `./gradlew build` green 2026-10-31. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29, 3 of 3 on 2026-10-30, and 5 of 5 on 2026-10-31 on the shared `e2e/exchange.sh`, the last two with market data on its own port. `e2e/run-perf.sh`: Measurements A1–A4, X1–X2 on 2026-10-31. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
 | Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT from GitHub Packages (`pmvrolijk/most-exchange`), republished 2026-10-30 with `DepthFeedListener` (most-exchange `3afef4f`), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
@@ -569,7 +574,15 @@ they decided whether `order-entry`'s persistence design stood.)
    6 tests; 5 mutations, each caught. Measured (A4): the coupling below saturation mostly gone.
    - **Still open:** the ~8% of capacity at saturation (A4e–f), on a host that is not a laptop;
      market data's archive grows within a run (Design §8.28).
-6a. **The trace ring** (Design §9.2), item 6's leftover: where the adapter's time goes, for §8.24.
+6a. ~~**The trace ring**~~ **Done 2026-10-31**, uncommitted (Design §9.3; Handover §2m). `Trace`
+   (Agrona's one-to-one ring, a drainer thread, a file), off unless `fix.trace.file`; events IN,
+   GATE, SENT, REPORT, OUT, DURABLE from the order-entry thread; the sender logs its MsgSeqNum (log
+   format 2); `fix report --trace` cuts the service time at each stage. 7 tests; 7 mutations, each
+   caught (one only after the test was strengthened). Found: Artio's receive time converts only by
+   the engine's own clock instance.
+   - **Measured** (A5): see the header. **Still open** (§8.24): why the exchange stage and the
+     library's intake move with the fsync; the 2.25 s gap of A1c.
+   - Not built: the rest of §9 (`/metrics`, `/status`, control).
 7. **`market-data`:** 35=y from the directory, then 35=V/W/X from `DepthFeedAssembler`. Started
    2026-10-30. Decided first (`decision-fork`, each the recommendation, Design §4): 35=X
    from a listener added to the SDK's assembler; market-data sessions transient (MsgSeqNum 1 at every

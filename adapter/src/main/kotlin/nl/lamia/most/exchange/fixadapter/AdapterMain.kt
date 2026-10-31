@@ -10,6 +10,7 @@ import nl.lamia.most.exchange.fixadapter.session.ConfiguredSessions
 import nl.lamia.most.exchange.fixadapter.session.FixAcceptor
 import nl.lamia.most.exchange.fixadapter.session.FixNodeConfig
 import nl.lamia.most.exchange.fixadapter.session.Role
+import nl.lamia.most.exchange.fixadapter.trace.Trace
 import org.agrona.CloseHelper
 import org.agrona.concurrent.AgentRunner
 import org.agrona.concurrent.BackoffIdleStrategy
@@ -53,6 +54,9 @@ class Adapter(private val properties: Properties, private val log: (String) -> U
         throw e
     }
 
+    /** The trace ring (Design.md §9.3): off unless `fix.trace.file` names a file. Closed after the backends. */
+    private val trace: Trace = Trace.fromProperties(properties, acceptor.engine.configuration().epochNanoClock())
+
     private var backend: OrderEntryBackend? = null
     private var runner: AgentRunner? = null
     private var marketDataBackend: MarketDataBackend? = null
@@ -63,6 +67,7 @@ class Adapter(private val properties: Properties, private val log: (String) -> U
     init {
         try {
             val backend = OrderEntryBackend(acceptor, orderEntryConfig, calendar, log = log).also { backend = it }
+            backend.trace = trace
             runner = AgentRunner(idle, { e -> log("order-entry: ${e.stackTraceToString()}") }, null, backend)
                 .also { AgentRunner.startOnThread(it) }
             marketDataConfig?.let { config ->
@@ -80,7 +85,8 @@ class Adapter(private val properties: Properties, private val log: (String) -> U
         log(
             "adapter: started, listening on ${node.bindAddress}:${node.port} for ${acceptor.sessions.all.size} order-entry sessions" +
                 (marketDataNode?.let { md -> ", ${md.bindAddress}:${md.port} for ${marketDataAcceptor?.sessions?.all?.size} market-data" } ?: "") +
-                "; trading date ${calendar.asInt}, idle ${idle.alias()}",
+                "; trading date ${calendar.asInt}, idle ${idle.alias()}" +
+                (if (trace.enabled) "; tracing to ${properties.getProperty(Trace.FILE)}" else ""),
         )
     }
 
@@ -92,7 +98,7 @@ class Adapter(private val properties: Properties, private val log: (String) -> U
      */
     override fun close() {
         val started = backend != null
-        val closed = runCatching { CloseHelper.closeAll(marketDataRunner, runner, marketDataBackend, backend, marketDataAcceptor, acceptor) }
+        val closed = runCatching { CloseHelper.closeAll(marketDataRunner, runner, marketDataBackend, backend, marketDataAcceptor, acceptor, trace) }
         closed.exceptionOrNull()?.let { log("adapter: not a clean stop: ${it.stackTraceToString()}") }
         if (started && closed.isSuccess) OrderStore.markStoppedCleanly(orderEntryConfig.storeDir)
     }

@@ -664,3 +664,25 @@ and `run-e2e.sh` passed on it twice).
   the emptying, the missing port); 5 mutations, each caught. The e2e passed with FEED1 on 29881.
 - *Measured* (A4, quiet): +0.45 ms p50 and nothing at p99 at 1,000/s, where shared it was +2.0 and
   +5.5 ms; at saturation still ~8% of capacity, as shared, so that share was never the archive's.
+
+**The trace ring, the same day** (Status §3 item 6a; Design §9.3, §8.24).
+- *Specified first* in Design §9.3: on by `fix.trace.file`, a one-to-one ring written on the
+  order-entry thread and never waited for, a drainer thread, six events, a file whose times are the
+  host's `nanoTime`, and `fix report --trace` joining by MsgSeqNum.
+- *Built:* `fix-session`'s `trace` package (`Trace`, `TraceFormat`, `TraceLog`); hooks in
+  `InboundOrders` (IN, with Artio's receive time from the handler), `ArchivedSends` (GATE, SENT),
+  `OutboundReports` (REPORT, OUT, with the shard), `ReportDelivery` (DURABLE, with the shard); the
+  backend's `trace` property, set by the adapter. The sender's log is format 2 (64-byte records, the
+  MsgSeqNum). `TraceJoin` in the report, a section in the page and on the terminal.
+- *The check:* 7 tests (the ring's round trip, a full ring counted, no allocation per event, off by
+  default; the six events in order through a real acceptor and SDK; the join's cuts by hand). 7
+  mutations, each caught; the participant filter's only after its test put another participant's
+  event first. The full build, every test rerun, green; one earlier combined run failed once and did
+  not again.
+- *Found:* Agrona's ring takes a message of at most an eighth of its size (512 bytes the least);
+  Artio's receive time converts only by the engine's own `EpochNanoClock` (another instance put it
+  after the handler); one trace for an adapter's life, the runs told apart by MsgSeqNum.
+- *Measured* (A5): below saturation the archive gate and the exchange stage ~8 ms each; at
+  saturation the queue before the handler. Two diagnostics (A5d, A5e) showed the exchange stage
+  moves with the fsync, not the threads.
+

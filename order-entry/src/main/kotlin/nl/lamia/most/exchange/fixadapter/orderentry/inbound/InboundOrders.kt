@@ -1,5 +1,7 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.inbound
 
+import nl.lamia.most.exchange.fixadapter.trace.Trace
+import nl.lamia.most.exchange.fixadapter.trace.TraceFormat
 import io.aeron.logbuffer.ControlledFragmentHandler.Action
 import nl.lamia.most.exchange.client.PriceCodec
 import nl.lamia.most.exchange.fixadapter.codecs.Constants
@@ -51,6 +53,13 @@ class InboundOrders(
     /** An id collision (§3.3, §8.15), after the store has blocked the session: for counting and logging, with what collided. */
     private val onIdCollision: (participantId: Long, detail: String) -> Unit,
 ) {
+    /** The trace ring (Design.md §9.3); the backend sets it. */
+    var trace: Trace = Trace.OFF
+
+    /** The message being handled: when the handler took it, and Artio's receive timestamp, for the trace's `IN`. */
+    var arrivalNs = 0L
+    var engineReceivedNs = 0L
+
     private val message = MutableAsciiBuffer()
     private val header = HeaderDecoder()
     private val newOrder = NewOrderSingleDecoder()
@@ -156,6 +165,12 @@ class InboundOrders(
     }
 
     /** A rebuilt row, kept with a copy of its message until the directory arrives. */
+    /** A live request, stored, on its way to the archive gate (§6.1): the trace's `IN` (§9.3). */
+    private fun queued(row: RequestRow) {
+        if (trace.enabled) trace.event(TraceFormat.IN, row.participantId, row.clOrdId, arrivalNs, engineReceivedNs)
+        sends.send(row)
+    }
+
     private fun keepUnresolved(row: RequestRow, offset: Int, length: Int) {
         val bytes = ByteArray(length)
         message.getBytes(offset, bytes)
@@ -256,7 +271,7 @@ class InboundOrders(
         row.sendAfter = position
         return when (store.insert(row)) {
             InsertResult.NEW -> {
-                if (recovering) rebuilt(row, offset, length) else sends.send(row)
+                if (recovering) rebuilt(row, offset, length) else queued(row)
                 Action.CONTINUE
             }
             InsertResult.DUPLICATE_CLORDID -> {
@@ -325,7 +340,7 @@ class InboundOrders(
         return when (store.insert(row)) {
             InsertResult.NEW -> {
                 if (order.pendingCancel == null) order.pendingCancel = row
-                if (recovering) rebuilt(row, offset, length) else if (row.cancelState == CancelState.SENT) sends.send(row)
+                if (recovering) rebuilt(row, offset, length) else if (row.cancelState == CancelState.SENT) queued(row)
                 Action.CONTINUE
             }
             InsertResult.DUPLICATE_CLORDID -> {
