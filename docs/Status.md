@@ -759,8 +759,28 @@ priority, 2026-11-01). Then §8.24's investigation with the user's Linux run.
          above Artio's, so it asks from past Artio's end; no replay is kept, explicit. Not covered:
          the epoch written before the receive gaps read the store (ordered, commented).
          `./gradlew build` green: 377 tests, `order-entry` 257.
-    6. **The test fakes on v8:** `OrderEntryRig` and the spikes' `Messages` echo `toSeq` and stop at
-       it; fence tests follow the SDK's new settling rule.
+    6. ~~**The test fakes on v8:** `OrderEntryRig` and the spikes' `Messages` echo `toSeq` and stop at
+       it; fence tests follow the SDK's new settling rule.~~ **Done 2026-11-01.**
+       - **The plan was wrong about the spikes:** their `Messages` builds Artio's FIX messages only;
+         no spike speaks to the exchange. `OrderEntryRig`'s `GatewayModel` is the one fake.
+       - **It echoed `toSeq` but replayed nothing**, so no test could reach the new rule. It is now
+         the exchange's model (most-exchange Design §5, "Report sequence and resend"): every
+         sequenced report kept in a ring per participant; a resend replays `fromSeq`..`toSeq` (0: to
+         the last), each with its own `reportSeq`, then completes with `toSeq` echoed,
+         `oldestRetainedSeq` and `replayedCount`; `TRUNCATED` when part of the range has left the
+         ring. `report(dropped = true)`: kept, never sent. `lose()` now also empties the ring below
+         it, so the truncated-resend test's `truncateNextResend` flag is gone: the model derives it.
+         `resends` records what was asked.
+       - **New test, from §5 "The request is a fence":** A's and X's acknowledgements dropped,
+         B's delivered. The SDK asks (1, 1); the completion leaves 3 missing, so it settles nothing
+         and asks (3, 0); X is acknowledged, never rejected, each 35=8 once. **Mutations, each
+         caught:** the model replaying nothing (the old fake); the model ignoring `toSeq`; and the
+         SDK's old rule (settle at every `COMPLETE`), patched in `../most-exchange` for one run with
+         `-PmostExchange.local=true` and restored: X went to the client as "not sequenced (gateway
+         failover)" while live at the exchange.
+       - The existing fence tests still cover their paths: the restart fence rejects not sequenced
+         (all below `nextSeq` held), and the truncated resend goes to a mass status.
+         `./gradlew build` green: 378 tests, `order-entry` 258.
     7. **For real** (`verify-for-real`): `e2e/run-e2e.sh` against v8 installs of `../most-exchange`,
        with a step for a ClOrdID that does not fit; the Docker stack wiped and brought up again.
        Optionally `e2e/run-perf.sh`, under `perf-claim`.

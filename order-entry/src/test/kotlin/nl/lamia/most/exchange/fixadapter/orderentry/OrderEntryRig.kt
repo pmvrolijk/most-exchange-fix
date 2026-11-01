@@ -85,7 +85,7 @@ class OrderEntryRig(
  * The exchange as the adapter's order entry meets it (most-exchange Adapters.md §1–§2), over real
  * Aeron on the adapter's driver: the directory, broadcast on a cycle as discovery does, and a gateway
  * per endpoint that records what it is sent, sends the reports a test asks for, and answers the
- * SDK's mass status and resend requests `COMPLETE`, stating no order and replaying nothing.
+ * SDK's mass status and resend requests as the exchange does ([GatewayModel]).
  */
 class ExchangeModel(aeronDir: String, var broadcast: DirectoryBroadcast?) : Polled, AutoCloseable {
     private val aeron = Aeron.connect(Aeron.Context().aeronDirectoryName(aeronDir))
@@ -127,7 +127,14 @@ data class GatewayOrder(val participantId: Long, val clOrdId: String, val securi
 
 data class GatewayCancel(val participantId: Long, val clOrdId: String, val origClOrdId: String, val exchangeOrderId: Long, val securityId: Int)
 
-/** One order entry gateway: its order stream in, its report stream out. */
+/**
+ * One order entry gateway: its order stream in, its report stream out. Its exchange as most-exchange's
+ * Design.md §5 specifies it ("Report sequence and resend", "Order mass status"): every sequenced
+ * report is kept in a ring per participant; a `ReportResendRequest` replays the retained ones from
+ * `fromSeq` to `toSeq` inclusive (0: to the last), each with its own `reportSeq`, then completes with
+ * `toSeq` echoed, `COMPLETE`, or `TRUNCATED` when some asked for are gone from the ring. A mass status
+ * states the orders open here.
+ */
 class GatewayModel(aeron: Aeron, val endpoint: GatewayEndpoint) : Polled, AutoCloseable {
     private val requests: Subscription = aeron.addSubscription(endpoint.orderEntryChannel, endpoint.orderEntryStreamId)
     private val reports: ExclusivePublication = aeron.addExclusivePublication(endpoint.executionReportChannel, endpoint.executionReportStreamId)
@@ -154,21 +161,37 @@ class GatewayModel(aeron: Aeron, val endpoint: GatewayEndpoint) : Polled, AutoCl
     /** Orders this gateway's exchange holds open, per participant: what a mass status states. */
     private val open = HashMap<Long, LinkedHashMap<String, Pair<Long, Long>>>() // clOrdId -> (exchangeOrderId, leavesQty)
 
-    /** The next resend is answered TRUNCATED, as when the ring no longer holds its start. */
-    var truncateNextResend = false
+    /** Per participant, the ring: each retained report's bytes by `reportSeq`. */
+    private val ring = HashMap<Long, HashMap<Long, ByteArray>>()
 
-    /** A reportSeq given and never sent, as a report lost on the way: the client sees a gap. */
+    /** Per participant, the lowest `reportSeq` the ring still holds: 1 until [lose]. */
+    private val oldestRetained = HashMap<Long, Long>()
+
+    /** The `ReportResendRequest`s this gateway answered, as (fromSeq, toSeq). */
+    val resends = mutableListOf<Pair<Long, Long>>()
+
+    /**
+     * A reportSeq given and never sent, and gone from the ring by the time it is asked for, with every
+     * report before it: the client sees a gap, and a resend from below it is TRUNCATED.
+     */
     fun lose(participantId: Long) {
-        nextSeq[participantId] = nextSeq(participantId) + 1
+        val seq = nextSeq(participantId)
+        nextSeq[participantId] = seq + 1
+        oldestRetained[participantId] = seq + 1
+        ring[participantId]?.keys?.removeIf { it <= seq }
     }
 
-    /** Sends a ClientExecutionReport, sequenced unless it is an ORDER_STATUS. Returns its reportSeq. */
+    /**
+     * Sends a ClientExecutionReport, sequenced unless it is an ORDER_STATUS, and keeps it in the ring.
+     * [dropped]: sequenced and kept, never sent, as a report the gateway dropped on the way. Returns
+     * its reportSeq.
+     */
     @Suppress("LongParameterList")
     fun report(
         participantId: Long, clOrdId: String, execType: nl.lamia.most.exchange.sbe.ExecType, exchangeOrderId: Long,
         price: Long = 0L, lastQty: Long = 0L, leavesQty: Long = 0L, cumQty: Long = 0L, origQty: Long = 0L, securityId: Int = 42,
         reason: nl.lamia.most.exchange.sbe.RejectReason = nl.lamia.most.exchange.sbe.RejectReason.NONE, side: Side = Side.BUY,
-        origClOrdId: String = clOrdId,
+        origClOrdId: String = clOrdId, dropped: Boolean = false,
     ): Long {
         val seq = if (execType == nl.lamia.most.exchange.sbe.ExecType.ORDER_STATUS) 0L else nextSeq(participantId).also { nextSeq[participantId] = it + 1 }
         // Since schema 8 every report carries clOrdId and origClOrdId: a cancel's, the order's in 41 (§5.3).
@@ -176,7 +199,10 @@ class GatewayModel(aeron: Aeron, val endpoint: GatewayEndpoint) : Polled, AutoCl
             .participantId(participantId).clOrdId(clOrdId).origClOrdId(origClOrdId).exchangeOrderId(exchangeOrderId).price(price).lastQty(lastQty)
             .leavesQty(leavesQty).cumQty(cumQty).origQty(origQty).securityId(securityId).rejectReason(reason)
             .execType(execType).side(side).enrichment(nl.lamia.most.exchange.sbe.Enrichment.KNOWN).reportSeq(seq)
-        stage(MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength(), isStatus = false)
+        val length = MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength()
+        // In the ring whether or not it is sent; dropped, as on the way: only a resend brings it (§5).
+        if (seq > 0L) ring.getOrPut(participantId) { HashMap() }[seq] = ByteArray(length).also { out.getBytes(0, it) }
+        if (!dropped) stage(length, isStatus = false)
         val orders = open.getOrPut(participantId) { LinkedHashMap() }
         when (execType) {
             nl.lamia.most.exchange.sbe.ExecType.NEW, nl.lamia.most.exchange.sbe.ExecType.TRADE ->
@@ -218,11 +244,25 @@ class GatewayModel(aeron: Aeron, val endpoint: GatewayEndpoint) : Polled, AutoCl
             }
             ReportResendRequestDecoder.TEMPLATE_ID -> {
                 resend.wrap(buffer, body, header.blockLength(), header.version())
+                val participant = resend.participantId()
+                val fromSeq = resend.fromSeq()
+                val toSeq = resend.toSeq()
+                resends += fromSeq to toSeq
+                val next = nextSeq(participant)
+                val oldest = oldestRetained[participant] ?: 1L
+                val last = if (toSeq == 0L) next - 1L else minOf(toSeq, next - 1L)
+                var replayed = 0
+                val retained = ring[participant].orEmpty()
+                for (seq in maxOf(fromSeq, oldest)..last) {
+                    val bytes = retained[seq] ?: continue
+                    staged.addLast(bytes)
+                    owed.addLast(bytes.size to false)
+                    replayed++
+                }
                 val e = ReportResendCompleteEncoder().wrapAndApplyHeader(out, 0, outHeader)
-                    .participantId(resend.participantId()).requestId(resend.requestId()).fromSeq(resend.fromSeq())
-                    .toSeq(resend.toSeq()).nextSeq(nextSeq(resend.participantId())).oldestRetainedSeq(1L).replayedCount(0)
-                    .status(if (truncateNextResend) RequestStatus.TRUNCATED else RequestStatus.COMPLETE)
-                truncateNextResend = false
+                    .participantId(participant).requestId(resend.requestId()).fromSeq(fromSeq)
+                    .toSeq(toSeq).nextSeq(next).oldestRetainedSeq(oldest).replayedCount(replayed)
+                    .status(if (fromSeq < oldest && fromSeq < next) RequestStatus.TRUNCATED else RequestStatus.COMPLETE)
                 stage(MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength(), isStatus = false)
             }
         }

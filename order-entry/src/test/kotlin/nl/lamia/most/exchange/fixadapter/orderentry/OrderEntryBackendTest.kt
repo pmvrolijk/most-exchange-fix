@@ -913,8 +913,7 @@ class OrderEntryBackendTest {
         // Shard 1 loses a report: the SDK sees the gap, fences, the resend is truncated, and a mass
         // status of shard 1 follows (most-exchange Adapters.md §4). It states B, the one order open there.
         val statusesBefore = adapter.gateway(1).statusesAnswered
-        adapter.gateway(1).lose(1001L)
-        adapter.gateway(1).truncateNextResend = true
+        adapter.gateway(1).lose(1001L) // gone from the ring too: the resend is TRUNCATED
         adapter.gateway(1).report(1001L, b.clOrdId, ExecType.NEW, 6001L, price = b.price, leavesQty = b.qty, origQty = b.qty, securityId = 43)
         pollUntil(*adapter.all(), what = "shard 1's mass status") { adapter.gateway(1).statusesAnswered > statusesBefore }
         pollFor(300, *adapter.all())
@@ -925,6 +924,37 @@ class OrderEntryBackendTest {
         pollUntil(*adapter.all(), what = "each shard's reportSeq stored") {
             adapter.rig.backend.store.firstMissing(1001L, 0) == 2L && adapter.rig.backend.store.firstMissing(1001L, 1) == adapter.gateway(1).nextSeq(1001L)
         }
+    }
+
+    @Test
+    fun `an order whose report the gateway dropped above a bounded resend is fenced for again, and acknowledged, never rejected`() {
+        // most-exchange Adapters.md §4 and its Design.md §5, "The request is a fence" (schema 8): a gap
+        // is asked for by its bounds, and a client still missing a report below the completion's
+        // nextSeq settles nothing and fences again. Settled then, X, live at the exchange, would have
+        // been rejected to the client as never sequenced (non-negotiable 1).
+        val adapter = start()
+        adapter.awaitExchange()
+        val session = adapter.logon()
+        for (id in listOf("ORD-A", "ORD-B", "ORD-X")) adapter.send(session, order(id))
+        pollUntil(*adapter.all(), what = "three orders at the gateway") { adapter.gateway(0).orders.size == 3 }
+        val g = adapter.gateway(0)
+        val (a, b, x) = g.orders
+        // A's acknowledgement dropped, B's delivered: a gap at 1. X's dropped too, above that gap.
+        g.report(1001L, a.clOrdId, ExecType.NEW, 5001L, price = a.price, leavesQty = a.qty, origQty = a.qty, dropped = true)
+        g.report(1001L, b.clOrdId, ExecType.NEW, 5002L, price = b.price, leavesQty = b.qty, origQty = b.qty)
+        g.report(1001L, x.clOrdId, ExecType.NEW, 5003L, price = x.price, leavesQty = x.qty, origQty = x.qty, dropped = true)
+        pollUntil(*adapter.all(), what = "three 35=8s (resends ${g.resends})") { adapter.reports(session).size >= 3 }
+        pollFor(300, *adapter.all())
+
+        val reports = adapter.reports(session)
+        assertEquals(listOf("ORD-A", "ORD-B", "ORD-X"), reports.map { it[11].orEmpty() }.sorted(), "each order's 35=8 once: $reports")
+        assertTrue(reports.all { it[150] == "0" && it[39] == "0" }, "each acknowledged, none rejected: $reports")
+        assertEquals(listOf("1", "2", "3"), reports.map { it[17].orEmpty() }.sorted(), "each reportSeq once")
+        assertEquals(
+            listOf(1L to 1L, 3L to 0L), g.resends.takeLast(2),
+            "the gap asked for by its bounds, then what is missing above everything received, unbounded",
+        )
+        pollUntil(*adapter.all(), what = "the reportSeq stored past X's") { adapter.rig.backend.store.firstMissing(1001L, 0) == 4L }
     }
 
     private fun cancelOf(origClOrdId: String, clOrdId: String) = OrderCancelRequestEncoder().apply {

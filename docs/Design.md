@@ -1625,7 +1625,11 @@ The archive's recorded position (§6.2) then means durable.
     - **The bounded resend** (`toSeq`) is the SDK's: it bounds a gap's resend, and settles an
       unanswered request only once it holds every report below the completion's `nextSeq`. No
       adapter code; the test fakes that answer a `ReportResendRequest` must echo `toSeq` and stop
-      at it.
+      at it. **Done (step 6):** the rig's gateway is now the exchange's model (its Design §5): a ring
+      per participant, a resend replaying `fromSeq` to `toSeq`, `TRUNCATED` from the ring, and a
+      report that can be dropped on the way. `OrderEntryBackendTest` "an order whose report the
+      gateway dropped above a bounded resend is fenced for again, and acknowledged, never
+      rejected" fails on the SDK's old rule.
     - **Found:** the SDK's `newOrder` and `cancel` take a `ClOrdId` object, one allocation per
       request on the library thread (the SDK already allocates one record per send). Not changed
       now; a buffer-based overload would be a change to most-exchange's `client` (CLAUDE.md 4).
