@@ -143,6 +143,9 @@ about 15 ms in the spike, through the same ABORT as back-pressure.
 
 ## 5. The exchange's `clOrdId` is derived from Artio's sequence
 
+**Superseded 2026-11-01 by §17** (schema version 8): the exchange takes the client's own ClOrdID.
+Kept for the record.
+
 Decided with the user on 2026-10-09 (Design.md §3.2).
 
 The exchange needs an `int64` `clOrdId`, unique per participant for the trading day. A FIX ClOrdID
@@ -264,7 +267,8 @@ common case free of configuration. An endpoint that moves in a later directory i
 followed: switching a live `OrderEntrySession` to new links is the SDK's business, and it has no
 call for it. A restart takes the new endpoint.
 
-**The block after an id collision: accepted, then logged out, lifted by any reset.** The Logon is
+**The block after an id collision: accepted, then logged out, lifted by any reset.** *Superseded
+2026-11-01 by §17: with the client's own ClOrdID there is no collision, and no block.* The Logon is
 authenticated on the engine's framer thread, and the store belongs to the library's. Refusing at
 the Logon would need the block shared across threads, and Artio's reject happens before a 141=Y
 could raise the `sequenceIndex`, so only an operator could ever lift it. Logging the session out
@@ -613,3 +617,53 @@ order entry's archive is another engine.
 - **What it did not fix:** at saturation market data still takes ~8% of order entry's capacity on the
   laptop (A4). That share is CPU or the disk, not the archive.
 
+
+## 17. Schema version 8: the client's ClOrdID is the exchange's, and the store keys on it
+
+Decided with the user on 2026-11-01, each the recommendation, on most-exchange's schema version 8
+(its Adapters.md §2 and §4, its R§18). Design §3.2, §3.3, §6.1, §8.30. Supersedes §5 and the block
+of §9.
+
+**What schema 8 removes, and what it does not.** The exchange takes `clOrdId` and `origClOrdId` as
+`char[20]`, the participant's own text. The derived `int64` of §5 did two jobs: it was the
+exchange's id, and it was the row's place in arrival order, on which recovery's high-water (§12),
+the order a 35=AF is answered in, and the trace ring's join rest. Only the first job goes. The id
+collision, its block and the operator's reset existed only because a derived id could repeat after
+Artio's state was lost (§5, §9). The client's own id, which the store already holds unique, cannot.
+**The startup recovery (§12) stays.** A host crash still takes RocksDB's unfsynced tail, the 35=D
+is still in the archive and may be at the exchange, and the exchange still does not check
+`clOrdId`. Without the rebuild, a request sent and never answered is never settled, and a lost
+ClOrdID slips past the duplicate check. most-exchange's R§18 says the same of the store.
+
+**Why the store is keyed by the ClOrdID, not by the position.** Sending the ClOrdID and keeping the
+derived number as the row's key would have been the smaller change. But after Artio's state is lost
+the number repeats, two requests would share a key, and the collision with its block would be back.
+Keyed by the ClOrdID, a key is unique because the store refuses a duplicate ClOrdID, whatever happens
+to Artio. The position stays on the row, for what only it can do, and two positions are compared
+only within one Artio lifetime: an epoch per participant, raised when Artio's state is found lost.
+
+**Why a ClOrdID that does not fit is refused, not mapped.** Mapping the ids that do not fit keeps
+every ClOrdID working, but keeps a mapping, its persistence and a second lookup path for the few:
+what schema 8 was taken up to remove. A 35=8 or 35=9 reject rather than a 35=3, because the ClOrdID
+is valid FIX and breaks only the venue's rule, and an order management system handles a rejected
+order where it may treat a session reject as a protocol fault. The cost: a client that sends
+36-character UUIDs must change. The Rules of Engagement say so.
+
+**Why a fresh start, not a migration.** The exchange restores a version 7 order with its id as the
+decimal string of the old `int64`, so its reports name neither the client's ClOrdID nor a row's key.
+Carrying such orders across needs a second id per row, and a lookup path for as long as any of them
+lives. Draining needs an operator to cancel resting orders first. Nothing runs in production, so a
+fresh start costs the dev stack a wipe. A live venue's upgrade is left until there is one.
+
+**Why the adapter starts after Artio's state is lost.** The refusal to start (§5, Design §3.2)
+guarded the derived ids, which are gone. What is lost with Artio's state is lost either way: the
+MsgSeqNum, so the client must reset, and the 35=8s the archive held that the client had not
+received. For the client that is its own 141=Y, which the design already answers with a 35=AF from
+the store (Design §2). Refusing to start would leave the operator one remedy, deleting the store too,
+which loses the duplicate check and every open order's state. So the adapter starts a new epoch, and
+logs and counts it.
+
+**The bounded resend needs nothing here.** The SDK chooses a resend's bounds, and settles an
+unanswered request only once it holds every report below the completion's `nextSeq`
+(most-exchange R§18). A request may be settled one fence later. Non-negotiable 1 is unaffected, and
+after a restart the SDK fences unbounded, so recovery is unaffected.

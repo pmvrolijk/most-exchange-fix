@@ -7,6 +7,7 @@ import io.aeron.FragmentAssembler
 import io.aeron.Subscription
 import io.aeron.logbuffer.ControlledFragmentHandler.Action
 import nl.lamia.most.exchange.client.AeronGatewayLink
+import nl.lamia.most.exchange.client.ClOrdId
 import nl.lamia.most.exchange.client.DirectoryClient
 import nl.lamia.most.exchange.client.GatewayEndpoint
 import nl.lamia.most.exchange.client.GatewayLink
@@ -326,7 +327,7 @@ class OrderEntryBackend(
         var restored = 0
         store.forEachInFlight { row ->
             if (row.shardId == shardId) {
-                session.restoreInFlight(row.participantId, row.clOrdId)
+                session.restoreInFlight(row.participantId, ClOrdId.of(row.clOrdId)) // schema 8 bridge, as ShardVenue
                 restored++
             }
         }
@@ -337,7 +338,9 @@ class OrderEntryBackend(
     private inner class ShardListener(private val shardId: Int) : OrderEntryListener {
         override fun onReport(report: ClientExecutionReportDecoder): ReportAction = outbound.onReport(shardId, report)
 
-        override fun onSettled(participantId: Long, clOrdId: Long, fate: OrderFate) = outbound.onSettled(participantId, clOrdId, fate)
+        // Schema 8 bridge, as ShardVenue: every request in flight was sent with its derived id's decimal text.
+        override fun onSettled(participantId: Long, clOrdId: ClOrdId, fate: OrderFate) =
+            outbound.onSettled(participantId, clOrdId.toString().toLong(), fate)
 
         override fun onMassStatusComplete(participantId: Long, status: RequestStatus, orderCount: Int, nextSeq: Long) =
             outbound.onMassStatusComplete(shardId, participantId, status, nextSeq)

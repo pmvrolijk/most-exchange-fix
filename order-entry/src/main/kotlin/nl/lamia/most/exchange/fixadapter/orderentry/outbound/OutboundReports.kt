@@ -2,6 +2,7 @@ package nl.lamia.most.exchange.fixadapter.orderentry.outbound
 
 import nl.lamia.most.exchange.fixadapter.trace.Trace
 import nl.lamia.most.exchange.fixadapter.trace.TraceFormat
+import nl.lamia.most.exchange.client.ClOrdId
 import nl.lamia.most.exchange.client.OrderFate
 import nl.lamia.most.exchange.client.ReportAction
 import nl.lamia.most.exchange.fixadapter.orderentry.artio.StatusUnknownText
@@ -80,9 +81,9 @@ class OutboundReports(
         this.shardId = shardId
         val participantId = report.participantId()
         if (trace.enabled) {
-            trace.event(TraceFormat.REPORT, participantId, report.clOrdId(), System.nanoTime(), report.reportSeq(), report.execType().value())
+            trace.event(TraceFormat.REPORT, participantId, derivedIdOf(report), System.nanoTime(), report.reportSeq(), report.execType().value())
         }
-        val row = store.find(participantId, report.clOrdId())
+        val row = store.find(participantId, derivedIdOf(report))
         if (row == null) {
             lostRows++
             log("participant $participantId: report for clOrdId ${report.clOrdId()}, which the store does not hold; consumed (Design.md §8.17)")
@@ -270,9 +271,17 @@ class OutboundReports(
     }
 
     /** A sequenced report's 35=8 is on its way: its `reportSeq` waits for the archive (§6.2). */
+    /**
+     * Schema 8 bridge (Status §3 item 12, step 1): the derived id a report carries as decimal text,
+     * read from its bytes with nothing allocated; -1, which no row holds, for any other id. Goes when
+     * the store is keyed by the client's own ClOrdID (steps 2-4).
+     */
+    private fun derivedIdOf(report: ClientExecutionReportDecoder): Long =
+        ClOrdId.parseDecimal(report.buffer(), report.offset() + ClientExecutionReportDecoder.clOrdIdEncodingOffset())
+
     private fun delivered(report: ClientExecutionReportDecoder, position: Long) {
         val reportSeq = report.reportSeq()
-        if (trace.enabled) trace.event(TraceFormat.OUT, report.participantId(), report.clOrdId(), System.nanoTime(), reportSeq, shardId.toByte())
+        if (trace.enabled) trace.event(TraceFormat.OUT, report.participantId(), derivedIdOf(report), System.nanoTime(), reportSeq, shardId.toByte())
         if (reportSeq > 0L) delivery.sent(shardId, report.participantId(), reportSeq, position)
     }
 

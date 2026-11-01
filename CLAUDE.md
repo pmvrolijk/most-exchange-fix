@@ -73,8 +73,13 @@ docker compose -f deploy/docker-compose.yml up -d --build   # beside most-exchan
      replaying from its last received MsgSeqNum + 1, never `NO_MESSAGE_REPLAY`: a client back first
      is handed over online with that replay. An offline session handed back below the library's
      last MsgSeqNum is released and asked for again. (Design.md §6.3) → R§11
-8. **The exchange `clOrdId` is `(sequenceIndex << 32) | MsgSeqNum`** of the inbound 35=D/F, never an
-   allocated counter. Refuse to start if Artio's `sequenceIndex` is below the stored one. → R§5
+8. **The exchange `clOrdId` is the client's FIX ClOrdID, as sent** (schema 8), and a 35=F's 41 its
+   `origClOrdId`. One that is not 1–20 of `A-Z a-z 0-9 - _ + ; : . /` (`ClOrdId.isValid`) is refused
+   before it is stored or sent, never mapped. The exchange does not check uniqueness; the store's
+   duplicate check does. Rows are keyed by the ClOrdID. A row's position, `(sequenceIndex << 32) |
+   MsgSeqNum` of its 35=D/F, is never sent, and two positions compare only within one epoch: a loss
+   of Artio's state starts a new one, never a refusal to start or a block. (Design.md §3.2, §6.1)
+   → R§17 (the derived id it replaces: R§5)
 9. **Artio does not validate an application message; the backend does.** Decode every inbound
    message and call `validate()` before using it. A failure is a 35=3 from the decoder's
    `rejectReason` and `invalidTagId`, never forwarded. The dictionary is

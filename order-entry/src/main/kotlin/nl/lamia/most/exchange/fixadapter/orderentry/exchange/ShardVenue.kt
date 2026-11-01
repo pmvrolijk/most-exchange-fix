@@ -1,5 +1,6 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.exchange
 
+import nl.lamia.most.exchange.client.ClOrdId
 import nl.lamia.most.exchange.client.GatewayEndpoint
 import nl.lamia.most.exchange.client.OrderEntrySession
 import nl.lamia.most.exchange.client.RoutedSecurity
@@ -56,12 +57,14 @@ class ShardVenue : OrderVenue {
         expireDate: Int, smpId: Long, smpStrategy: SmpStrategy,
     ): SendResult {
         val session = sessionFor(securityId) ?: return SendResult.NO_GATEWAY
-        return session.newOrder(participantId, clOrdId, securityId, side, price, qty, expireDate, smpId, smpStrategy)
+        // Schema 8 bridge (Status §3 item 12, step 1): the derived id as its decimal text, until the
+        // store sends the client's own ClOrdID (steps 2-4). Allocates.
+        return session.newOrder(participantId, ClOrdId.of(clOrdId), securityId, side, price, qty, expireDate, smpId, smpStrategy)
     }
 
     override fun cancel(participantId: Long, clOrdId: Long, origClOrdId: Long, exchangeOrderId: Long, securityId: Int, side: Side): SendResult {
         val session = sessionFor(securityId) ?: return SendResult.NO_GATEWAY
-        return session.cancel(participantId, clOrdId, origClOrdId, exchangeOrderId, securityId, side)
+        return session.cancel(participantId, ClOrdId.of(clOrdId), ClOrdId.of(origClOrdId), exchangeOrderId, securityId, side)
     }
 
     private fun sessionFor(securityId: Int): OrderEntrySession? {

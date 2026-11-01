@@ -242,36 +242,58 @@ orders, IOC and FOK, replace (35=G), and any value the exchange cannot carry (§
 
 ### 3.2 Identifiers
 
-- **The exchange's `clOrdId` is derived, not allocated** (decided 2026-10-09, R§5):
+- **The exchange's `clOrdId` is the client's own ClOrdID (11), as sent** (decided 2026-11-01, on
+  the exchange's schema version 8; §8.30, R§17). A 35=F's own ClOrdID is its `clOrdId`, and its
+  OrigClOrdID (41) the `origClOrdId`. Nothing is derived, allocated or mapped. The exchange wants
+  the id unique per participant for at least the trading day and does not check it (most-exchange
+  Adapters.md §2): the store's duplicate check below, and retention (§6.1), are what make it so.
+- **A ClOrdID must fit the exchange's rule:** 1 to 20 characters of `A-Z a-z 0-9 - _ + ; : . /`,
+  checked with the SDK's `ClOrdId.isValid` before anything is stored or sent. **One that does not
+  is refused** (decided 2026-11-01), never mapped, never sent (the gateway would refuse it
+  `INVALID_CL_ORD_ID`): §3.3 says how.
+- **The position** `(sequenceIndex << 32) | MsgSeqNum` of a request's 35=D or 35=F is kept on its
+  row and never sent. It is the startup replay's high-water (§8.17), the order a 35=AF is answered
+  in (§3.3), and the trace ring's join to the sender (§9.3). Two positions are compared only within
+  one **epoch**, the participant's count of times Artio's state was found lost (below).
+- **Artio's state lost while the store holds the participant's state** (decided 2026-11-01,
+  superseding the refusal to start below). Found before the bind, from `FixEngine.allSessions()`:
+  a configured session Artio does not know, or knows with a `sequenceIndex` below the stored one
+  (both as before), or with a last received MsgSeqNum below the high-water's at the same
+  `sequenceIndex` (new: Artio has every message a position was taken from). **The adapter starts.** It raises the participant's epoch, so the high-water
+  and the stored receive gap (§2) start again from Artio's new sequence, and logs and counts it.
+  For the client this is its own 141=Y (§2): it logs on resetting, and its 35=AF is answered from
+  the store. The 35=8s the lost archive held for it are not resent.
+- **Until schema 8** (superseded 2026-11-01, R§17; kept for the record):
+  - **The exchange's `clOrdId` is derived, not allocated** (decided 2026-10-09, R§5):
 
-  ```
-  clOrdId = (sequenceIndex << 32) | MsgSeqNum      — of the inbound 35=D or 35=F
-  ```
+    ```
+    clOrdId = (sequenceIndex << 32) | MsgSeqNum      — of the inbound 35=D or 35=F
+    ```
 
-  Artio's `sequenceIndex` counts the session's sequence resets, so the pair is unique for the
-  session's lifetime, and the session is one participant. Nothing has to be persisted to allocate
-  it. A PossDup resend of the same message carries the same MsgSeqNum and so derives the same
-  `clOrdId`. Any 35=D can be found again in Artio's archive by its `clOrdId`.
-- **Guard:** the store keeps the highest `sequenceIndex` seen per participant (its one session,
-  keyed by `participantId`, not Artio's session id, which a wipe can change: decided 2026-10-25).
-  If Artio starts with a lower one (its state was wiped), the adapter refuses to start. Derived ids
-  would otherwise repeat.
-  - **The guard misses a wipe at `sequenceIndex` 0**, the normal case for a session never reset
-    (found 2026-10-25). The store catches the repeat itself: a new request whose `clOrdId` is held
-    by a row with a different FIX ClOrdID is an **id collision** (§6.1). The request is rejected and
-    the session logged out until an operator resets its sequence (§3.3, decided 2026-10-25).
-  - **And at startup** (decided 2026-10-25): a configured order-entry session Artio does not know
-    at all, while the store holds rows or a `sequenceIndex` for its participant, means Artio's state
-    was wiped. The adapter refuses to start.
-  - **Where the guards run** (2026-10-25, slice 2b): both read Artio's own list of the sessions it
-    knows (`FixEngine.allSessions()`, loaded from its session file as the engine starts, offline
-    sessions included), after the store is loaded and **before the acceptor binds**, so no Logon
-    is accepted by an adapter about to refuse to start. "Holds" means any row, a stored
-    `sequenceIndex` above 0, a durable first-missing `reportSeq` above 1, or a block. A session
-    whose `sequenceIndex` is still unknown to Artio (-1) counts as not known. While running, the
-    stored `sequenceIndex` is raised at each claim and on any message that carries a higher one.
-    A claim that comes back below it (Artio's state lost while running) is treated as an id
-    collision: blocked and logged out.
+    Artio's `sequenceIndex` counts the session's sequence resets, so the pair is unique for the
+    session's lifetime, and the session is one participant. Nothing has to be persisted to allocate
+    it. A PossDup resend of the same message carries the same MsgSeqNum and so derives the same
+    `clOrdId`. Any 35=D can be found again in Artio's archive by its `clOrdId`.
+  - **Guard:** the store keeps the highest `sequenceIndex` seen per participant (its one session,
+    keyed by `participantId`, not Artio's session id, which a wipe can change: decided 2026-10-25).
+    If Artio starts with a lower one (its state was wiped), the adapter refuses to start. Derived ids
+    would otherwise repeat.
+    - **The guard misses a wipe at `sequenceIndex` 0**, the normal case for a session never reset
+      (found 2026-10-25). The store catches the repeat itself: a new request whose `clOrdId` is held
+      by a row with a different FIX ClOrdID is an **id collision** (§6.1). The request is rejected and
+      the session logged out until an operator resets its sequence (§3.3, decided 2026-10-25).
+    - **And at startup** (decided 2026-10-25): a configured order-entry session Artio does not know
+      at all, while the store holds rows or a `sequenceIndex` for its participant, means Artio's state
+      was wiped. The adapter refuses to start.
+    - **Where the guards run** (2026-10-25, slice 2b): both read Artio's own list of the sessions it
+      knows (`FixEngine.allSessions()`, loaded from its session file as the engine starts, offline
+      sessions included), after the store is loaded and **before the acceptor binds**, so no Logon
+      is accepted by an adapter about to refuse to start. "Holds" means any row, a stored
+      `sequenceIndex` above 0, a durable first-missing `reportSeq` above 1, or a block. A session
+      whose `sequenceIndex` is still unknown to Artio (-1) counts as not known. While running, the
+      stored `sequenceIndex` is raised at each claim and on any message that carries a higher one.
+      A claim that comes back below it (Artio's state lost while running) is treated as an id
+      collision: blocked and logged out.
 - **FIX ClOrdID (11)** is unique per session for the trading day, and for as long as the order is
   open. A new 35=D reusing a known one is rejected with OrdRejReason 6, *duplicate order*.
 - **`exchangeOrderId`** is kept from the first report (Adapters.md §2) and sent back as OrderID (37).
@@ -286,8 +308,9 @@ except a 35=j, which is never answered.
 | --- | --- |
 | 35=D | Validated (§5.1) and written to the order store, *to send*. `newOrder` follows from the duty cycle once the archive has recorded the 35=D (§6.1, decided 2026-10-26). `BACK_PRESSURED` → retried from the row there |
 | 35=D, ClOrdID known | Another of the session's rows holds the ClOrdID: 35=8, OrdRejReason 6. With PossDup=Y it is dropped instead: a resend of a request already answered |
-| 35=D or 35=F, the same request again | Its derived `clOrdId` and its ClOrdID are already stored together (§6.1, *same*): a back-pressure redelivery, a PossDup resend, or a claim's replay (§2). Dropped: a row still to send is sent once, from the duty cycle (decided 2026-10-26; before, a redelivery sent a row whose own send had been back-pressured). The engine does not check `clOrdId` (most-exchange Adapters.md §2): sent twice, it would be two orders under one id |
-| 35=D or 35=F, an id collision | Another ClOrdID holds the derived `clOrdId` (§3.2, §6.1). **Decided 2026-10-25** (§8.15): answered locally, 35=8 OrdRejReason 99 or 35=9 CxlRejReason 99, Text "session sequence reset required", never sent. Then a Logout with that Text. The session's Logons are refused until an operator resets its sequence, which raises its `sequenceIndex` (§9.1). Its open orders are untouched. Counted, and alertable (§9.2). **How, decided 2026-10-25** (slice 2b): the block is stored per participant as the `sequenceIndex` it was found at (`meta`, §6.1), so it survives a restart. The engine still accepts the Logon (its check runs on the framer thread, away from the store); on acquiring the session, the order-entry library sends a Logout with the same Text and disconnects. A message replayed or arriving before that is rejected with the same Text. **The block lifts when the session comes back with a higher `sequenceIndex`**: an operator's reset, or the client's own Logon with 141=Y. Either makes the derived ids new, so the collision cannot recur |
+| 35=D or 35=F, ClOrdID that does not fit | **Decided 2026-11-01** (§3.2, R§17): a ClOrdID (11) that is not 1 to 20 of `A-Z a-z 0-9 - _ + ; : . /`. A 35=D gets a 35=8, OrdRejReason 99; a 35=F a 35=9, CxlRejReason 99; both with Text "ClOrdID must be 1-20 of A-Z a-z 0-9 - _ + ; : . /". An OrigClOrdID (41) that does not fit names no order: 35=9, CxlRejReason 1, as any unknown order. Answered locally, never stored or sent |
+| 35=D or 35=F, the same request again | Its ClOrdID is already stored at the same position (§3.2, §6.1, *same*; until schema 8, its derived `clOrdId` with its ClOrdID): a back-pressure redelivery, a PossDup resend, or a claim's replay (§2). Dropped: a row still to send is sent once, from the duty cycle (decided 2026-10-26; before, a redelivery sent a row whose own send had been back-pressured). The engine does not check `clOrdId` (most-exchange Adapters.md §2): sent twice, it would be two orders under one id |
+| ~~35=D or 35=F, an id collision~~ | **Superseded 2026-11-01** (schema 8, R§17): with the client's own ClOrdID as the exchange's id, there is no collision, no block and no reset to wait for. Kept for the record: Another ClOrdID holds the derived `clOrdId` (§3.2, §6.1). **Decided 2026-10-25** (§8.15): answered locally, 35=8 OrdRejReason 99 or 35=9 CxlRejReason 99, Text "session sequence reset required", never sent. Then a Logout with that Text. The session's Logons are refused until an operator resets its sequence, which raises its `sequenceIndex` (§9.1). Its open orders are untouched. Counted, and alertable (§9.2). **How, decided 2026-10-25** (slice 2b): the block is stored per participant as the `sequenceIndex` it was found at (`meta`, §6.1), so it survives a restart. The engine still accepts the Logon (its check runs on the framer thread, away from the store); on acquiring the session, the order-entry library sends a Logout with the same Text and disconnects. A message replayed or arriving before that is rejected with the same Text. **The block lifts when the session comes back with a higher `sequenceIndex`**: an operator's reset, or the client's own Logon with 141=Y. Either makes the derived ids new, so the collision cannot recur |
 | 35=D or 35=F, before the directory | No complete directory has arrived yet, so no security can be resolved or routed (§3.5). The same reject as `NOT_READY` below, "exchange unavailable", never "unknown security" (2026-10-25, slice 2b) |
 | 35=D or 35=F, the SDK cannot send | `NOT_READY` (the opening mass status has not finished) or `NO_GATEWAY`. **Decided 2026-10-25: rejected**, 35=8 OrdRejReason 99 or 35=9 CxlRejReason 99, Text "exchange unavailable". Never sent, so the client may retry with a new ClOrdID. Not held: an `ABORT` that lasts stalls every order-entry session, heartbeats included. **Since 2026-10-26** the send is the duty cycle's (§6.1), so the reject is owed on the row and sent from there, through the outbound path, as a fate's is (§5.3). `UNKNOWN_PARTICIPANT`, a shard's session not holding the participant, is a configuration error: the same reject, Text "participant not served", and logged |
 | 35=F | Looked up by OrigClOrdID (41) in the store, then `cancel` with the stored `exchangeOrderId`, security and side. Unknown order, or 41 naming a cancel → 35=9, CxlRejReason 1. OrderID, Side or the security sent and not matching the order's → 35=9, CxlRejReason 1 |
@@ -564,7 +587,7 @@ than 8 significant decimals is **rejected, not rounded**. The conversion must be
 
 | Tag | Required | Exchange field | Conversion; refused values |
 | --- | --- | --- | --- |
-| 11 ClOrdID | Y | `clOrdId`, derived (§3.2) | Stored. Duplicate → OrdRejReason 6 |
+| 11 ClOrdID | Y | `clOrdId`, as sent (§3.2; derived until schema 8) | 1 to 20 of `A-Z a-z 0-9 - _ + ; : . /`, else OrdRejReason 99 (§3.3). Stored. Duplicate → OrdRejReason 6 |
 | 48 SecurityID + 22 SecurityIDSource | Y, or 55 | `securityId` | 22=8: the exchange's `securityId`. 22=4: an ISIN, resolved by the directory. Unknown → OrdRejReason 1 |
 | 55 Symbol | if no 48 | `securityId` | Resolved by the directory |
 | 54 Side | Y | `side` | 1 → BUY, 2 → SELL. Others → reject |
@@ -603,8 +626,8 @@ not `validate()`'s.
 
 | Tag | Exchange field | Conversion |
 | --- | --- | --- |
-| 11 ClOrdID | `clOrdId`, derived (§3.2) | The cancel's own id. Its report carries it |
-| 41 OrigClOrdID | `origClOrdId` | Looked up in the store |
+| 11 ClOrdID | `clOrdId`, as sent (§3.2; derived until schema 8) | The cancel's own id. Its report carries it. Must fit as in a 35=D, else CxlRejReason 99 |
+| 41 OrigClOrdID | `origClOrdId`, as sent | Looked up in the store. One that does not fit names no order: CxlRejReason 1 |
 | 37 OrderID | `exchangeOrderId` | From the store. If sent, it must match |
 | 54 Side, 55/48 | `side`, `securityId` | From the store. If sent, they must match, else 35=9 |
 
@@ -613,7 +636,7 @@ not `validate()`'s.
 | Tag | From |
 | --- | --- |
 | 37 OrderID | `exchangeOrderId` |
-| 11 ClOrdID / 41 OrigClOrdID | The FIX ids stored for `clOrdId`. On a cancel's report, 11 is the cancel's and 41 the order's |
+| 11 ClOrdID / 41 OrigClOrdID | The report's `clOrdId` finds the row (since schema 8, the FIX ClOrdID itself; until then, the ids stored for the derived `clOrdId`). On a cancel's report, 11 is the cancel's and 41 the order's, as the report's own `origClOrdId` also says |
 | 17 ExecID | **Deterministic** (decided 2026-10-09). A sequenced report's ExecID is its `reportSeq`, in decimal. The exchange's counter is replicated, snapshotted and never reset for the participant (most-exchange Design.md §5), and one session is one participant, so it is unique for the session's life. A report delivered twice across a restart carries the same ExecID, and the client can drop it. Everything else (`reportSeq` 0, the adapter's own 35=8s) gets `A<sequenceIndex>.<MsgSeqNum>` of the 35=8 carrying it. Those are never re-delivered by the exchange |
 | 150 ExecType | NEW → 0, TRADE → F, CANCELED → 4, EXPIRED → C, REJECTED → 8, ORDER_STATUS → I |
 | 39 OrdStatus | NEW → 0. TRADE → 1 if `leavesQty` > 0, else 2. CANCELED → 4. EXPIRED → C. REJECTED → 8. ORDER_STATUS → 1 if `cumQty` > 0, else 0 |
@@ -740,34 +763,37 @@ The order store's row is versioned so the fields can be added (§6.1).
 | State | Why | Where |
 | --- | --- | --- |
 | FIX session sequence numbers, every message in and out | FIX resend on reconnect, offline delivery | Artio's archive and replay index, **fsynced** (§6.4) |
-| Per request (an order or a cancel): FIX ClOrdID ↔ `clOrdId` ↔ `exchangeOrderId`, and what the client was told | Answering, cancelling, uniqueness for the day, 35=H/AF, `restoreInFlight` | **RocksDB** plus an in-memory working set (§6.1, decided 2026-10-09) |
+| Per request (an order or a cancel): FIX ClOrdID, the exchange's `clOrdId` since schema 8 (§3.2), ↔ `exchangeOrderId`, its position, and what the client was told | Answering, cancelling, uniqueness for the day, 35=H/AF, `restoreInFlight` | **RocksDB** plus an in-memory working set (§6.1, decided 2026-10-09) |
 | Per participant and shard: first `reportSeq` not yet durably delivered | Resume with a resend after a restart | RocksDB, **advanced only behind the archive** (§6.2) |
-| Per participant (its one session): highest `sequenceIndex` | The derived-id guard (§3.2) | RocksDB |
+| Per participant (its one session): highest `sequenceIndex`, and the epoch | Finding Artio's state lost (§3.2); until schema 8, the derived-id guard | RocksDB |
 
 ### 6.1 The order store
 
 Decided 2026-10-09: **RocksDB, with the working set in memory.**
 
 - **A row per request, an order or a cancel** (decided 2026-10-25). A cancel has its own row, which
-  points at its order's `clOrdId`. Its 35=8 or 35=9 needs the cancel's own ClOrdID (§5.3), and after
+  points at its order's ClOrdID (its derived `clOrdId` until schema 8). Its 35=8 or 35=9 needs the cancel's own ClOrdID (§5.3), and after
   a restart a sent, unanswered cancel goes back to the SDK with `restoreInFlight` like an order.
   A **parked** cancel (§3.3) is a cancel row in state *parked*, so it still survives a restart. Both
   kinds share the session's ClOrdID namespace, so ClOrdID uniqueness covers cancels too.
 - **Keyed by `participantId`**, not Artio's session id (decided 2026-10-25). It is configured one to
   one with a session (§2), it does not change when Artio's state is wiped (§3.2), and every report
   carries it.
-- **In memory:** Agrona maps on the order-entry thread, keyed by (`participantId`, `clOrdId`) and by
-  (`participantId`, FIX ClOrdID). The ClOrdID is hashed from the message's bytes and compared byte
-  for byte along the hash's chain, so a lookup allocates nothing and a hash collision is never a
-  false duplicate. Every read is served from here.
+- **In memory:** Agrona maps on the order-entry thread, keyed by (`participantId`, FIX ClOrdID).
+  **Since schema 8** (decided 2026-11-01, §8.30) that is the one key: a ClOrdID is at most 20
+  bytes, read as the SDK's three words, from a FIX message's bytes or a report's, and compared
+  word for word along its hash's chain, so a lookup allocates nothing and a hash collision is never
+  a false duplicate. Every read is served from here. Until schema 8 there was a second map, by
+  (`participantId`, derived `clOrdId`), which reports and fates were found by.
 - **Inserting a request** reports one of:
   - *new*: written;
-  - *same*: the same `clOrdId` with the same ClOrdID, the very request again (a redelivery after
-    back-pressure, or a PossDup resend). The row is left as it is;
+  - *same*: the ClOrdID held at the same position and epoch, the very request again (a
+    redelivery after back-pressure, a PossDup resend, or a replay). The row is left as it is.
+    Until schema 8: the same `clOrdId` with the same ClOrdID;
   - *duplicate ClOrdID*: another of the participant's rows holds the ClOrdID (§3.2, OrdRejReason 6
     for an order);
-  - *id collision*: another ClOrdID holds the `clOrdId`. Artio's sequence went back without its
-    `sequenceIndex` rising (§3.2). Nothing is written.
+  - ~~*id collision*: another ClOrdID holds the `clOrdId`. Artio's sequence went back without its
+    `sequenceIndex` rising (§3.2). Nothing is written.~~ Gone with schema 8 (R§17).
 
   What each means to the client is the backend's (§3.3); the store only reports it.
 - **RocksDB:** a row per request, written on the library thread. The WAL is **not fsynced**, so a write
@@ -807,22 +833,30 @@ Decided 2026-10-09: **RocksDB, with the working set in memory.**
     argument that the WAL need not be fsynced depends on this (R§4). It must stay configured, and a
     test must hold it.
   - **Column families**, in one database, so they share one WAL and one prefix:
-    - `orders`: (`participantId`, `clOrdId`) → a versioned row. Every row: its kind, FIX ClOrdID,
+    - `orders`: (`participantId`, ClOrdID as 20 bytes, NUL-padded) → a versioned row (since
+      schema 8; until then the key was (`participantId`, derived `clOrdId`)). Every row: its kind,
+      its position and epoch (§3.2), FIX ClOrdID,
       the trading date it was entered on, the shard it was sent to (an order's security's, a
       cancel's order's; added 2026-10-25), the last `reportSeq`, and a fate's 35=8 owed (§6.2). An
       order: `exchangeOrderId` once acknowledged, security, side, price, `origQty`, TimeInForce
       and `expireDate`, SMP as sent, the status last sent (OrdStatus, `cumQty`, `leavesQty`), the
       cumulative notional (128-bit), the ambiguous flag, and room for §5.5's fields. A cancel: its
-      order's `clOrdId`, and its state, *parked*, *sent* or *answered*;
+      order's ClOrdID, and its state, *parked*, *sent* or *answered*;
     - `meta`: per participant and shard, the durable first-missing `reportSeq`; per participant,
-      the highest `sequenceIndex`, an id collision's block, as the `sequenceIndex` it was
-      found at (§3.3; deleted when the block lifts), and the high-water floor: the highest
-      `clOrdId` dropped by retention or answered here with no row (§8.17, added 2026-10-27). **Per shard** (found 2026-10-25, slice 4):
+      the highest `sequenceIndex`, the epoch (§3.2, since schema 8), ~~an id collision's block, as
+      the `sequenceIndex` it was found at (§3.3; deleted when the block lifts)~~ (gone with schema
+      8), and the high-water floor: the highest position, in the current epoch, dropped by
+      retention or answered here with no row (§8.17, added 2026-10-27; a derived `clOrdId` until
+      schema 8). **Per shard** (found 2026-10-25, slice 4):
       each shard's engine numbers a participant's reports on its own (most-exchange
       `MatchingEngineService`), and each shard has its own `OrderEntrySession`. One value per
       participant would have resumed one shard from another's sequence.
 
-    A row of an unknown version is refused, and the adapter does not start.
+    A row of an unknown version is refused, and the adapter does not start. **So is a store written
+    before schema 8** (decided 2026-11-01, §8.30): the upgrade is a fresh start, with the
+    exchange's own restart, and the adapter's error says so. Fresh means the store **and** Artio's
+    state (`fix.logDir`, `fix.archiveDir`): kept alone, the old archive would be replayed into the
+    empty store at startup (§8.17), and every request in it rebuilt and settled as a reject.
   - **Retention** (decided 2026-10-25 for ambiguous orders). A row is dropped when all hold:
     - it was entered before the current trading date (ClOrdID uniqueness is for the day);
     - it is finished: an order in a terminal state (OrdStatus 2, 4, C or 8) and not ambiguous, or
@@ -1059,7 +1093,7 @@ The archive's recorded position (§6.2) then means durable.
    (2026-10-15, §2). Still open: the session schedule, and whether it follows the exchange's
    calendar.
 3. ~~ClOrdID ↔ `clOrdId` mapping and its store~~ **Derived `clOrdId` (§3.2); RocksDB plus in-memory
-   (§6.1)** (2026-10-09).
+   (§6.1)** (2026-10-09). The derived `clOrdId` superseded 2026-11-01 by the ClOrdID as sent (§8.30).
 4. ~~35=G~~ **Rejected** (2026-10-09, §3.3).
 5. ~~Threading~~ **Decided** (2026-10-09, §3.5, §4). That one Artio engine can hand order-entry
    sessions to one library and market-data sessions to another is a spike (§8.13).
@@ -1116,6 +1150,9 @@ The archive's recorded position (§6.2) then means durable.
     rows already hold. The store detects it on insert and writes nothing. Only rows still held
     collide, which covers every open order, because retention keeps those. A wipe of all of Artio's
     state is also refused at startup (§3.2).
+    **Superseded 2026-11-01** (§8.30, R§17): with the client's own ClOrdID as the exchange's id,
+    nothing can collide. The block, its Logout and the operator's reset go; a loss of Artio's
+    state no longer refuses the start (§3.2).
 16. **The SDK's `DirectoryClient` allocates on every broadcast cycle** (found 2026-10-25, slice 2b).
     It stages and commits the whole table each time, new maps, `String`s and records, even when the
     version has not changed. The broadcast repeats every 2–5 s (most-exchange
@@ -1545,6 +1582,38 @@ The archive's recorded position (§6.2) then means durable.
       had one; `docker compose down -v`. Worth reporting to Artio: its own lookup breaks on any
       outbound MsgSeqNum the index skips.
 
+30. **Schema version 8: the client's ClOrdID is the exchange's, and the resend is bounded**
+    (raised by the user 2026-11-01, the priority; most-exchange `5042244`, its Adapters.md §2, §4
+    and R§18; the SDK republished as `0.1.0-SNAPSHOT`). **Decided 2026-11-01** (the user, each the
+    recommendation; R§17):
+    - **The exchange's `clOrdId` is the FIX ClOrdID as sent** (§3.2), the 35=F's 41 its
+      `origClOrdId`. The id collision, its block, its Logout and the operator's reset go (§8.15).
+    - **A ClOrdID or OrigClOrdID that does not fit** (1 to 20 of `A-Z a-z 0-9 - _ + ; : . /`) **is
+      refused**, never mapped (§3.3). Clients that send 36-character UUIDs are shut out; the Rules
+      of Engagement say so.
+    - **The upgrade is a fresh start** of the store and Artio's state, beside the exchange's
+      `most cluster shutdown` and v8 restart (§6.1). A store written before schema 8 refuses the
+      start. A live venue's upgrade path is left until there is one.
+    - **Artio's state lost while the store holds rows: the adapter starts**, in a new epoch,
+      logged and counted (§3.2).
+    - **What stays:** the store, its duplicate check (now what keeps the exchange's id unique for
+      the day), retention, and the startup recovery (§8.17): a host crash still loses RocksDB's
+      tail, and the exchange still does not check `clOrdId`. Rows are keyed by the ClOrdID
+      (§6.1), and carry their position, which the high-water, 35=AF's order and the trace use.
+    - **The bounded resend** (`toSeq`) is the SDK's: it bounds a gap's resend, and settles an
+      unanswered request only once it holds every report below the completion's `nextSeq`. No
+      adapter code; the test fakes that answer a `ReportResendRequest` must echo `toSeq` and stop
+      at it.
+    - **Found:** the SDK's `newOrder` and `cancel` take a `ClOrdId` object, one allocation per
+      request on the library thread (the SDK already allocates one record per send). Not changed
+      now; a buffer-based overload would be a change to most-exchange's `client` (CLAUDE.md 4).
+      And the SDK's version did not change: until the adapter moves, a fresh resolve of
+      `0.1.0-SNAPSHOT` (CI, or Gradle's snapshot cache expiring) breaks `master`'s build.
+    - **Possible, not proposed:** a report for a row a host crash lost carries both ids and every
+      quantity, so it could now be answered from the report alone. Recovery rebuilds those rows
+      first, so the case is left for a request the archive does not have (§8.20).
+    - **Plan:** Status §3 item 12.
+
 ## 9. Control and metrics
 
 One JDK `HttpServer` (no web framework, native-image friendly), on a management address. Decided
@@ -1605,8 +1674,8 @@ on); first readings in Measurements A5.
   (Fixed 2026-10-31, found by the CI build on Linux: close drained until a read returned 0, and
   Agrona's read returns 0 when the block before the wrap is only padding, so up to a ring of events
   after it was lost, neither written nor counted.)
-- **Events**, each with `System.nanoTime()`, the participant and the exchange `clOrdId` (whose low
-  32 bits are the client's MsgSeqNum, CLAUDE.md 8):
+- **Events**, each with `System.nanoTime()`, the participant and the request's position (§3.2;
+  the exchange's derived `clOrdId` until schema 8), whose low 32 bits are the client's MsgSeqNum:
 
   | Event | When | Its extra |
   | --- | --- | --- |

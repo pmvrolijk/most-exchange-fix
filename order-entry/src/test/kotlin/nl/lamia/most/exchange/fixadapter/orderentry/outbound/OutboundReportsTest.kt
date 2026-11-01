@@ -1,5 +1,6 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.outbound
 
+import nl.lamia.most.exchange.client.ClOrdId
 import nl.lamia.most.exchange.client.OrderFate
 import nl.lamia.most.exchange.client.ReportAction
 import nl.lamia.most.exchange.client.SendResult
@@ -127,9 +128,13 @@ class OutboundReportsTest {
         enrichment: Enrichment = Enrichment.KNOWN, securityId: Int = ACME, shard: Int = if (securityId == OTHER_SHARD_SECURITY) 1 else 0,
     ): ReportAction {
         encoder.wrapAndApplyHeader(buffer, 0, headerEncoder)
-            .participantId(P).clOrdId(clOrdId).exchangeOrderId(exchangeOrderId).price(price).lastQty(lastQty)
+            .participantId(P).exchangeOrderId(exchangeOrderId).price(price).lastQty(lastQty)
             .leavesQty(leavesQty).cumQty(cumQty).origQty(10_00000000L).securityId(securityId).rejectReason(reason)
             .execType(execType).side(Side.BUY).enrichment(enrichment).reportSeq(reportSeq)
+        // Schema 8 bridge (Status §3 item 12, step 1): the derived id as decimal text, written with
+        // nothing allocated, so the allocation test below measures the adapter alone.
+        ClOrdId.encodeDecimal(clOrdId, buffer, encoder.offset() + ClientExecutionReportEncoder.clOrdIdEncodingOffset())
+        ClOrdId.encodeDecimal(clOrdId, buffer, encoder.offset() + ClientExecutionReportEncoder.origClOrdIdEncodingOffset())
         decoder.wrapAndApplyHeader(buffer, 0, headerDecoder)
         return outbound.onReport(shard, decoder)
     }

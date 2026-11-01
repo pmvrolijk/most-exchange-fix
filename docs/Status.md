@@ -3,8 +3,13 @@
 Where the adapter stands, what is open, and what to do next. **This is the session entry point** —
 read this, not the handover. [`Handover.md`](Handover.md) is the archive of work records.
 
-Last updated 2026-10-31. **Both backends are built and `bin/adapter` runs them; market data has its
+Last updated 2026-11-01. **Both backends are built and `bin/adapter` runs them; market data has its
 own engine; the adapter has its latency tooling, a baseline and a trace ring.**
+
+- **The priority (the user, 2026-11-01): the exchange's schema version 8** (§3 item 12, Design
+  §8.30, R§17). The exchange now takes the client's ClOrdID as `char[20]` and bounds a resend with
+  `toSeq`; the SDK is republished under the same `0.1.0-SNAPSHOT`, so **`master` stops building at
+  the next fresh resolve**. Analysed and decided, docs written; **no code yet**.
 
 - **Measured** (Measurements A1–A5, X1–X2, the laptop, macOS): at fileSyncLevel 1 the adapter
   answers 1,000 and 3,000 orders/s at a 15–18 ms p50 and saturates at ~4,250 requests/s; the gateway
@@ -20,15 +25,24 @@ own engine; the adapter has its latency tooling, a baseline and a trace ring.**
   skip, a 35=8 sent to a logged-out client was never resent. The skip is now 10,000 Heartbeats.
 - **The GitHub Action** is green on GitHub (item 8). **The Operator's Manual and the Rules of
   Engagement** are written and built (item 11, `docs/manual/`).
-- **Next:** nothing queued by the user. §8.24 waits for the Linux run; several sessions per
+- **Next: §3 item 12, schema version 8.** Then: §8.24 waits for the Linux run; several sessions per
   participant (§8.27) is a low-priority roadmap item; the control API and metrics (Design §9) are
   the largest gap the manuals list.
-- **Committed** through the trace ring (`358d7b5`) and the CI workflow; check `git status` for the rest (Docker, §8.29, the CI action bumps, the manuals).
+- **Committed** through the manuals (`cf9afcd`): Docker, §8.29, the CI action bumps and the manuals included.
 
 The user's frame, 2026-10-31: production is Linux; 300–1,000 orders/s per connection is fine, and
 3,500–5,000/s through one adapter is the target worth reaching. Each participant gets a dedicated
 adapter, with a market-data session beside its order-entry one, on separate ports. Raised, not
 designed: an optional order-entry throttle (Design §8.25).
+
+Decided 2026-11-01 (the user, each the recommendation; Design §3.2, §8.30, R§17):
+- **The exchange's `clOrdId` is the FIX ClOrdID as sent.** The id collision, its block and the
+  operator's reset go. The startup recovery stays: a host crash still loses the store's tail, and
+  the exchange still does not check `clOrdId`.
+- **A ClOrdID or OrigClOrdID that does not fit** (1 to 20 of `A-Z a-z 0-9 - _ + ; : . /`) **is
+  refused** with a 35=8 or 35=9, never mapped.
+- **The upgrade is a fresh start** of the store and Artio's state, beside the exchange's v8 restart.
+- **Artio's state lost while the store holds rows: the adapter starts** in a new epoch, logged.
 
 Decided 2026-10-31 (the user):
 - **Market data gets its own engine**, port and an archive at fileSyncLevel 0 (Design §4, superseding
@@ -194,8 +208,8 @@ Each changes what gets built (`decision-fork`):
 
 ## 3. To do next
 
-In order. Items 1–7, 6a and 8a are done and committed; 9 and 10 are done, uncommitted. **Next: 8,
-the remote and a GitHub Action** (the user's order, 2026-10-31). Then §8.24's investigation with the user's Linux run.
+In order. Items 1–11, 6a and 8a are done and committed. **Next: 12, schema version 8** (the user's
+priority, 2026-11-01). Then §8.24's investigation with the user's Linux run.
 
 1. ~~**Switch the build to GitHub Packages**~~ **Done 2026-10-15.** `mostSdk.url` points at
    `maven.pkg.github.com/pmvrolijk/most-exchange`; `githubUser` + `githubPackagesToken` (classic,
@@ -678,6 +692,40 @@ the remote and a GitHub Action** (the user's order, 2026-10-31). Then §8.24's i
     before the fix; the skip's own test now expects the Logon at +10,001. `./gradlew build` green,
     the e2e 9 of 9, and in Docker a SIGKILL then `deploy/smoke.sh` twice.
     - **Left:** report the lookup to Artio upstream (the user's call: a public issue).
+
+12. **Schema version 8** (the user's priority, 2026-11-01; Design §8.30, R§17). Analysed and decided
+    2026-11-01; Design §3.2, §3.3, §5.1–§5.3, §6, §6.1, §8.15, §8.30, §9.3, CLAUDE.md 8 and R§5, §9,
+    §17 written. Each step builds and tests green before the next (`spec-first-test` for each):
+    1. ~~**The build on v8**~~ **Done 2026-11-01.** The registry's `sbe` and `client` jars say
+       `Most-Sbe-Schema-Version: 8`; `SdkSchemaTest` fails on any other. Only `order-entry` broke
+       (9 call sites, the rig and one test helper). **A bridge, until steps 2–4:** the derived id
+       is sent as its decimal text (`ClOrdId.of(long)`), and a report's id read back with
+       `ClOrdId.parseDecimal`, so behaviour is unchanged; marked "Schema 8 bridge" in
+       `ShardVenue`, `OrderEntryBackend`, `OutboundReports`, `OrderEntryRig` and
+       `OutboundReportsTest`. The bridge's `ClOrdId.of` allocates per send. The rig sets
+       `origClOrdId` and echoes `toSeq`. `./gradlew build` green: 367 tests, `order-entry` 247.
+       No fence test failed under the SDK's new settling rule; step 6 checks they still cover it.
+       Not run: the e2e (needs v8 installs, step 7).
+    2. **The store:** keyed by (`participantId`, ClOrdID, 20 bytes); the position and epoch on the
+       row; one in-memory index by the ClOrdID's three words (`ClOrdIdHasher`'s chain and the
+       `clOrdId` map go); `ID_COLLISION`, the block, `requireSequenceIndex` go; the high-water and
+       floor by position within the epoch; a new row version, and a store written before it
+       refused. `OrderStoreTest` first.
+    3. **Inbound:** `ClOrdId.isValid` on 11 and 41, refused as §3.3 says; the collision paths go;
+       *same* is the ClOrdID at the same position; the 35=AF order by position.
+    4. **Outbound and the SDK:** a report's row found from its `clOrdId` bytes; `onSettled` and
+       `restoreInFlight` with `ClOrdId`; `INVALID_CL_ORD_ID` mapped (OrdRejReason 99, its name as
+       Text); `Ports` and `ShardVenue` pass `ClOrdId`; the trace records the position.
+    5. **Startup:** `StartupGuards` finds Artio's state lost as §3.2 says, and starts a new epoch.
+    6. **The test fakes on v8:** `OrderEntryRig` and the spikes' `Messages` echo `toSeq` and stop at
+       it; fence tests follow the SDK's new settling rule.
+    7. **For real** (`verify-for-real`): `e2e/run-e2e.sh` against v8 installs of `../most-exchange`,
+       with a step for a ClOrdID that does not fit; the Docker stack wiped and brought up again.
+       Optionally `e2e/run-perf.sh`, under `perf-claim`.
+    8. **The manuals:** the Rules of Engagement (the ClOrdID rule and its rejects; the collision's
+       reject and reset gone); the Operator's Manual (the upgrade as a fresh start; the operator's
+       reset gone; Artio's state lost). `deploy/README.md`'s note that wiping the adapter's volume
+       repeats `clOrdId`s goes.
 
 ## 4. What is that is worth having here based on other Fix gateways using Aeron
 

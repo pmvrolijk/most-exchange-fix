@@ -168,10 +168,12 @@ class GatewayModel(aeron: Aeron, val endpoint: GatewayEndpoint) : Polled, AutoCl
         participantId: Long, clOrdId: Long, execType: nl.lamia.most.exchange.sbe.ExecType, exchangeOrderId: Long,
         price: Long = 0L, lastQty: Long = 0L, leavesQty: Long = 0L, cumQty: Long = 0L, origQty: Long = 0L, securityId: Int = 42,
         reason: nl.lamia.most.exchange.sbe.RejectReason = nl.lamia.most.exchange.sbe.RejectReason.NONE, side: Side = Side.BUY,
+        origClOrdId: Long = clOrdId,
     ): Long {
         val seq = if (execType == nl.lamia.most.exchange.sbe.ExecType.ORDER_STATUS) 0L else nextSeq(participantId).also { nextSeq[participantId] = it + 1 }
+        // Schema 8 bridge (Status §3 item 12, step 1): the adapter sends its derived id as decimal text.
         val e = nl.lamia.most.exchange.sbe.ClientExecutionReportEncoder().wrapAndApplyHeader(out, 0, outHeader)
-            .participantId(participantId).clOrdId(clOrdId).exchangeOrderId(exchangeOrderId).price(price).lastQty(lastQty)
+            .participantId(participantId).clOrdId(clOrdId.toString()).origClOrdId(origClOrdId.toString()).exchangeOrderId(exchangeOrderId).price(price).lastQty(lastQty)
             .leavesQty(leavesQty).cumQty(cumQty).origQty(origQty).securityId(securityId).rejectReason(reason)
             .execType(execType).side(side).enrichment(nl.lamia.most.exchange.sbe.Enrichment.KNOWN).reportSeq(seq)
         stage(MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength(), isStatus = false)
@@ -192,13 +194,13 @@ class GatewayModel(aeron: Aeron, val endpoint: GatewayEndpoint) : Polled, AutoCl
             NewOrderSingleDecoder.TEMPLATE_ID -> {
                 newOrder.wrap(buffer, body, header.blockLength(), header.version())
                 orders += GatewayOrder(
-                    newOrder.participantId(), newOrder.clOrdId(), newOrder.securityId(), newOrder.side(),
+                    newOrder.participantId(), newOrder.clOrdId().toLong(), newOrder.securityId(), newOrder.side(),
                     newOrder.price(), newOrder.qty(), newOrder.expireDate(),
                 )
             }
             OrderCancelRequestDecoder.TEMPLATE_ID -> {
                 cancel.wrap(buffer, body, header.blockLength(), header.version())
-                cancels += GatewayCancel(cancel.participantId(), cancel.clOrdId(), cancel.origClOrdId(), cancel.exchangeOrderId(), cancel.securityId())
+                cancels += GatewayCancel(cancel.participantId(), cancel.clOrdId().toLong(), cancel.origClOrdId().toLong(), cancel.exchangeOrderId(), cancel.securityId())
             }
             OrderMassStatusRequestDecoder.TEMPLATE_ID -> {
                 status.wrap(buffer, body, header.blockLength(), header.version())
@@ -218,7 +220,7 @@ class GatewayModel(aeron: Aeron, val endpoint: GatewayEndpoint) : Polled, AutoCl
                 resend.wrap(buffer, body, header.blockLength(), header.version())
                 val e = ReportResendCompleteEncoder().wrapAndApplyHeader(out, 0, outHeader)
                     .participantId(resend.participantId()).requestId(resend.requestId()).fromSeq(resend.fromSeq())
-                    .nextSeq(nextSeq(resend.participantId())).oldestRetainedSeq(1L).replayedCount(0)
+                    .toSeq(resend.toSeq()).nextSeq(nextSeq(resend.participantId())).oldestRetainedSeq(1L).replayedCount(0)
                     .status(if (truncateNextResend) RequestStatus.TRUNCATED else RequestStatus.COMPLETE)
                 truncateNextResend = false
                 stage(MessageHeaderEncoder.ENCODED_LENGTH + e.encodedLength(), isStatus = false)
