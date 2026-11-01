@@ -429,34 +429,36 @@ class OrderStoreTest {
     }
 
     @Test
-    fun `the adapter refuses to start below the highest sequenceIndex stored for the participant`() {
-        // Until Status §3 item 12 step 5 turns the refusal into a new epoch (Design.md §3.2).
+    fun `the highest sequenceIndex is stored per participant, and never lowered`() {
+        // Design.md §3.2: what a session Artio knows is compared with, before the bind.
         val s = open()
         s.recordSequenceIndex(P1, 3)
-        s.recordSequenceIndex(P1, 2) // never lowers
+        s.recordSequenceIndex(P1, 2)
         val again = restart()
         assertEquals(3, again.highestSequenceIndex(P1))
-        val refusal = assertFailsWith<IllegalStateException> { again.requireSequenceIndex(P1, 2) }
-        assertTrue("sequenceIndex" in refusal.message.orEmpty(), refusal.message)
-        again.requireSequenceIndex(P1, 3)
-        again.requireSequenceIndex(P1, 4)
-        again.requireSequenceIndex(P2, 0)
+        assertEquals(0, again.highestSequenceIndex(P2))
     }
 
     @Test
-    fun `the store holds state for a participant with a row, a sequenceIndex, a first-missing or a floor`() {
-        // Design.md §3.2: what makes a session Artio does not know a loss of Artio's state.
+    fun `the store holds positions for a participant with a row of its epoch, a sequenceIndex, a floor or a receive gap`() {
+        // Design.md §3.2: what makes a session Artio does not know a loss of Artio's state. A
+        // first-missing reportSeq is the exchange's, and a row of an earlier epoch an earlier Artio's.
         val s = open()
         s.recordSequenceIndex(P1, 0) // not stored: 0 is where every session starts
         s.findByFix(P1, "ORD-1")
-        assertFalse(s.holdsState(P1))
+        assertFalse(s.holdsPositions(P1))
         s.recordSequenceIndex(P1, 1)
         s.saveFirstMissing(P2, 1, 5L)
         assertEquals(InsertResult.NEW, s.insert(s.order(P4, pos(0, 7), "ORD-7")))
         s.handled(P6, pos(0, 3))
+        s.saveReceiveGap(P5, sequenceIndex = 0, from = 2, to = 4)
+        assertEquals(InsertResult.NEW, s.insert(s.order(P3, pos(0, 9), "OLD-9")))
+        s.beginEpoch(P3, start = 0L)
         val again = restart()
-        for (p in listOf(P1, P2, P4, P6)) assertTrue(again.holdsState(p), "participant $p")
-        assertFalse(again.holdsState(P5))
+        for (p in listOf(P1, P4, P5, P6)) assertTrue(again.holdsPositions(p), "participant $p")
+        assertFalse(again.holdsPositions(P2), "a first-missing alone")
+        assertFalse(again.holdsPositions(P3), "a row of an earlier epoch alone")
+        assertFalse(again.holdsPositions(P7))
     }
 
     @Test
@@ -470,7 +472,7 @@ class OrderStoreTest {
         s.saveReceiveGap(P1, sequenceIndex = 2, from = 13, to = 15)
         s.insert(s.order(P2, pos(0, 4), "OTHER-4"))
 
-        s.beginEpoch(P1)
+        s.beginEpoch(P1, start = 0L) // a session Artio does not know: its sequence starts at (0, 1)
         assertEquals(1, s.epoch(P1))
         assertEquals(0L, s.highWater(P1), "the old positions are another Artio's")
         assertEquals(0, s.highestSequenceIndex(P1))
@@ -494,6 +496,31 @@ class OrderStoreTest {
             InsertResult.DUPLICATE_CLORDID, again.insert(again.order(P1, pos(2, 9), "OLD-9")),
             "the same position in another epoch is another request",
         )
+    }
+
+    @Test
+    fun `a new epoch begun at Artio's position starts there, so no restart replays what Artio held before it`() {
+        // Design.md §3.2: a session Artio knows below the stored sequenceIndex. Its archive still holds
+        // the messages from before; they are an earlier epoch's, every one handled or lost with it.
+        val s = open()
+        s.insert(s.order(P1, pos(3, 20), "OLD-20"))
+        s.recordSequenceIndex(P1, 3)
+        s.saveReceiveGap(P1, sequenceIndex = 3, from = 21, to = 22)
+
+        s.beginEpoch(P1, start = pos(1, 40))
+        assertEquals(1, s.epoch(P1))
+        assertEquals(pos(1, 40), s.highWater(P1), "Artio's last received, at its sequenceIndex")
+        assertEquals(1, s.highestSequenceIndex(P1))
+        assertEquals(0, s.receiveGapFrom(P1))
+        assertEquals(pos(1, 41), s.replayFrom(P1))
+        assertTrue(s.holdsPositions(P1))
+
+        val again = restart()
+        assertEquals(1, again.epoch(P1))
+        assertEquals(pos(1, 40), again.highWater(P1))
+        assertEquals(1, again.highestSequenceIndex(P1))
+        assertEquals(pos(1, 41), again.replayFrom(P1), "written through")
+        assertEquals(0, again.receiveGapFrom(P1))
     }
 
     // ---------------------------------------------------------------- recovery's high-water, §8.17
@@ -578,7 +605,7 @@ class OrderStoreTest {
         val reopened = open()
         assertTrue(reopened.stoppedCleanly)
         assertEquals(0, reopened.size, "the mark is not a row")
-        assertFalse(reopened.holdsState(0L), "nor any participant's state")
+        assertFalse(reopened.holdsPositions(0L), "nor any participant's position")
     }
 
     // ---------------------------------------------------------------- refusals at load
@@ -684,9 +711,11 @@ class OrderStoreTest {
     private companion object {
         const val P1 = 1001L
         const val P2 = 1002L
+        const val P3 = 1003L
         const val P4 = 1004L
         const val P5 = 1005L
         const val P6 = 1006L
+        const val P7 = 1007L
         const val TODAY = 20261026
         const val YESTERDAY = 20261023
 

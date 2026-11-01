@@ -256,13 +256,33 @@ orders, IOC and FOK, replace (35=G), and any value the exchange cannot carry (§
   in (§3.3), and the trace ring's join to the sender (§9.3). Two positions are compared only within
   one **epoch**, the participant's count of times Artio's state was found lost (below).
 - **Artio's state lost while the store holds the participant's state** (decided 2026-11-01,
-  superseding the refusal to start below). Found before the bind, from `FixEngine.allSessions()`:
-  a configured session Artio does not know, or knows with a `sequenceIndex` below the stored one
-  (both as before), or with a last received MsgSeqNum below the high-water's at the same
-  `sequenceIndex` (new: Artio has every message a position was taken from). **The adapter starts.** It raises the participant's epoch, so the high-water
-  and the stored receive gap (§2) start again from Artio's new sequence, and logs and counts it.
-  For the client this is its own 141=Y (§2): it logs on resetting, and its 35=AF is answered from
-  the store. The 35=8s the lost archive held for it are not resent.
+  superseding the refusal to start below). Found before the bind, from `FixEngine.allSessions()`
+  (`StartupGuards`), for each configured order-entry session:
+  - Artio does not know it (or knows it with its `sequenceIndex` still unknown, -1), while the store
+    holds a **position of the participant's epoch**: a high-water (a row of the epoch, or a floor),
+    a stored `sequenceIndex` above 0, or a receive gap (§2). A first-missing `reportSeq` is the
+    exchange's, and a row of an earlier epoch an earlier Artio's: neither counts, or every restart
+    before the client logs on again would start another epoch;
+  - or Artio knows it with a `sequenceIndex` below the stored one.
+
+  **The adapter starts.** It raises the participant's epoch, logs it and counts it (§9.2). The new
+  epoch starts at **Artio's own position** for the session: (0, 0) for a session it does not know,
+  and for one it knows, its `sequenceIndex` and last received MsgSeqNum, read once the session is
+  handed over at startup, which then replays nothing. The high-water, the floor and the stored
+  `sequenceIndex` start there, and the receive gap is cleared, all in one write. Everything Artio
+  archived before it is an earlier epoch's, handled or lost with it; replayed, a request among it
+  whose row retention had dropped would be rebuilt in flight. Every row is kept, for the duplicate
+  check and every open order's state. For the client this is its own 141=Y (§2): it logs on
+  resetting, and its 35=AF is answered from the store. The 35=8s the lost archive held for it are not
+  resent.
+  - **Not a loss** (corrected 2026-11-01, in Status §3 item 12 step 5): Artio knowing the session at
+    the stored `sequenceIndex` with a last received MsgSeqNum below the high-water's. This clause
+    first counted it, on the claim that Artio has every message a position was taken from. A host
+    crash breaks that claim: a 35=D's row is written when the library reads it, before the archive
+    has fsynced it, so RocksDB can keep a row whose message the archive lost. The positions are still
+    one sequence, and the startup recovery rebuilds from there (§8.17). A new epoch would forget the
+    stored receive gap, so what Artio left missing is never asked for, and would start the replay
+    again from the archive's first message.
 - **Until schema 8** (superseded 2026-11-01, R§17; kept for the record):
   - **The exchange's `clOrdId` is derived, not allocated** (decided 2026-10-09, R§5):
 
@@ -1595,7 +1615,9 @@ The archive's recorded position (§6.2) then means durable.
       `most cluster shutdown` and v8 restart (§6.1). A store written before schema 8 refuses the
       start. A live venue's upgrade path is left until there is one.
     - **Artio's state lost while the store holds rows: the adapter starts**, in a new epoch,
-      logged and counted (§3.2).
+      logged and counted (§3.2). Corrected in step 5: a received MsgSeqNum below the high-water
+      at the same `sequenceIndex` is a host crash's, not a loss; the epoch starts at Artio's
+      position, not at 0; and only a position of the epoch makes an unknown session a loss.
     - **What stays:** the store, its duplicate check (now what keeps the exchange's id unique for
       the day), retention, and the startup recovery (§8.17): a host crash still loses RocksDB's
       tail, and the exchange still does not check `clOrdId`. Rows are keyed by the ClOrdID
@@ -1639,7 +1661,9 @@ management address only.
 
 - **Counters:** messages in and out by MsgType; rejects by reason, with `ORDER_EXPIRED` on day
   orders separately (§3.6); fates by kind and participant; back-pressure
-  aborts in both directions; gateway switches; fences; duplicate reports; store writes.
+  aborts in both directions; gateway switches; fences; duplicate reports; store writes; epochs
+  begun, Artio's state found lost at startup (§3.2; `OrderEntryBackend.epochsBegun`, until this
+  section is built).
 - **Gauges:** sessions logged on; open orders; the durable `reportSeq` lag per participant, in
   reports and in archive bytes.
 - **Internal latencies**, as HdrHistograms recorded on the library thread. A `Recorder` swaps

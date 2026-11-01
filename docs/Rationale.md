@@ -663,6 +663,16 @@ the store (Design §2). Refusing to start would leave the operator one remedy, d
 which loses the duplicate check and every open order's state. So the adapter starts a new epoch, and
 logs and counts it.
 
+**Why the new epoch starts at Artio's position, and what is not a loss** (found building it,
+2026-11-01). The first draft of Design §3.2 started the epoch at 0, and also counted a received
+MsgSeqNum below the high-water at the same `sequenceIndex` as a loss. Both were wrong. Started at
+0, the next restart replays Artio's whole archive. When Artio knows the session, the archive holds
+the earlier epoch's messages, and one whose row retention dropped would be rebuilt in flight as if
+new. And a host crash leaves a row whose 35=D the archive lost: the row is written when the library
+reads the message, the archive fsyncs after. That is the recovery of §12, within one sequence. Made
+an epoch, it would lose the stored receive gap, and the 35=Ds missing in it would never be asked
+for again.
+
 **The bounded resend needs nothing here.** The SDK chooses a resend's bounds, and settles an
 unanswered request only once it holds every report below the completion's `nextSeq`
 (most-exchange R§18). A request may be settled one fence later. Non-negotiable 1 is unaffected, and

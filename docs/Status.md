@@ -98,9 +98,10 @@ Decided 2026-10-25 (Design §3.2, §6.1), each the recommendation:
   can change, and the `sequenceIndex` guard with it.
 - **A cancel has its own row,** pointing at its order. Parked is a state of that row.
 - **An ambiguous order is retained like an open one** until a report or an operator settles it.
-- **An id collision** (§8.15) is rejected, then the session is logged out, and its Logons are
+- ~~**An id collision** (§8.15) is rejected, then the session is logged out, and its Logons are
   refused until an operator resets its sequence. A configured session Artio does not know, while
-  the store holds rows for its participant, refuses the start.
+  the store holds rows for its participant, refuses the start.~~ Superseded 2026-11-01 by schema 8
+  (Design §3.2, R§17): no collision, and a loss of Artio's state starts a new epoch.
 - **`NOT_READY` and `NO_GATEWAY` reject** a 35=D or 35=F, "exchange unavailable". They are not
   held: a lasting `ABORT` stalls every order-entry session, heartbeats included.
 - **A second cancel while one is pending** is a 35=9, CxlRejReason 3.
@@ -731,7 +732,33 @@ priority, 2026-11-01). Then §8.24's investigation with the user's Linux run.
          position (store and inbound), the high-water ignoring the epoch, no format check, a NUL
          accepted in a FIX lookup, an unfit ClOrdID let through. `./gradlew build` green: 370 tests,
          `order-entry` 250.
-    5. **Startup:** `StartupGuards` finds Artio's state lost as §3.2 says, and starts a new epoch.
+    5. ~~**Startup:** `StartupGuards` finds Artio's state lost as §3.2 says, and starts a new epoch.~~
+       **Done 2026-11-01.** `StartupGuards.losses` reads only; the backend begins each epoch, logs it
+       and counts it (`epochsBegun`, for §9.2). **§3.2 corrected while building it**, three ways:
+       - a received MsgSeqNum below the high-water at the same `sequenceIndex` is **not** a loss:
+         a host crash leaves exactly that (a row written before the archive fsynced its 35=D), and
+         an epoch would forget the receive gap and replay from the archive's start. `SessionInfo`
+         has no received number anyway;
+       - the epoch starts at **Artio's position**, not 0: (0, 0) for a session Artio does not know,
+         at once; for one it knows, its `sequenceIndex` and last received, when it is handed over at
+         startup with no replay (`epochAtHandover`). Started at 0, the next start replays the earlier
+         epoch's archive and rebuilds a request whose row retention dropped;
+       - an unknown session is a loss only while the store holds a **position of the epoch**
+         (`holdsPositions`: a high-water, a stored `sequenceIndex`, a receive gap). Old rows or a
+         first-missing would start an epoch at every restart until the client logs on.
+       - `requireSequenceIndex`, `holdsState` and the parameterless `beginEpoch` gone;
+         `positionOf` moved to `RequestRow`.
+       - **Tests**, from §3.2 first: `StartupGuardsTest` (6, Artio's `SessionInfo` faked); in
+         `OrderStoreTest`, an epoch begun at Artio's position, and what counts as a position; the
+         two backend refusals replaced by their opposite, on real Artio: an unknown session starts
+         in epoch 1 (a held position is a new order, a held ClOrdID still a duplicate), and a
+         session known below the stored index starts at Artio's position, with no later start
+         rebuilding an old 35=D. **Mutations, each caught:** the handover's epoch at 0; an earlier
+         epoch's rows counted as positions; no check of a known session's index. Not caught, as
+         expected: the old replay start in place of no replay. Before the epoch the stored index is
+         above Artio's, so it asks from past Artio's end; no replay is kept, explicit. Not covered:
+         the epoch written before the receive gaps read the store (ordered, commented).
+         `./gradlew build` green: 377 tests, `order-entry` 257.
     6. **The test fakes on v8:** `OrderEntryRig` and the spikes' `Messages` echo `toSeq` and stop at
        it; fence tests follow the SDK's new settling rule.
     7. **For real** (`verify-for-real`): `e2e/run-e2e.sh` against v8 installs of `../most-exchange`,

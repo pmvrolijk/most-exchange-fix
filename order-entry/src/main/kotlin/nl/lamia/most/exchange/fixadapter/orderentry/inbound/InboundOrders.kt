@@ -196,7 +196,7 @@ class InboundOrders(
         d.decode(message, offset, length)
         if (!d.validate()) return sessionReject(replies, d.header(), d.invalidTagId(), d.rejectReason())
 
-        val id = positionOf(sequenceIndex, d.header().msgSeqNum())
+        val id = RequestRow.positionOf(sequenceIndex, d.header().msgSeqNum())
         d.clOrdID(clOrdId)
         val held = store.findByFixClOrdId(participantId, clOrdId.buffer(), clOrdId.offset(), clOrdId.length)
         if (held != null && isSameRequest(participantId, held, id)) {
@@ -283,7 +283,7 @@ class InboundOrders(
         c.decode(message, offset, length)
         if (!c.validate()) return sessionReject(replies, c.header(), c.invalidTagId(), c.rejectReason())
 
-        val id = positionOf(sequenceIndex, c.header().msgSeqNum())
+        val id = RequestRow.positionOf(sequenceIndex, c.header().msgSeqNum())
         c.clOrdID(clOrdId)
         c.origClOrdID(origClOrdId)
         val held = store.findByFixClOrdId(participantId, clOrdId.buffer(), clOrdId.offset(), clOrdId.length)
@@ -556,9 +556,6 @@ class InboundOrders(
     private fun isPossDup(h: HeaderDecoder): Boolean = h.hasPossDupFlag() && h.possDupFlag()
 
     private companion object {
-        /** A request's position (Design.md §3.2): never sent, since schema 8, but kept on its row. */
-        fun positionOf(sequenceIndex: Int, msgSeqNum: Int): Long = (sequenceIndex.toLong() shl 32) or (msgSeqNum.toLong() and 0xffffffffL)
-
         /** Earlier epochs first, then by position (§3.2). */
         val IN_ARRIVAL_ORDER = Comparator<RequestRow?> { a, b ->
             if (a!!.epoch != b!!.epoch) a.epoch.compareTo(b.epoch) else a.position.compareTo(b.position)

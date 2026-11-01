@@ -36,6 +36,7 @@ import nl.lamia.most.exchange.fixadapter.orderentry.inbound.ArchivedSends
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.InboundOrders
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.Texts
 import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
+import nl.lamia.most.exchange.fixadapter.orderentry.store.RequestRow
 import nl.lamia.most.exchange.fixadapter.session.FixAcceptor
 import nl.lamia.most.exchange.fixadapter.session.Role
 import nl.lamia.most.exchange.fixadapter.session.RoleClaims
@@ -129,6 +130,13 @@ class OrderEntryBackend(
     /** Shards whose directory endpoint has moved from the one their session was created with, as last logged. */
     private val movedLogged = HashSet<Int>()
 
+    /** Participants whose Artio state was found lost at this start, each a new epoch (Design.md §3.2). */
+    var epochsBegun = 0
+        private set
+
+    /** Losses on a session Artio knows: the epoch starts at its position once it is handed over (§3.2). */
+    private val epochAtHandover = HashMap<Long, StartupGuards.Loss>()
+
     /** A replayed message from another session than the one it was delivered to, as first seen (Design.md §8.17). */
     private var misrouted: String? = null
     private val replayBuffer = MutableAsciiBuffer()
@@ -138,7 +146,9 @@ class OrderEntryBackend(
         require(participantIds.isNotEmpty()) { "no order-entry session is configured" }
         try {
             store.load(tradingDate.asInt)
-            StartupGuards.check(acceptor.engine.allSessions(), acceptor.sessions, store)
+            for (loss in StartupGuards.losses(acceptor.engine.allSessions(), acceptor.sessions, store)) {
+                if (loss.isKnown) epochAtHandover[loss.participantId] = loss else beginEpoch(loss, start = 0L)
+            }
             aeron = owned(Aeron.connect(Aeron.Context().aeronDirectoryName(acceptor.config.aeronDir)))
             val libraryConfiguration = acceptor.libraryConfiguration(claims()).apply {
                 libraryName("order-entry")
@@ -217,8 +227,13 @@ class OrderEntryBackend(
             val configured = acceptor.sessions.find(senderCompId = key.localCompId(), targetCompId = key.remoteCompId()) ?: continue
             if (configured.role != Role.ORDER_ENTRY) continue
             val participantId = checkNotNull(configured.participantId)
-            val from = store.replayFrom(participantId)
-            sessions.requestAtStartup(participantId, info.sessionId(), replayFrom = (from and 0xffffffffL).toInt(), replayIndex = (from ushr 32).toInt())
+            if (participantId in epochAtHandover) {
+                // Everything Artio archived for it is an earlier epoch's: nothing is replayed (§3.2).
+                sessions.requestAtStartup(participantId, info.sessionId(), replayFrom = FixLibrary.NO_MESSAGE_REPLAY, replayIndex = 0)
+            } else {
+                val from = store.replayFrom(participantId)
+                sessions.requestAtStartup(participantId, info.sessionId(), replayFrom = (from and 0xffffffffL).toInt(), replayIndex = (from ushr 32).toInt())
+            }
             while (sessions.isRequesting || sessions.isAnyReplaying) {
                 check(System.nanoTime() < deadline) {
                     "order entry: the offline sessions were not handed over, their archives replayed, within ${STARTUP_TIMEOUT_NS / 1_000_000_000L} s"
@@ -228,6 +243,7 @@ class OrderEntryBackend(
             }
             misrouted?.let { error("order entry: $it; refusing to start rather than rebuild it for the wrong participant (Design.md §8.17)") }
         }
+        check(epochAtHandover.isEmpty()) { "order entry: Artio's state lost for ${epochAtHandover.keys}, and their sessions not handed over" }
         if (inbound.rebuilt > 0) {
             log("order entry: ${inbound.rebuilt} requests rebuilt from the archive, in flight once the directory names their shards (Design.md §8.17)")
         }
@@ -361,11 +377,27 @@ class OrderEntryBackend(
             session.logoutAndDisconnect()
             return Ignored
         }
+        // Before the receive gaps read the store: the new epoch has cleared its gap.
+        epochAtHandover.remove(participantId)?.let { beginEpoch(it, RequestRow.positionOf(session.sequenceIndex(), session.lastReceivedMsgSeqNum())) }
         sessions.acquired(participantId, session)
         gaps.acquired(participantId, session)
         // Offline (requested at startup or after a disconnect), its Logon comes later: onSessionStart.
         if (session.isActive) loggedOn(participantId, session)
         return Handler(participantId)
+    }
+
+    /**
+     * Artio's state was lost for the participant (§3.2): a new epoch, from [start], Artio's position
+     * for its session. The client logs on as after its own 141=Y; the 35=8s the lost archive held for
+     * it are not resent.
+     */
+    private fun beginEpoch(loss: StartupGuards.Loss, start: Long) {
+        store.beginEpoch(loss.participantId, start)
+        epochsBegun++
+        log(
+            "order entry: participant ${loss.participantId}: Artio's state was lost (${loss.why}); epoch ${store.epoch(loss.participantId)} " +
+                "begins at ${start ushr 32}:${start and 0xffffffffL}; the rows are kept, and 35=8s the lost archive held are not resent (Design.md §3.2)",
+        )
     }
 
     /** The participant's client is logged on (§3.2): its `sequenceIndex` recorded. */

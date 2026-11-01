@@ -1123,38 +1123,78 @@ class OrderEntryBackendTest {
         pollUntil(*adapter.all(), what = "BETA at shard 1") { adapter.gateway(1).orders.size == 1 }
     }
 
-    // ================================================================ the guards, §3.2
+    // ================================================================ Artio's state lost, §3.2
 
     @Test
-    fun `the adapter refuses to start, unbound, when Artio does not know a session the store holds rows for`() {
+    fun `when Artio does not know a session the store holds rows for, the adapter starts it in a new epoch, where a held position is a new order and a held ClOrdID still a duplicate`() {
+        // Design.md §3.2, R§17: no refusal to start. The client meets a session Artio has never seen.
         OrderStore.open(OrderEntryRig.storeDir(adapterDir)).use { store ->
             store.load(OrderEntryRig.TODAY)
-            store.insert(row(store, 1001L, 5L, "OLD-5"))
+            store.insert(row(store, 1001L, 2L, "OLD-2"))
+            store.insert(row(store, 1001L, 3L, "OLD-3"))
         }
-        val config = AcceptorRig.nodeConfig(adapterDir, port)
-        FixAcceptor(config, bindAtStartup = false).use { acceptor ->
-            val refusal = assertFailsWith<IllegalStateException> {
-                OrderEntryBackend(acceptor, OrderEntryConfig(OrderEntryRig.storeDir(adapterDir), "aeron:ipc", 9100), { OrderEntryRig.TODAY })
-            }
-            assertTrue("1001" in refusal.message.orEmpty() && "Artio does not know" in refusal.message.orEmpty(), refusal.message)
-            assertFailsWith<ConnectException>("nothing listens") { Socket().use { it.connect(InetSocketAddress("localhost", port), 1_000) } }
+        OrderStore.markStoppedCleanly(OrderEntryRig.storeDir(adapterDir))
+
+        start().use { adapter ->
+            assertEquals(1, adapter.rig.backend.epochsBegun, adapter.rig.log.toString())
+            assertTrue(adapter.rig.log.any { "1001" in it && "Artio's state was lost" in it && "epoch 1" in it }, adapter.rig.log.toString())
+            adapter.awaitExchange()
+            val session = adapter.logon() // its Logon is MsgSeqNum 1: the next 35=D takes OLD-2's position
+            adapter.send(session, order("NEW-2"))
+            pollUntil(*adapter.all(), what = "NEW-2 at the gateway (${adapter.rig.log})") { adapter.gateway(0).orders.size == 1 }
+            assertEquals("NEW-2", adapter.gateway(0).orders.single().clOrdId)
+            adapter.send(session, order("OLD-3"))
+            val reject = adapter.awaitReply(session, "OLD-3's reject") { it.msgType == "8" && it[11] == "OLD-3" }
+            assertEquals("6", reject[103], "the duplicate check spans epochs: the exchange's id stays unique for the day")
+            assertEquals(1, adapter.gateway(0).orders.size)
+        }
+        OrderStore.open(OrderEntryRig.storeDir(adapterDir)).use { store ->
+            store.load(OrderEntryRig.TODAY)
+            assertEquals(1, store.epoch(1001L))
+            assertEquals(0, store.epoch(1002L), "another participant's epoch is its own")
         }
     }
 
     @Test
-    fun `the adapter refuses to start when Artio's sequenceIndex is below the stored one`() {
-        start().use { adapter ->
+    fun `when Artio knows a session below the stored sequenceIndex, its new epoch starts at Artio's position, and no later start replays what Artio held before it`() {
+        // Design.md §3.2: Artio's archive still holds the messages from before. A request among them
+        // whose row is gone (here: lost; in life, dropped by retention) is never rebuilt.
+        val received = start().use { adapter ->
             adapter.awaitExchange()
             val session = adapter.logon()
+            adapter.send(session, order("ORD-1"))
+            pollUntil(*adapter.all(), what = "ORD-1 at the gateway") { adapter.gateway(0).orders.size == 1 }
             pollUntil(*adapter.all(), what = "logout sent") { session.startLogout() > 0 }
             pollUntil(*adapter.all(), what = "logged out") { !session.isConnected }
+            session.lastSentMsgSeqNum()
         }
         OrderStore.open(OrderEntryRig.storeDir(adapterDir)).use { store ->
             store.load(OrderEntryRig.TODAY)
-            store.recordSequenceIndex(1001L, 2)
+            store.loseForTest(1001L, "ORD-1")
+            store.recordSequenceIndex(1001L, 2) // as if Artio's state were restored from before two resets
         }
-        val refusal = assertFailsWith<IllegalStateException> { OrderEntryRig(adapterDir, port) }
-        assertTrue("sequenceIndex" in refusal.message.orEmpty(), refusal.message)
+        OrderStore.markStoppedCleanly(OrderEntryRig.storeDir(adapterDir))
+
+        start().use { adapter ->
+            assertEquals(1, adapter.rig.backend.epochsBegun, adapter.rig.log.toString())
+            assertTrue(
+                adapter.rig.log.any { "1001" in it && "sequenceIndex 0" in it && "stored 2" in it && "epoch 1" in it },
+                adapter.rig.log.toString(),
+            )
+            assertEquals(0, adapter.rig.backend.inbound.rebuilt, "nothing replayed at the start that found the loss")
+        }
+        OrderStore.open(OrderEntryRig.storeDir(adapterDir)).use { store ->
+            store.load(OrderEntryRig.TODAY)
+            assertEquals(1, store.epoch(1001L))
+            assertEquals(received.toLong(), store.highWater(1001L), "Artio's last received, at its sequenceIndex 0")
+            assertEquals(0, store.highestSequenceIndex(1001L))
+        }
+        OrderStore.markStoppedCleanly(OrderEntryRig.storeDir(adapterDir))
+
+        start().use { adapter ->
+            assertEquals(0, adapter.rig.backend.epochsBegun, "found once: ${adapter.rig.log}")
+            assertEquals(0, adapter.rig.backend.inbound.rebuilt, "ORD-1, archived before the epoch, is not rebuilt")
+        }
     }
 
     // ================================================================ no id collision since schema 8, §8.15 superseded

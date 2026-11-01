@@ -276,6 +276,9 @@ class RequestRow internal constructor() {
     }
 
     companion object {
+        /** A request's position (Design.md §3.2): `(sequenceIndex << 32) | MsgSeqNum` of its 35=D or 35=F, never sent. */
+        fun positionOf(sequenceIndex: Int, msgSeqNum: Int): Long = (sequenceIndex.toLong() shl 32) or (msgSeqNum.toLong() and 0xffffffffL)
+
         /** A request that reached no shard: refused before it was sent. */
         const val NO_SHARD = -1
 

@@ -395,39 +395,35 @@ class OrderStore private constructor(
         p.highestSequenceIndex = sequenceIndex
     }
 
-    /**
-     * The guard of §3.2 until Status §3 item 12 step 5: Artio's [sequenceIndex] for the participant's
-     * session below the stored one means Artio's state was lost. Step 5 starts a new epoch instead.
-     */
-    fun requireSequenceIndex(participantId: Long, sequenceIndex: Int) {
-        val stored = highestSequenceIndex(participantId)
-        check(sequenceIndex >= stored) {
-            "participant $participantId: Artio's sequenceIndex $sequenceIndex is below the stored $stored. " +
-                "Artio's state was lost (Design.md §3.2). Refusing to start"
-        }
-    }
-
     /** The participant's epoch (§3.2): 0 until Artio's state is first found lost. */
     fun epoch(participantId: Long): Int = participants.get(participantId)?.epoch ?: 0
 
     /**
-     * Artio's state was found lost (§3.2): a new epoch, in which the high-water, the floor, the stored
-     * `sequenceIndex` and the receive gap start again from Artio's new sequence. Every row is kept, its
+     * Artio's state was found lost (§3.2): a new epoch, starting at [start], Artio's own position for
+     * the participant's session, `(sequenceIndex << 32) | last received MsgSeqNum`, or 0 if Artio does
+     * not know the session. The high-water, the floor and the stored `sequenceIndex` start there, so no
+     * restart replays what Artio held before it, and the receive gap is cleared. Every row is kept, its
      * position of the epoch it was taken in. One write, so a crash keeps all of it or none.
      */
-    fun beginEpoch(participantId: Long) {
+    fun beginEpoch(participantId: Long, start: Long) {
+        require(start >= 0L) { "an epoch's start of $start" }
         val p = rowsOf(participantId)
+        val sequenceIndex = (start ushr 32).toInt()
         WriteBatch().use { batch ->
             batch.put(meta, metaKeyOf(META_EPOCH, participantId), intValue(p.epoch + 1))
-            batch.delete(meta, metaKeyOf(META_SEQUENCE_INDEX, participantId))
-            batch.delete(meta, metaKeyOf(META_FLOOR, participantId))
+            if (sequenceIndex > 0) {
+                batch.put(meta, metaKeyOf(META_SEQUENCE_INDEX, participantId), intValue(sequenceIndex))
+            } else {
+                batch.delete(meta, metaKeyOf(META_SEQUENCE_INDEX, participantId))
+            }
+            if (start > 0L) batch.put(meta, metaKeyOf(META_FLOOR, participantId), longValue(start)) else batch.delete(meta, metaKeyOf(META_FLOOR, participantId))
             batch.delete(meta, metaKeyOf(META_RECEIVE_GAP, participantId))
             db.write(writeOptions, batch)
         }
         p.epoch++
-        p.highestSequenceIndex = 0
-        p.floor = 0L
-        p.highWater = 0L
+        p.highestSequenceIndex = sequenceIndex
+        p.floor = start
+        p.highWater = start
         p.gapIndex = 0
         p.gapFrom = 0
         p.gapTo = 0
@@ -467,13 +463,14 @@ class OrderStore private constructor(
     }
 
     /**
-     * Whether anything is stored for the participant: a row, a `sequenceIndex` above 0, a durable
-     * first-missing above 1, or a floor. A configured session Artio does not know while this holds
-     * means Artio's state was lost (Design.md §3.2).
+     * Whether the store holds a position of the participant's current epoch: a high-water (a row of
+     * the epoch, or a floor), a `sequenceIndex` above 0, or a receive gap. A configured session Artio
+     * does not know while this holds means Artio's state was lost (Design.md §3.2). A first-missing
+     * `reportSeq` is the exchange's, and a row of an earlier epoch an earlier Artio's: neither counts.
      */
-    fun holdsState(participantId: Long): Boolean {
+    fun holdsPositions(participantId: Long): Boolean {
         val p = participants.get(participantId) ?: return false
-        return p.rows > 0 || p.highestSequenceIndex > 0 || p.floor > 0L || p.firstMissing.values.any { it > 1L }
+        return p.highWater > 0L || p.highestSequenceIndex > 0 || p.gapFrom > 0
     }
 
     /** The first MsgSeqNum of the participant's open receive gap (Design.md §2), 0 if none is stored. */
