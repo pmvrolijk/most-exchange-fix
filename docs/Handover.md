@@ -768,3 +768,44 @@ straight after the SIGKILL.
 - *Licence:* the covers' CC BY 4.0 line came from most-exchange; the user chose to keep it, so
   `docs/` is CC BY 4.0 as the exchange's: `docs/LICENSE` and a paragraph in `README.md`.
 - *Not settled:* whether the exchange rejects an off-tick price is not stated in the RoE.
+
+### 2q. Schema version 8: the client's ClOrdID is the exchange's (Status §3 item 12), 2026-11-01
+
+- *Asked* (the user, the priority): adapt to most-exchange's schema 8 (`5042244`, its Adapters.md
+  §2 and §4): `clOrdId`/`origClOrdId` as `char[20]`, and `toSeq` on `ReportResendRequest`. An
+  impact analysis, a proposal and a plan first.
+- *Corrected in the analysis:* the user's frame had the startup recovery (§8.17) go with the
+  derived id. It stays: a host crash still loses RocksDB's tail, and the exchange still does not
+  check `clOrdId` (most-exchange R§18 says the same).
+- *Decided* (the user, each the recommendation; Design §3.2, §8.30, R§17): an unfit ClOrdID is
+  refused (OrdRejReason 99; a cancel's 41, unknown order); the upgrade is a fresh start of the
+  store and Artio's state; Artio's state lost starts a new epoch, logged and counted, never a
+  refusal to start. CLAUDE.md 8 rewritten; R§5 and R§9's block superseded.
+- *Built, in eight steps, each green before the next* (`spec-first-test` throughout):
+  1. the build on the v8 SDK, behind a bridge (`SdkSchemaTest` pins schema 8);
+  2–4. as one change, since re-keying the store removed the bridge's lookup: rows keyed by
+     (participant, ClOrdID's 20 bytes), position and epoch on the row (`RowCodec` 2), a format mark
+     so a store from before refuses the start; `ClOrdId.isValid` on 11; reports found by their
+     `char[20]` with no allocation; the collision, its block and Logout gone. The venue port takes
+     the id's bytes, so the inbound path stays allocation-free;
+  5. `StartupGuards.losses` and the epoch. **Design §3.2's own draft was wrong three ways**,
+     found building it: a received number below the high-water at the same `sequenceIndex` is a
+     host crash's, not a loss; the epoch starts at Artio's position, not 0, or the next start
+     replays the earlier epoch's archive; only a position of the epoch makes an unknown session a
+     loss. Corrected in Design and R§17;
+  6. the rig's gateway made the exchange's model (a ring, a resend `fromSeq`..`toSeq`,
+     `TRUNCATED` from the ring, a dropped report). It had echoed `toSeq` and replayed nothing, so
+     no test could reach the SDK's new settling rule; the plan's "the spikes' `Messages`" was
+     wrong, they are FIX only;
+  7. the e2e and Docker;
+  8. the manuals and `deploy/README.md`.
+- *Checked:* `./gradlew build` green, 378 tests. Mutations caught at each step, among them the
+  SDK's old settling rule, patched in `../most-exchange` for one run and restored: an order live at
+  the exchange went to the client as "not sequenced". `e2e/run-e2e.sh` PASS against v8 installs
+  (most-exchange `d04d7ab`), with step 6b for a 36-character ClOrdID; in Docker, the v7 store
+  refused the start for real, then `down -v` of `most-fix` alone and `deploy/smoke.sh` passed.
+  Cited section numbers in both manuals: 0 unresolved.
+- *Found writing the manual:* the exchange's own v8 upgrade keeps resting orders under their old
+  integer id as text, so the adapter's fresh start must follow a cancel of the participants'
+  orders (Operator's Manual 6.7; R§17). On the dev stack participant 7 had none open.
+- *Not run:* `e2e/run-perf.sh`, the GitHub Action, the spikes. Open items in Status §1.

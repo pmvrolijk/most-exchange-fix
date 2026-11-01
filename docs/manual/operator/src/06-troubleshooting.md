@@ -27,8 +27,9 @@ Every one of these happens before the ports bind, so no client sees a half-start
 | `fix.calendar.zone: not a time zone`, `fix.calendar.rollTime must be HH:mm`, `fix.calendar.weekdays: <x> is not one of …` | The calendar (4.4) |
 | `Artio accepts unknown tags: start the JVM with -Dfix.codecs.reject_unknown_field=true` | The JVM was started without the start script's flags (4.8) |
 | `active mark file detected: …/archive-mark.dat` | Within ~10 s of a crash. Wait and start again; a supervisor retries (3.8) |
-| `session <s>: Artio does not know it, yet the order store holds state for participant <p>. Artio's state was lost, …` | `fix.logDir`/`fix.archiveDir` were wiped or replaced while `fix.storeDir` was kept. Restore them together, or see 6.7 |
-| `participant <p>: Artio's sequenceIndex <i> is below the stored <j>. …` | Artio's state is older than the store's: an old backup restored. Restore all three directories from one moment |
+| `the order store was written before the exchange's schema 8 (no format mark). The upgrade is a fresh start …` | The store is an adapter's from before schema 8. Upgrading is a fresh start of all three directories (6.7, "Upgrading the adapter") |
+| `<row> has version 1, written before the exchange's schema 8. The upgrade is a fresh start …` | As above: a row from before schema 8 |
+| `<row> has version <v>; this adapter reads version 2 only` | A row this adapter cannot read: a later adapter's store, or a corrupt one. Never start an older adapter on a newer store |
 | `order entry: … refusing to start rather than rebuild it for the wrong participant` | The archive replayed a message whose SenderCompID is not its session's client. The archive and the sessions file disagree: CompIDs changed under an existing session |
 | `order entry: the offline sessions were not handed over, their archives replayed, within 10 s` | The startup replay did not finish; usually a starved host. Look for other errors above it |
 
@@ -38,7 +39,6 @@ Every one of these happens before the ports bind, so no client sees a half-start
 | --- | --- |
 | `Logout … Text=Logon refused`, at MsgSeqNum 1 | No configured session matches the Logon's 49, 56, 553 and the SHA-256 of 554 all at once, or the session is at the other role's port. The Logout never says which: check each, starting with the port |
 | Logged out, MsgSeqNum lower than expected | The client logged on below what the adapter expects. The client's sequence store and the adapter's disagree: the client's was reset, or the adapter's state is older than the client's. The client may log on with 141=Y, giving up what it had not received |
-| Logged out at once, `session sequence reset required` | The session is blocked by an id collision (5.2). A Logon with 141=Y lifts it |
 | Logged out, `messages <a> to <b> not received; resend them` | The client did not answer the adapter's ResendRequests (5.2). It is asked again after its next Logon |
 | The connection is refused | The adapter is not listening: not started, still in the ~10 s after a crash, or `fix.bindAddress` is not reachable from the client |
 
@@ -93,15 +93,16 @@ numbers and orders are untouched; the client logs on with the new secret.
 
 The adapter's state is three directories that must stay consistent with each other: `fix.logDir`,
 `fix.archiveDir` and `fix.storeDir`. Copy them together, with the adapter stopped, and restore them
-together. A store newer than Artio's state, or older, refuses the start (6.2), which is the guard
-doing its job: derived order ids would repeat.
+together. Restored apart, Artio's state older than the store's starts a new epoch (5.2): the
+adapter runs, but its clients must reset and lose the reports they had not received.
 
 ### Starting a participant afresh
 
 ::: warning Never wipe the adapter's state alone
-While the exchange still holds the participant's orders, a fresh adapter starts at `sequenceIndex`
-0 again: its new orders' exchange ids repeat ones the exchange already has, and reports for the old
-orders reach a store that does not know them. Cancel the participant's orders at the exchange first
+While the exchange still holds the participant's orders, a fresh adapter has no store: reports for
+the old orders reach a store that does not know them, and are consumed with nothing sent to the
+client, and the day's ClOrdIDs are forgotten, so a client reusing one gives the exchange two orders
+with one id, which it does not check. Cancel the participant's orders at the exchange first
 (most-exchange's `most cancel`, or the exchange's operator), then stop the adapter and remove all
 three directories. In Docker: `docker compose -f deploy/docker-compose.yml down -v`, and delete the
 client's own sequence store.
@@ -121,6 +122,24 @@ it had not received and asks for a mass status (35=AF).
 Stop it cleanly, replace the install, start it. The store's rows are versioned, and a row of an
 unknown version refuses the start rather than being misread. Artio and Aeron move only together with
 most-exchange's Aeron.
+
+**To the exchange's schema version 8, the upgrade is a fresh start.** The exchange's id became the
+client's ClOrdID, and nothing from before carries over:
+
+1. **Cancel the adapter's participants' resting orders** (`most cancel`, or the exchange's
+   operator), and check with `most status --participant <p> --shard <n>` that none is open. The
+   exchange's own upgrade keeps resting orders, each under its old integer id as text; the new
+   store would not know them, and their reports would be consumed unsent (6.4).
+2. Stop the adapter cleanly, then the exchange, as its own Operator's Manual says for version 8
+   (`most cluster shutdown`), and bring the exchange up on version 8.
+3. Remove the adapter's three directories, `fix.logDir`, `fix.archiveDir` and `fix.storeDir`, and
+   have each client clear its sequence store. In Docker:
+   `docker compose -f deploy/docker-compose.yml down -v`, and delete `build/deploy/clients`.
+4. Install and start the new adapter. Started on an old store, it refuses with
+   `the order store was written before the exchange's schema 8` (6.2) and writes nothing to it.
+
+Tell the participants first: a ClOrdID must now be 1 to 20 of `A-Z a-z 0-9 - _ + ; : . /`
+(Rules of Engagement, 4.8), and one that is not, a UUID among them, is rejected.
 
 ## 6.8 Reading the logs
 

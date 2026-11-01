@@ -10,6 +10,7 @@ market. For those in the first table nothing is recorded, and the ClOrdID may be
 
 | Refused | OrdRejReason (103) | Text (58) |
 | --- | --- | --- |
+| 11 not 1 to 20 of `A-Z a-z 0-9 - _ + ; : . /` (4.8) | 99 | `ClOrdID must be 1-20 of A-Z a-z 0-9 - _ + ; : . /` |
 | Neither 48 nor 55; 48 without 22, or 22 other than 4 or 8; a security the venue does not list | 1 | `unknown security` |
 | 38 absent, zero or negative, or not exact at 8 decimals | 13 | `incorrect quantity` |
 | 40 other than 2 | 99 | `limit orders only` |
@@ -25,7 +26,6 @@ Refused after the order was recorded (its ClOrdID is used):
 | Refused | OrdRejReason | Text |
 | --- | --- | --- |
 | ClOrdID already used on the session (4.8) | 6 | `duplicate ClOrdID` |
-| The session needs a sequence reset (4.8) | 99 | `session sequence reset required` |
 | The venue cannot reach the exchange, or is not yet ready to trade | 99 | `exchange unavailable` |
 | The exchange's gateway does not serve your participant | 99 | `participant not served` |
 | Never reached the exchange, at a gateway failover (4.7) | 99 | `not sequenced (gateway failover)` |
@@ -49,14 +49,14 @@ A 35=8, ExecType 8, with **the exchange's reason as Text**:
 | Refused | CxlRejReason (102) | Text (58) |
 | --- | --- | --- |
 | The order is already filled, cancelled, expired or rejected | 0 | `too late to cancel` |
-| No order with that OrigClOrdID, or 41 names a cancel | 1 | `unknown order` |
+| The cancel's own 11 not 1 to 20 of `A-Z a-z 0-9 - _ + ; : . /` (4.8) | 99 | `ClOrdID must be 1-20 of A-Z a-z 0-9 - _ + ; : . /` |
+| No order with that OrigClOrdID, 41 names a cancel, or 41 does not fit (4.8) | 1 | `unknown order` |
 | OrderID, Side or the security sent and not the order's | 1 | `does not match the order` |
 | A replace (35=G), CxlRejResponseTo 2 | 2 | `replace not supported` |
 | Another cancel of the order is pending | 3 | `already pending cancel` |
 | The exchange refused it: the order is not resting | 1 | `UNKNOWN_ORDER` (or 0, `too late to cancel`, when the venue already knows the order is finished) |
 | The exchange refused it: the market is closed | 2 | `MARKET_CLOSED` |
 | The venue cannot reach the exchange | 99 | `exchange unavailable` |
-| The session needs a sequence reset | 99 | `session sequence reset required` |
 | Never reached the exchange, at a failover | 99 | `not sequenced` |
 | Its fate unknown, at a failover; OrdStatusUnknown = Y | 99 | `cancel status unknown` |
 | The order's status is unknown (4.7); OrdStatusUnknown = Y | 99 | `STATUS UNKNOWN: …` |
@@ -92,7 +92,6 @@ RefTagID (371) names the tag when there is one.
 | Text (58) | Why | What to do |
 | --- | --- | --- |
 | `Logon refused` | Your Logon matched no session: CompIDs, username, password, or the port (2.2) | Check each; the venue does not say which |
-| `session sequence reset required` | The session is blocked (4.8) | Log on with ResetSeqNumFlag = Y |
 | `messages <from> to <to> not received; resend them` | Three ResendRequests went unanswered (2.5) | Resend that range after your next Logon |
 
 ## 6.7 Unknown order on a status request

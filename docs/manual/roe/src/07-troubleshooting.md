@@ -16,7 +16,6 @@ The venue records every FIX message on your session, both ways. To find yours qu
 | Connection refused | Wrong host or port; the venue is not accepting connections (a restart takes some seconds) | Check the address; retry after a few seconds |
 | Logout `Logon refused`, at MsgSeqNum 1 | One of SenderCompID, TargetCompID, Username, Password does not match, **or you connected to the other session's port** | Check all four and the port. The venue does not say which |
 | Logout naming a MsgSeqNum too low | Your Logon is numbered below what the venue expects: your sequence store was reset or restored | Do not guess a number. Contact the venue, or reset with 141=Y and recover with 35=AF (2.7) |
-| Logged on, then at once logged out, `session sequence reset required` | The session is blocked (4.8) | Log on with ResetSeqNumFlag = Y |
 | Market data: Logon refused or out of sequence after a reconnect | Market-data sessions start at 1 every time | Log on with 141=Y, or at MsgSeqNum 1 |
 
 ## 7.3 Logged out during the session
@@ -24,7 +23,6 @@ The venue records every FIX message on your session, both ways. To find yours qu
 | Text | What to do |
 | --- | --- |
 | `messages <from> to <to> not received; resend them` | Your engine did not answer the venue's ResendRequests. After your next Logon, resend that range, PossDup = Y. Check that your engine answers a ResendRequest with EndSeqNo 0 up to its last message sent (2.5) |
-| `session sequence reset required` | 4.8 |
 | No Text, after a period of silence | Heartbeats missed: your engine stopped sending, or the network did. Check HeartBtInt and that your engine answers TestRequests |
 | A session reject before it, SessionRejectReason 10 | Your clock is more than two minutes off |
 
@@ -57,6 +55,7 @@ Read the Text: it is fixed and section 6 lists every one. The most common:
 | `unknown security` | Symbol misspelt, or 22 missing with 48. Take the identifiers from the security list (5.2) |
 | `price not exact at 8 decimals`, `incorrect quantity` | A float formatted with more than eight decimals: format decimals exactly |
 | `duplicate ClOrdID` | ClOrdIDs reused within the day; use unique ones |
+| `ClOrdID must be 1-20 of A-Z a-z 0-9 - _ + ; : . /` | A ClOrdID too long, a UUID, or with another character: shorten it, or map your ids to ones that fit (4.8) |
 | `MARKET_CLOSED` | The security is not trading: outside hours, or halted |
 | `PRICE_OUT_OF_BOUNDS` | The price is outside the collar around the reference price |
 | `ORDER_EXPIRED` | A GTD ExpireDate in the past |

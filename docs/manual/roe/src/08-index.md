@@ -130,6 +130,7 @@ References are to section numbers. **Bold** marks where a tag or term is defined
 
 <ul>
 <li>Cancel on disconnect, none <span class="ref">2.9, 4.5</span></li>
+<li>ClOrdID characters and length <span class="ref">1.4, 3.3, <b>4.8</b>, 6.1</span></li>
 <li>ClOrdID uniqueness <span class="ref">1.4, <b>4.8</b></span></li>
 <li>Day order <span class="ref"><b>4.2</b></span></li>
 <li>Decimals, exact to eight places <span class="ref"><b>1.3</b>, 7.5</span></li>
@@ -146,7 +147,6 @@ References are to section numbers. **Bold** marks where a tag or term is defined
 <li>Restart of the venue <span class="ref"><b>2.8</b></span></li>
 <li>Self-match prevention <span class="ref"><b>4.3</b></span></li>
 <li>Sequence numbers <span class="ref"><b>2.3</b></span></li>
-<li>Session blocked for a reset <span class="ref"><b>4.8</b>, 7.2</span></li>
 <li>Slow consumer <span class="ref"><b>5.7</b></span></li>
 <li>Testing your connection <span class="ref"><b>7.7</b></span></li>
 <li>Transient session <span class="ref">2.3, <b>5.1</b></span></li>

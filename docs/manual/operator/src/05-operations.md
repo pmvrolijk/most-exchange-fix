@@ -67,18 +67,29 @@ order entry: participant <p>: messages <from> to <to> not received; resend them;
 The gap is kept across a disconnect and a restart, and asked for again straight after the next
 Logon.
 
-### An id collision blocks a session
+### Artio's state lost: a new epoch
 
-The exchange's `clOrdId` is derived from the session's sequence (1.5). If Artio's sequence went back
-without its `sequenceIndex` rising (its state lost or restored from an old copy), a new request
-would derive an id an older one holds. The adapter rejects it, logs the session out with Text
-`session sequence reset required`, and **refuses its Logons until the sequence is reset**. Today
-the reset is the client's: a Logon with 141=Y lifts the block. The log lines, as formats:
+Artio's state, `fix.logDir` and `fix.archiveDir`, holds each session's sequence numbers. If it is
+lost or replaced by an older copy while `fix.storeDir` is kept, the adapter finds it before the
+ports bind: a configured session Artio does not know while the store holds its positions, or one
+Artio knows at a `sequenceIndex` below the stored one. **It starts anyway**, in a new *epoch* for
+the participant: the store keeps every row, so open orders, the day's ClOrdIDs and the duplicate
+check survive, and the request positions start again from Artio's own. The log line, as a format:
 
 ```
-participant <p>: id collision, session blocked until its sequence is reset (Design.md §3.3): <detail>
-participant <p>: back at sequenceIndex <i> after a reset; block lifted (Design.md §3.3)
+order entry: participant <p>: Artio's state was lost (<why>); epoch <n> begins at <sequenceIndex>:<MsgSeqNum>; the rows are kept, and 35=8s the lost archive held are not resent (Design.md §3.2)
 ```
+
+For the client it is a reset: its session starts again where Artio's is, it logs on with 141=Y,
+and recovers its orders with a 35=AF. The 35=8s the lost archive held for it, and had not
+delivered, are gone. Find out how Artio's state was lost; 6.7 says how to back the three
+directories up together.
+
+::: note Until the exchange's schema 8
+The exchange's id was derived from the session's sequence, so a lost Artio state could repeat one:
+the adapter refused to start, and an id collision blocked the session until it reset. Neither
+exists any more.
+:::
 
 ## 5.3 The order path
 
@@ -151,8 +162,8 @@ only then is the clean stop marked in the store. `adapter: stopped` is the last 
 Before the ports bind, the adapter:
 
 1. loads the store, pruning what retention allows (5.1);
-2. refuses to start if Artio's state looks wiped while the store holds the participant's state,
-   or Artio's `sequenceIndex` is below the stored one (6.2);
+2. starts a new epoch for a participant whose Artio state was lost (5.2), and refuses a store
+   written before the exchange's schema 8 (6.2);
 3. rebuilds any request the archive has and the store lost (a host crash), from Artio's archive, one
    session at a time;
 4. **after an unclean stop**, moves every order-entry session's MsgSeqNum on 10,000, by writing
@@ -222,7 +233,7 @@ Until `/metrics` and `/status` exist, **the log is the monitoring surface**. Lin
 | `adapter: refused to start:` | A start failed; the reason follows (6.2) |
 | `the last stop was not clean` | A crash, recovered; find out why it crashed |
 | `the library lost the engine; reports wait until it is back` | Artio's library and engine lost each other; reports are held |
-| `id collision, session blocked` | A session needs its sequence reset (5.2) |
+| `Artio's state was lost` | Artio's directories were lost or replaced; the client must reset (5.2) |
 | `… ambiguous` | An order's fate is unknown; reconcile it (5.5) |
 | `logged out after 3 ResendRequests` | A client is not resending what it owes |
 | `report for clOrdId …, which the store does not hold; consumed` | The exchange has an order the store lacks (6.4) |

@@ -8,7 +8,7 @@
 #
 # What it shows: a 35=D reaches the book and rests; a cross trades both sides; a report for a
 # logged-out client waits for its logon; market data, 35=x and 35=V, from most-exchange's own
-# market-data process; 35=H, 35=F and 35=AF; a clean restart keeps the store; a SIGKILL of the
+# market-data process; 35=H, 35=F and 35=AF; a ClOrdID that does not fit refused; a clean restart keeps the store; a SIGKILL of the
 # adapter under load loses no order and leaves none unknown, and a report written offline after it
 # still reaches its client.
 #
@@ -126,6 +126,18 @@ fixc 2 send --symbol ZZZZ --side buy --price 1.00 --qty 1 --clordid Z1 > "$RUN/z
 cat "$RUN/z1.out"
 expect "$RUN/z1.out" "ClOrdID=Z1 .*ExecType=REJECTED .*Text=unknown security" "unknown symbol"
 pass "rejected unknown security"
+
+echo
+echo "== 6b. a ClOrdID that does not fit the exchange's rule is refused, never sent (Design.md §3.2, §3.3)"
+# Schema 8: the exchange's clOrdId is the client's own, 1-20 of A-Z a-z 0-9 - _ + ; : . /. A UUID is 36.
+UUID=3f2b8c1e-6d4a-4f7b-9e21-0c5a7d8e9f10
+fixc 2 send --symbol AAPL --side buy --price 1.00 --qty 1 --clordid "$UUID" > "$RUN/u1.out" 2>&1
+cat "$RUN/u1.out"
+expect "$RUN/u1.out" "ClOrdID=$UUID .*ExecType=REJECTED .*OrdRejReason=99 .*Text=ClOrdID must be 1-20 of" "the unfit ClOrdID's reject"
+fixc 2 cancel --clordid C9 --orig "$UUID" --symbol AAPL --side buy --qty 1 > "$RUN/u2.out" 2>&1
+cat "$RUN/u2.out"
+expect "$RUN/u2.out" "OrderCancelReject ClOrdID=C9 OrigClOrdID=$UUID .*CxlRejReason=1" "a cancel of an unfit OrigClOrdID: unknown order"
+pass "a 36-character ClOrdID rejected OrdRejReason 99; a cancel naming one, unknown order"
 
 echo
 echo "== 7. a clean restart keeps the store"

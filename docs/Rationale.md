@@ -654,6 +654,9 @@ decimal string of the old `int64`, so its reports name neither the client's ClOr
 Carrying such orders across needs a second id per row, and a lookup path for as long as any of them
 lives. Draining needs an operator to cancel resting orders first. Nothing runs in production, so a
 fresh start costs the dev stack a wipe. A live venue's upgrade is left until there is one.
+Found writing the manual (2026-11-01): the fresh start needs those orders cancelled too. The
+exchange's own upgrade keeps them, and a new store does not know them, so their reports would be
+consumed unsent. So the fresh start is a drain followed by a wipe; what it saves is the second id.
 
 **Why the adapter starts after Artio's state is lost.** The refusal to start (§5, Design §3.2)
 guarded the derived ids, which are gone. What is lost with Artio's state is lost either way: the

@@ -18,7 +18,7 @@ References are to section numbers. **Bold** marks where a term is defined or exp
 <li>Calendar, trading <span class="ref"><b>4.4</b>, 2.9, 5.1, 6.4</span></li>
 <li>Cancel, parked <span class="ref"><b>5.3</b></span></li>
 <li>Clean stop <span class="ref"><b>5.6</b>, 2.8, 3.8</span></li>
-<li>clOrdId, derived <span class="ref"><b>1.5</b>, 5.2, 6.7</span></li>
+<li>clOrdId, the client's ClOrdID <span class="ref"><b>1.5</b>, 6.7</span></li>
 <li>CompID <span class="ref">1.6, <b>4.7</b>, 6.3</span></li>
 <li>Crash <span class="ref">2.8, <b>5.6</b>, 6.6</span></li>
 <li>Crash skip, see MsgSeqNum</li>
@@ -34,6 +34,7 @@ References are to section numbers. **Bold** marks where a term is defined or exp
 <li>Docker <span class="ref"><b>2.3</b>, 2.8, 6.5</span></li>
 <li>Dynamic MDC <span class="ref">2.3, 3.5</span></li>
 <li>Embedded media driver <span class="ref"><b>1.2</b>, 3.5, 4.2</span></li>
+<li>Epoch, after Artio's state is lost <span class="ref"><b>5.2</b>, 5.6, 6.7</span></li>
 <li>ExecID <span class="ref"><b>1.5</b>, 5.4</span></li>
 <li>Exchange unavailable <span class="ref">5.3, <b>6.4</b></span></li>
 <li>fileSyncLevel <span class="ref">3.1, <b>4.2</b>, 4.5</span></li>
@@ -48,7 +49,6 @@ References are to section numbers. **Bold** marks where a term is defined or exp
 <ul>
 <li>Health check <span class="ref">2.3</span></li>
 <li>Holidays file <span class="ref"><b>4.4</b></span></li>
-<li>Id collision <span class="ref"><b>5.2</b>, 6.3</span></li>
 <li>Idle strategy <span class="ref">3.4, <b>4.6</b></span></li>
 <li>JVM flags <span class="ref"><b>4.8</b>, 6.2</span></li>
 <li>Logon, refused <span class="ref"><b>5.2</b>, 6.3</span></li>
@@ -76,7 +76,8 @@ References are to section numbers. **Bold** marks where a term is defined or exp
 <li>ResetSeqNumFlag (141) <span class="ref">5.2, 6.3, 6.7</span></li>
 <li>Restart policy <span class="ref">2.3, 3.8</span></li>
 <li>Role <span class="ref"><b>1.1</b>, 4.7</span></li>
-<li>sequenceIndex <span class="ref">1.5, 5.2, 6.2, 6.7</span></li>
+<li>Schema version 8, upgrading to <span class="ref">1.5, 2.12, 6.2, <b>6.7</b></span></li>
+<li>sequenceIndex <span class="ref">1.5, 5.2</span></li>
 <li>Sessions file <span class="ref">1.4, <b>4.7</b></span></li>
 <li>SIGBUS <span class="ref">3.3, <b>6.5</b></span></li>
 <li>Smoke test <span class="ref">2.6, 2.11</span></li>
@@ -93,6 +94,7 @@ References are to section numbers. **Bold** marks where a term is defined or exp
 <li>Transient session <span class="ref">1.6, 5.2</span></li>
 <li>UNAUTHORIZED_PARTICIPANT <span class="ref">4.9, 6.4</span></li>
 <li>Unknown status <span class="ref"><b>5.5</b>, 3.6, 6.4</span></li>
+<li>Upgrading the adapter <span class="ref"><b>6.7</b></span></li>
 <li>Wipe of the adapter's state <span class="ref">2.12, <b>6.7</b></span></li>
 </ul>
 

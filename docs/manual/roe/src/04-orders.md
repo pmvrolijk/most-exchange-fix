@@ -107,18 +107,15 @@ A cancel in flight at a failover is settled the same way: never sequenced, a 35=
 
 ## 4.8 Duplicates, resends and ClOrdID
 
+- **A ClOrdID is 1 to 20 characters**, each one of `A-Z a-z 0-9 - _ + ; : . /`, on an order and on a cancel.
+  It is carried to the exchange as you sent it, and comes back as you sent it on every report. One
+  that does not fit, a 36-character UUID among them, is rejected at once and never reaches the
+  market: a 35=D with OrdRejReason 99, a 35=F with a 35=9, CxlRejReason 99, both with Text
+  `ClOrdID must be 1-20 of A-Z a-z 0-9 - _ + ; : . /`. A cancel whose OrigClOrdID does not fit
+  names no order: 35=9, CxlRejReason 1, `unknown order`.
 - **A new 35=D with a ClOrdID the session already used** for an order still open, or that day, is
   rejected, OrdRejReason 6, Text `duplicate ClOrdID`. A cancel's ClOrdID counts as used too.
 - **A resent 35=D or 35=F (PossDupFlag = Y) the venue already has** is not executed again. If it
   was answered, the resend is dropped and the answer is not repeated; if not, it is answered once.
 - **The same message delivered twice**, by your engine's resend or the venue's own recovery, is
   recognised by its MsgSeqNum and processed once.
-
-::: warning A session blocked for a sequence reset
-The venue derives the exchange's order id from your session's sequence numbers. If they go back
-without a reset, for example if you restore an old sequence store, a new order could carry the id
-of an old one. The venue then rejects it, OrdRejReason 99, Text `session sequence reset required`,
-and logs the session out with the same Text; each later Logon is accepted and at once logged out
-the same way, until the sequence is reset. Log on with ResetSeqNumFlag = Y (2.7); your open orders
-are untouched.
-:::

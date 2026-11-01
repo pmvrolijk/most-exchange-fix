@@ -94,14 +94,17 @@ is four shares.
 
 | Identifier | Tag | What it is |
 | --- | --- | --- |
-| ClOrdID | 11 | The client's, unique per session for the trading day and while the order is open |
+| ClOrdID | 11 | The client's: 1 to 20 of `A-Z a-z 0-9 - _ + ; : . /`, unique per session for the trading day and while the order is open |
 | OrderID | 37 | The exchange's order id; `NONE` until the order is acknowledged |
 | ExecID | 17 | The exchange's report sequence number, in decimal, for a report from the exchange; `A<index>.<MsgSeqNum>` for a message the adapter answered itself |
 
-The exchange's own `clOrdId` is not the client's: the adapter derives it from the FIX session,
-`(sequenceIndex << 32) | MsgSeqNum` of the 35=D or 35=F. That is why the session's sequence
-numbers matter to the store, and why wiping the adapter's state while the exchange keeps the
-participant's orders is unsafe (section 6.7).
+**The exchange's `clOrdId` is the client's ClOrdID, as sent** (the exchange's schema version 8),
+and a cancel's OrigClOrdID its `origClOrdId`. The exchange takes 1 to 20 of those characters and
+does not check that an id is unique; the adapter's order store does, which is why the store must
+outlive the trading day and why wiping the adapter's state while the exchange keeps the
+participant's orders is unsafe (6.7). A ClOrdID that does not fit is refused, never sent. Each
+request's place in its session, `(sequenceIndex << 32) | MsgSeqNum` of its 35=D or 35=F, is kept on
+its row, never sent: the startup recovery and the order of a 35=AF's answers use it.
 
 ## 1.6 Sessions and participants
 

@@ -112,7 +112,7 @@ and LeavesQty; fills you missed are reflected in CumQty, not reported one by one
 finished while you were not receiving (filled, cancelled, expired) is not open, and is not in the
 answer; ask for it by ClOrdID with an OrderStatusRequest (35=H) if you need its final state.
 
-Reset only when you must: a lost sequence store, or a session blocked by the venue (7.2).
+Reset only when you must: a lost sequence store, or the venue's own session state lost (2.8).
 
 ## 2.8 After the venue restarts
 
@@ -123,6 +123,10 @@ Reset only when you must: a lost sequence store, or a session blocked by the ven
 - **A report you had already received before a crash may come again**, under a new MsgSeqNum and
   without PossDupFlag, because the venue cannot tell which ones reached you. **Its ExecID is the
   same:** deduplicate execution reports by ExecID, always.
+- **If the venue loses your session's state** (an operator's failure, not a restart), its sequence
+  numbers are no longer the ones you hold. Log on with 141=Y and recover with a 35=AF (2.7). Your orders, their state and
+  the ClOrdIDs you used that day are kept; reports the venue had not yet delivered to you are not
+  resent.
 - **No order is lost.** Every order that reached the venue before the crash is answered after the
   restart: it reached the exchange and is reported, or it did not and is rejected, or its fate is
   unknown and it is said so (4.7).

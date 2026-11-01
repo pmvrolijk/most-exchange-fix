@@ -1613,7 +1613,10 @@ The archive's recorded position (§6.2) then means durable.
       of Engagement say so.
     - **The upgrade is a fresh start** of the store and Artio's state, beside the exchange's
       `most cluster shutdown` and v8 restart (§6.1). A store written before schema 8 refuses the
-      start. A live venue's upgrade path is left until there is one.
+      start. A live venue's upgrade path is left until there is one. **Found in step 8:** the
+      exchange's own upgrade keeps resting orders, under their old integer id as text, so the
+      participants' resting orders are cancelled first; a fresh store would consume their reports
+      unsent (the Operator's Manual, 6.7, "Upgrading the adapter").
     - **Artio's state lost while the store holds rows: the adapter starts**, in a new epoch,
       logged and counted (§3.2). Corrected in step 5: a received MsgSeqNum below the high-water
       at the same `sequenceIndex` is a host crash's, not a loss; the epoch starts at Artio's
@@ -1638,6 +1641,9 @@ The archive's recorded position (§6.2) then means durable.
     - **Possible, not proposed:** a report for a row a host crash lost carries both ids and every
       quantity, so it could now be answered from the report alone. Recovery rebuilds those rows
       first, so the case is left for a request the archive does not have (§8.20).
+    - **Verified** (Status §3 item 12, step 7): `e2e/run-e2e.sh` against v8 installs, its step 6b
+      the unfit ClOrdID and OrigClOrdID; in Docker, the v7 store's refusal, the fresh start and
+      `deploy/smoke.sh`.
     - **Plan:** Status §3 item 12.
 
 ## 9. Control and metrics

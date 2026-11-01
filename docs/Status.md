@@ -6,10 +6,12 @@ read this, not the handover. [`Handover.md`](Handover.md) is the archive of work
 Last updated 2026-11-01. **Both backends are built and `bin/adapter` runs them; market data has its
 own engine; the adapter has its latency tooling, a baseline and a trace ring.**
 
-- **The priority (the user, 2026-11-01): the exchange's schema version 8** (§3 item 12, Design
-  §8.30, R§17). The exchange now takes the client's ClOrdID as `char[20]` and bounds a resend with
-  `toSeq`; the SDK is republished under the same `0.1.0-SNAPSHOT`, so **`master` stops building at
-  the next fresh resolve**. Analysed and decided, docs written; **no code yet**.
+- **The exchange's schema version 8 is done** (§3 item 12, Design §8.30, R§17), steps 1–8 on
+  2026-11-01. The exchange's `clOrdId` is the client's ClOrdID as sent; one that does not fit is
+  refused; the id collision, its block and the refusal to start on an Artio loss are gone (a new
+  epoch instead); the bounded resend is the SDK's, under test against a ring-replaying gateway
+  model. `./gradlew build` green, 378 tests; `e2e/run-e2e.sh` PASS against v8 installs; Docker
+  upgraded by a fresh start, `deploy/smoke.sh` passing.
 
 - **Measured** (Measurements A1–A5, X1–X2, the laptop, macOS): at fileSyncLevel 1 the adapter
   answers 1,000 and 3,000 orders/s at a 15–18 ms p50 and saturates at ~4,250 requests/s; the gateway
@@ -25,10 +27,25 @@ own engine; the adapter has its latency tooling, a baseline and a trace ring.**
   skip, a 35=8 sent to a logged-out client was never resent. The skip is now 10,000 Heartbeats.
 - **The GitHub Action** is green on GitHub (item 8). **The Operator's Manual and the Rules of
   Engagement** are written and built (item 11, `docs/manual/`).
-- **Next: §3 item 12, schema version 8.** Then: §8.24 waits for the Linux run; several sessions per
+- **Next:** §8.24 waits for the Linux run; several sessions per
   participant (§8.27) is a low-priority roadmap item; the control API and metrics (Design §9) are
-  the largest gap the manuals list.
-- **Committed** through the manuals (`cf9afcd`): Docker, §8.29, the CI action bumps and the manuals included.
+  the largest gap the manuals list (the new epoch's count, `epochsBegun`, waits there).
+- **Left open by schema 8, smallest first:**
+  - **Not run since schema 8:** the GitHub Action (its fresh resolve is the first to fetch the
+    republished SDK), `e2e/run-perf.sh`, and the spikes. The e2e and Docker were.
+  - **A loss of Artio's state is verified only in `OrderEntryBackendTest`**, on a real Artio with
+    a doctored store; no e2e or Docker run deletes Artio's directories and keeps the store. What
+    the client sees on the wire then (its Logon against a sequence Artio restarted) is unverified,
+    and the manuals say only "reset with 141=Y".
+  - **After Artio's state is restored from an older copy at the same `sequenceIndex`** (not a
+    loss, §3.2), a client's PossDup resend of a 35=D whose row retention has dropped arrives live
+    and is taken as new. Artio would not normally ask for it; found reasoning, not tested.
+  - **The SDK's `ClOrdId` allocation per send** (§8.30): a buffer overload is a change to
+    most-exchange's `client`.
+  - **The epoch is written before the receive gaps read the store** at a handover: ordered and
+    commented, no test catches the order reversed.
+- **Committed** through schema 8's step 6 (`edb8be2`); steps 7 and 8 (the e2e's step 6b, the
+  manuals, `deploy/README.md`) were written after it.
 
 The user's frame, 2026-10-31: production is Linux; 300–1,000 orders/s per connection is fine, and
 3,500–5,000/s through one adapter is the target worth reaching. Each participant gets a dedicated
@@ -171,8 +188,8 @@ There is no remote yet.
 | Branch | `master`; the user commits |
 | Licence | AGPL-3.0-or-later (`LICENSE.md`); `docs/` CC BY 4.0 (`docs/LICENSE`), as the exchange's; the SDK it links is Apache-2.0 |
 | Modules | 5 — `fix-session`, `order-entry`, `market-data`, `adapter` (the process), `tools` (`bin/fix`: the e2e's client, `perf` and `report`); packages `nl.lamia.most.exchange.fixadapter.*` |
-| Tests | `fix-session` 49, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 246 (the store 26, the inbound path 72, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the backend end to end 39, SDK wiring 1); `adapter` 10; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` 25 (pacing 8, the mix and the raw reader 9, the report 7, `fix perf` end to end 1). `./gradlew build` green 2026-10-31. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29, 3 of 3 on 2026-10-30, and 5 of 5 on 2026-10-31 on the shared `e2e/exchange.sh`, the last two with market data on its own port; 1 of 1 with step 9 (§8.29) on 2026-10-31. `e2e/run-perf.sh`: Measurements A1–A4, X1–X2 on 2026-10-31. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
-| Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT from GitHub Packages (`pmvrolijk/most-exchange`), republished 2026-10-30 with `DepthFeedListener` (most-exchange `3afef4f`), Artio 0.182, rocksdbjni 11.8.1 |
+| Tests | `fix-session` 49, plus 1 in its own JVM (`testAcceptorGuard`); `order-entry` 258 (the store 31, the inbound path 71, the outbound path 34, AvgPx 5, delivery 12, the report sessions 13, the receive gaps 15, the directory index 7, the config 5, the calendar 15, the startup guards 6, the backend end to end 42, SDK wiring 1, the SDK's schema 1); `adapter` 10; `market-data` 35 (subscriptions 23, the backend end to end 6, the security list 5, SDK wiring 1); `tools` 25 (pacing 8, the mix and the raw reader 9, the report 7, `fix perf` end to end 1). `./gradlew build` green 2026-11-01: 378. `e2e/run-e2e.sh`: 7 runs of 8 pass (§8.21), then 3 of 3 on 2026-10-29, 3 of 3 on 2026-10-30, and 5 of 5 on 2026-10-31 on the shared `e2e/exchange.sh`, the last two with market data on its own port; 1 of 1 with step 9 (§8.29) on 2026-10-31; 1 of 1 with step 6b on schema 8, against most-exchange `d04d7ab`'s installs, on 2026-11-01. `e2e/run-perf.sh`: Measurements A1–A4, X1–X2 on 2026-10-31. The 15 spikes (`:spikes:test`) last ran 2026-10-15; `RecoveryReplaySpikeTest`'s 4 on 2026-10-27; `SequenceReuseSpikeTest`'s 4 and `ResendStallSpikeTest`'s 1 on 2026-10-28; `RewindSpikeTest`'s 5 (and the 1 again) on 2026-10-29 |
+| Depends on | most-exchange `client` + `sbe` 0.1.0-SNAPSHOT from GitHub Packages (`pmvrolijk/most-exchange`), republished 2026-11-01 with **schema version 8** (most-exchange `5042244`; `SdkSchemaTest` pins it), Artio 0.182, rocksdbjni 11.8.1 |
 | Specification | [`Design.md`](Design.md) — §1–§10 decided, except the configuration format (proposed); §8 is the open list |
 | Remote | none yet. |
 
@@ -197,7 +214,8 @@ Each changes what gets built (`decision-fork`):
    - the media driver topology (§8.6);
    - ~~the `OrdStatusUnknown` tag number and the exact 2964 code set~~ **5001; 1 and 2 only, 3 a
      session reject** (2026-10-20, §5.4).
-   - ~~an id collision~~ **rejected, Logout, Logons refused until reset** (2026-10-25, §8.15).
+   - ~~an id collision~~ **rejected, Logout, Logons refused until reset** (2026-10-25, §8.15). Superseded 2026-11-01 by schema 8: no collision; a loss of
+     Artio's state starts a new epoch (§3.2, R§17).
    - ~~Unverified assumptions the design rests on~~ **All four hold** (spikes, 2026-10-15, §8.13).
      They left three decisions, all made:
      - ~~how the adapter finds its library's `RecordingPos`~~ **from Aeron's public counters**, by
@@ -694,7 +712,7 @@ priority, 2026-11-01). Then §8.24's investigation with the user's Linux run.
     the e2e 9 of 9, and in Docker a SIGKILL then `deploy/smoke.sh` twice.
     - **Left:** report the lookup to Artio upstream (the user's call: a public issue).
 
-12. **Schema version 8** (the user's priority, 2026-11-01; Design §8.30, R§17). Analysed and decided
+12. ~~**Schema version 8**~~ **Done 2026-11-01, steps 1–8.** (The user's priority, 2026-11-01; Design §8.30, R§17.) Analysed and decided
     2026-11-01; Design §3.2, §3.3, §5.1–§5.3, §6, §6.1, §8.15, §8.30, §9.3, CLAUDE.md 8 and R§5, §9,
     §17 written. Each step builds and tests green before the next (`spec-first-test` for each):
     1. ~~**The build on v8**~~ **Done 2026-11-01.** The registry's `sbe` and `client` jars say
@@ -781,13 +799,45 @@ priority, 2026-11-01). Then §8.24's investigation with the user's Linux run.
        - The existing fence tests still cover their paths: the restart fence rejects not sequenced
          (all below `nextSeq` held), and the truncated resend goes to a mass status.
          `./gradlew build` green: 378 tests, `order-entry` 258.
-    7. **For real** (`verify-for-real`): `e2e/run-e2e.sh` against v8 installs of `../most-exchange`,
+    7. ~~**For real** (`verify-for-real`): `e2e/run-e2e.sh` against v8 installs of `../most-exchange`,
        with a step for a ClOrdID that does not fit; the Docker stack wiped and brought up again.
-       Optionally `e2e/run-perf.sh`, under `perf-claim`.
-    8. **The manuals:** the Rules of Engagement (the ClOrdID rule and its rejects; the collision's
+       Optionally `e2e/run-perf.sh`, under `perf-claim`.~~ **Done 2026-11-01.**
+       - **`e2e/run-e2e.sh`: PASS, 9 of 9 and the new 6b**, against `../most-exchange`'s installs
+         rebuilt at its `d04d7ab` (every jar `Most-Sbe-Schema-Version: 8`). Step 6b: a 36-character
+         UUID ClOrdID is answered 35=8 OrdRejReason 99 with the adapter's Text (the gateway's would
+         be `INVALID_CL_ORD_ID`: never sent), and a 35=F naming it as OrigClOrdID 35=9
+         CxlRejReason 1, unknown order. Step 8, a SIGKILL under load: 716 orders and 84 cancels,
+         every one answered, none unknown; 3 requests restored in flight, 2 of them settled not
+         sequenced, as they never reached the exchange.
+       - **Docker:** the exchange's dev stack was already on images built after schema 8. The
+         adapter on its old volume refused the start, as §6.1 says, with the fresh start in its
+         message: the format check on a real v7 store. Then `down -v` on `most-fix` alone and
+         `build/deploy/clients` deleted, `up -d`, and `deploy/smoke.sh` passed (5 of 5). No report
+         for an order the new store does not know.
+       - **Not run:** `e2e/run-perf.sh`. Nothing in steps 2-6 is on the order path's timing except
+         the SDK's one `ClOrdId` per send (§8.30); a figure needs `perf-claim`.
+    8. ~~**The manuals:** the Rules of Engagement (the ClOrdID rule and its rejects; the collision's
        reject and reset gone); the Operator's Manual (the upgrade as a fresh start; the operator's
        reset gone; Artio's state lost). `deploy/README.md`'s note that wiping the adapter's volume
-       repeats `clOrdId`s goes.
+       repeats `clOrdId`s goes.~~ **Done 2026-11-01**, both PDFs rebuilt.
+       - **Rules of Engagement:** the ClOrdID rule in 1.4, 3.3, 3.4 and 4.8; its rejects in 6.1
+         (35=D, OrdRejReason 99) and 6.3 (35=F, CxlRejReason 99; an unfit 41, 1 `unknown order`),
+         and in 7's table of Texts; `session sequence reset required` gone from 4.8, 6.1, 6.3, 6.6,
+         7.2, 7.3 and the index; 2.8 says what a client sees when the venue loses its session state.
+       - **Operator's Manual:** 1.5 the exchange's id is the ClOrdID, the position never sent; 5.2's
+         id collision replaced by "Artio's state lost: a new epoch", with its log line as a format
+         and the old behaviour in a note; 5.6 and 5.9 to match; 6.2 the two refusals replaced by the
+         store's three (no format mark, a row of version 1, an unknown version), each the code's
+         text; 6.3's blocked-session row gone; 6.7's backup, fresh start and **the schema 8
+         upgrade, a fresh start**, as four steps; the index.
+       - **Found writing it:** the exchange's own upgrade keeps resting orders, each under its old
+         integer id as text (its Operator's Manual, "Upgrading to schema version 8"). The new store
+         does not know them, so the upgrade's first step is to cancel the participants' orders and
+         check with `most status`. On the dev stack, participant 7 had none open: `most status
+         --participant 7 --shard 0`, 0 open orders.
+       - **`deploy/README.md`:** the upgrade in the table at the top; "never wipe alone" with its
+         reason since schema 8 (reports consumed unsent, the day's ClOrdIDs forgotten); Artio's
+         state lost alone; the old store's refusal under Troubleshooting.
 
 ## 4. What is that is worth having here based on other Fix gateways using Aeron
 

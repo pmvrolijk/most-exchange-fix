@@ -49,7 +49,7 @@ and can reissue it, never recover it.
 
 | Identifier | Tag | Whose | Rules |
 | --- | --- | --- | --- |
-| ClOrdID | 11 | Yours | Unique per session for the trading day, and for as long as the order is open. Used on every order and cancel |
+| ClOrdID | 11 | Yours | 1 to 20 characters of `A-Z a-z 0-9 - _ + ; : . /` (4.8). Unique per session for the trading day, and for as long as the order is open. Used on every order and cancel, and carried to the exchange as sent |
 | OrigClOrdID | 41 | Yours | The ClOrdID of the order a cancel refers to |
 | OrderID | 37 | The exchange's | Assigned when the order is acknowledged; `NONE` before that, and on a reject |
 | ExecID | 17 | The exchange's | Unique per session. A report from the exchange carries the exchange's report sequence number; a message the interface answers itself carries `A<index>.<MsgSeqNum>` (3.8) |

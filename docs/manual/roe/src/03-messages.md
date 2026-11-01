@@ -37,7 +37,7 @@ Other FIX 4.4 header fields are accepted and ignored.
 
 | Tag | Name | Req | Values and rules |
 | --- | --- | --- | --- |
-| 11 | ClOrdID | Y | Unique per session for the trading day and while the order is open (4.8) |
+| 11 | ClOrdID | Y | 1 to 20 characters of `A-Z a-z 0-9 - _ + ; : . /`, unique per session for the trading day and while the order is open (4.8) |
 | 55 | Symbol | C | The security, if 48 is absent |
 | 48 | SecurityID | C | The security: the exchange's id with 22=8, or its ISIN with 22=4. Takes precedence over 55 |
 | 22 | SecurityIDSource | C | Required with 48: `8` (exchange id) or `4` (ISIN) |
@@ -76,7 +76,7 @@ Refused at the interface, an IOC and an unknown security:
 
 | Tag | Name | Req | Values and rules |
 | --- | --- | --- | --- |
-| 11 | ClOrdID | Y | The cancel's own id, unique as an order's is |
+| 11 | ClOrdID | Y | The cancel's own id, of the same characters and unique as an order's is (4.8) |
 | 41 | OrigClOrdID | Y | The order's ClOrdID |
 | 37 | OrderID | N | If sent, must be the order's |
 | 54 | Side | Y | Must be the order's |

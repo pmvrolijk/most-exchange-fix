@@ -19,6 +19,7 @@ deploy/fix md --symbol AAPL --follow 10
 | Order entry | `localhost:9876`, CLIENT7 → MOST, `client7` / `client7-secret`, participant 7 |
 | Market data | `localhost:9877`, FEED7 → MOST, `feed7` / `feed7-secret`, 141=Y at every Logon |
 | Teardown | `docker compose -f deploy/docker-compose.yml down`. `-v` discards the archive and the store: see "Stopping and crashing" first, and delete `build/deploy/clients` with them |
+| Upgrading to the exchange's schema 8 | A fresh start: the exchange on version 8 (its own deploy/README.md), then `down -v` here and `build/deploy/clients` deleted. An old volume refuses the start, saying so (Operator's Manual, 6.7) |
 
 ## How it joins the exchange
 
@@ -64,11 +65,14 @@ Participant 7 is one of `gw-0`'s, in most-exchange's `config/shard-0-participant
     a 35=8 sent while the client was logged out was never resent (Design.md §8.29). The jump is
     now written as Heartbeats; after a crash, `deploy/smoke.sh` passes again.
 - **Never wipe the adapter's volume alone** (`down -v` here) while the exchange still holds
-  participant 7's orders. The wipe takes the order store and Artio's `sequenceIndex` with it, so
-  the new session's `clOrdId`s, `(sequenceIndex << 32) | MsgSeqNum`, repeat ones the exchange
-  already has (Design.md §3.2, §8.15), and the guard against that (CLAUDE.md 8) went with the
-  store. Its reports then reach a store that does not know them. Cancel participant 7's orders
-  first (`most cancel`), or reset the exchange with it (`down -v` in most-exchange's `deploy/`).
+  participant 7's orders. The wipe takes the order store, so reports for those orders reach a
+  store that does not know them and are consumed unsent, and the day's ClOrdIDs are forgotten: the
+  exchange does not check `clOrdId` uniqueness, the store does (Design.md §3.2). Cancel participant
+  7's orders first (`most cancel`), or reset the exchange with it (`down -v` in most-exchange's
+  `deploy/`).
+- **Losing Artio's state alone** (its logs and archive, with the store kept) does not stop the
+  adapter: it starts participant 7 in a new epoch and logs `Artio's state was lost` (Design.md
+  §3.2). The client resets: `--reset`, or delete its state in `build/deploy/clients`.
 
 ## What is dev-only
 
@@ -89,5 +93,6 @@ Participant 7 is one of `gw-0`'s, in most-exchange's `config/shard-0-participant
 | `network most-aeron declared as external, but could not be found` | most-exchange's stack is not up. Start it first |
 | Restarting, `active mark file detected` | A crash's archive mark file, live for ~10 s. Docker retries; it starts by itself |
 | Healthy, but no `shard 0 ready` in `docker logs most-fix-fix-7-1` | No directory: discovery is not up, or the channel's control address is not `shard0:40000` |
-| `report for clOrdId N, which the store does not hold; consumed` | The exchange holds an order of participant 7's that this store never had: the adapter's volume was wiped alone. See "Stopping and crashing" |
+| `report for clOrdId <id>, which the store does not hold; consumed` | The exchange holds an order of participant 7's that this store never had: the adapter's volume was wiped alone. See "Stopping and crashing" |
+| Restarting, `the order store was written before the exchange's schema 8` | A volume from before schema 8. The upgrade is a fresh start: `down -v`, see the table at the top |
 | The client is refused, `MsgSeqNum too low` | Its state in `build/deploy/clients` outlived a `down -v`. Delete it, or `--reset` |

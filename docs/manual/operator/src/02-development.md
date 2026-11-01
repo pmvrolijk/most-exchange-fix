@@ -253,4 +253,5 @@ docker compose -f deploy/docker-compose.yml stop        # the adapter, cleanly; 
 ```
 
 `down -v` on the adapter discards its archive and order store. **Never do that alone** while the
-exchange keeps participant 7's orders: see 6.7.
+exchange keeps participant 7's orders: see 6.7. It is how the dev stack upgraded to the exchange's
+schema 8, beside the exchange's own restart on version 8 (6.7, "Upgrading the adapter").
