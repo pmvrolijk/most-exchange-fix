@@ -150,9 +150,7 @@ class OrderEntryBackend(
             sends = ArchivedSends(store, venue, InboundRecording(aeron.countersReader(), libraryConfiguration.inboundLibraryStream())) { row, text ->
                 outbound.refuse(row, text)
             }
-            inbound = InboundOrders(store, venue, index, tradingDate, sends) { participantId, detail ->
-                log("participant $participantId: id collision, session blocked until its sequence is reset (Design.md §3.3): $detail")
-            }
+            inbound = InboundOrders(store, venue, index, tradingDate, sends)
             outbound = OutboundReports(store, reports, sends, delivery, log)
             outbound.recover()
             directorySubscription = owned(aeron.addSubscription(config.directoryChannel, config.directoryStreamId))
@@ -294,7 +292,7 @@ class OrderEntryBackend(
         // Before any shard's session, so the requests recovery rebuilt are restored with the rest (§8.17).
         if (inbound.awaitingDirectory > 0) {
             val resolved = inbound.resolveRecovered { row, text ->
-                log("order entry: participant ${row.participantId}: recovered request ${row.clOrdId} refused, $text (Design.md §8.17)")
+                log("order entry: participant ${row.participantId}: recovered request ${row.fixClOrdIdAsString()} refused, $text (Design.md §8.17)")
                 outbound.refuse(row, text)
             }
             log("order entry: $resolved recovered requests resolved against the directory")
@@ -327,7 +325,7 @@ class OrderEntryBackend(
         var restored = 0
         store.forEachInFlight { row ->
             if (row.shardId == shardId) {
-                session.restoreInFlight(row.participantId, ClOrdId.of(row.clOrdId)) // schema 8 bridge, as ShardVenue
+                session.restoreInFlight(row.participantId, row.toClOrdId())
                 restored++
             }
         }
@@ -338,9 +336,7 @@ class OrderEntryBackend(
     private inner class ShardListener(private val shardId: Int) : OrderEntryListener {
         override fun onReport(report: ClientExecutionReportDecoder): ReportAction = outbound.onReport(shardId, report)
 
-        // Schema 8 bridge, as ShardVenue: every request in flight was sent with its derived id's decimal text.
-        override fun onSettled(participantId: Long, clOrdId: ClOrdId, fate: OrderFate) =
-            outbound.onSettled(participantId, clOrdId.toString().toLong(), fate)
+        override fun onSettled(participantId: Long, clOrdId: ClOrdId, fate: OrderFate) = outbound.onSettled(participantId, clOrdId, fate)
 
         override fun onMassStatusComplete(participantId: Long, status: RequestStatus, orderCount: Int, nextSeq: Long) =
             outbound.onMassStatusComplete(shardId, participantId, status, nextSeq)
@@ -372,23 +368,16 @@ class OrderEntryBackend(
         return Handler(participantId)
     }
 
-    /** The participant's client is logged on (§3.2, §3.3): its `sequenceIndex` guarded, a blocked session logged out. */
+    /** The participant's client is logged on (§3.2): its `sequenceIndex` recorded. */
     private fun loggedOn(participantId: Long, session: Session) {
         gaps.loggedOn(participantId, session)
         val sequenceIndex = session.sequenceIndex()
         if (sequenceIndex < store.highestSequenceIndex(participantId)) {
-            // Artio's state lost while running: the derived ids would repeat (§3.2).
-            store.block(participantId, sequenceIndex)
-            log("participant $participantId: sequenceIndex $sequenceIndex below the stored ${store.highestSequenceIndex(participantId)}; blocked")
+            // Artio's state lost while running. With the client's own ClOrdID nothing collides (§8.15
+            // superseded); the next start finds the loss before the bind (§3.2).
+            log("participant $participantId: sequenceIndex $sequenceIndex below the stored ${store.highestSequenceIndex(participantId)}: Artio's state was lost")
         } else {
             store.recordSequenceIndex(participantId, sequenceIndex)
-            if (store.liftBlock(participantId, sequenceIndex)) {
-                log("participant $participantId: back at sequenceIndex $sequenceIndex after a reset; block lifted (Design.md §3.3)")
-            }
-        }
-        if (store.isBlocked(participantId)) {
-            replies.session = session
-            replies.logout(Texts.SEQUENCE_RESET_REQUIRED)
         }
     }
 
@@ -415,8 +404,6 @@ class OrderEntryBackend(
                 }
                 // Dropped by the library before the restart: it never reached the exchange, and is asked for again (§2).
                 if (gaps.droppedBeforeRestart(participantId, sequenceIndex, buffer, offset, length)) return Action.CONTINUE
-                // Past a block's index, its Logon came, and lifted it (§3.3); Logons are not replayed to here.
-                store.liftBlock(participantId, sequenceIndex)
                 return inbound.onReplayed(participantId, sequenceIndex, messageType, buffer, offset, length)
             }
             replies.session = session

@@ -20,14 +20,19 @@ interface OrderVenue {
     /** The shard a request for [securityId] goes to, [RequestRow.NO_SHARD] if none: the row keeps it (Design.md §6.1). */
     fun shardOf(securityId: Int): Int
 
+    /**
+     * [clOrdId] is the client's own ClOrdID, as the exchange takes it since schema 8 (Design.md §3.2):
+     * its 20 bytes, NUL-padded, at offset 0. Bytes, not the SDK's `ClOrdId`, so the inbound path
+     * allocates nothing; the venue makes the SDK's object (§8.30).
+     */
     @Suppress("LongParameterList")
     fun newOrder(
-        participantId: Long, clOrdId: Long, securityId: Int, side: Side, price: Long, qty: Long,
+        participantId: Long, clOrdId: DirectBuffer, securityId: Int, side: Side, price: Long, qty: Long,
         expireDate: Int, smpId: Long, smpStrategy: SmpStrategy,
     ): SendResult
 
     @Suppress("LongParameterList")
-    fun cancel(participantId: Long, clOrdId: Long, origClOrdId: Long, exchangeOrderId: Long, securityId: Int, side: Side): SendResult
+    fun cancel(participantId: Long, clOrdId: DirectBuffer, origClOrdId: DirectBuffer, exchangeOrderId: Long, securityId: Int, side: Side): SendResult
 }
 
 /** The directory's securities (Design.md §5.1). Lookups by bytes allocate nothing. */
@@ -86,8 +91,6 @@ interface ClientReplies {
      */
     fun unknownOrderStatus(request: OrderStatusRequestDecoder): Boolean
 
-    /** A Logout with [text], then the disconnect. */
-    fun logout(text: String)
 }
 
 /** The Texts the inbound path answers with (Design.md §3.3, §5.1). Fixed, so a client can match on them. */
@@ -102,7 +105,8 @@ object Texts {
     const val EXPIRE_DATE_REQUIRED = "ExpireDate required for GTD"
     const val SMP_ID_POSITIVE = "SelfMatchPreventionID must be a positive integer"
     const val DUPLICATE_CLORDID = "duplicate ClOrdID"
-    const val SEQUENCE_RESET_REQUIRED = "session sequence reset required"
+    /** A ClOrdID the exchange cannot carry (Design.md §3.2, §3.3). */
+    const val CLORDID_NOT_FIT = "ClOrdID must be 1-20 of A-Z a-z 0-9 - _ + ; : . /"
     const val EXCHANGE_UNAVAILABLE = "exchange unavailable"
     const val PARTICIPANT_NOT_SERVED = "participant not served"
     const val UNKNOWN_ORDER = "unknown order"

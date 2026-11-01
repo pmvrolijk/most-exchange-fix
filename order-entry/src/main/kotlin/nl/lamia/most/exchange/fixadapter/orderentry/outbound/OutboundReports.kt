@@ -80,10 +80,12 @@ class OutboundReports(
     fun onReport(shardId: Int, report: ClientExecutionReportDecoder): ReportAction {
         this.shardId = shardId
         val participantId = report.participantId()
+        // Since schema 8 the report's clOrdId is the client's ClOrdID, the row's key (§3.2, §5.3).
+        val row = store.findByClOrdIdField(participantId, report.buffer(), report.offset() + ClientExecutionReportDecoder.clOrdIdEncodingOffset())
+        tracedPosition = row?.position ?: 0L
         if (trace.enabled) {
-            trace.event(TraceFormat.REPORT, participantId, derivedIdOf(report), System.nanoTime(), report.reportSeq(), report.execType().value())
+            trace.event(TraceFormat.REPORT, participantId, tracedPosition, System.nanoTime(), report.reportSeq(), report.execType().value())
         }
-        val row = store.find(participantId, derivedIdOf(report))
         if (row == null) {
             lostRows++
             log("participant $participantId: report for clOrdId ${report.clOrdId()}, which the store does not hold; consumed (Design.md §8.17)")
@@ -95,7 +97,7 @@ class OutboundReports(
         return when (row.kind) {
             RowKind.ORDER -> if (report.execType() == ExecType.ORDER_STATUS) onStatus(row, report) else onOrderReport(row, report, again)
             RowKind.CANCEL -> {
-                val order = store.find(participantId, row.origClOrdId) ?: error("cancel ${row.clOrdId} without its order")
+                val order = store.orderOf(row) ?: error("cancel ${row.fixClOrdIdAsString()} without its order")
                 onCancelReport(row, order, report, again)
             }
         }
@@ -139,7 +141,7 @@ class OutboundReports(
                 e.text(report.rejectReason().name)
             }
             else -> {
-                log("participant ${order.participantId}: report of ExecType ${report.execType()} for order ${order.clOrdId}; consumed")
+                log("participant ${order.participantId}: report of ExecType ${report.execType()} for order ${order.fixClOrdIdAsString()}; consumed")
                 return ReportAction.CONSUMED
             }
         }
@@ -265,23 +267,18 @@ class OutboundReports(
                 if (!again) answered(cancel, order, report.reportSeq(), position)
                 delivered(report, position)
             }
-            else -> log("participant ${cancel.participantId}: report of ExecType ${report.execType()} for cancel ${cancel.clOrdId}; consumed")
+            else -> log("participant ${cancel.participantId}: report of ExecType ${report.execType()} for cancel ${cancel.fixClOrdIdAsString()}; consumed")
         }
         return ReportAction.CONSUMED
     }
 
     /** A sequenced report's 35=8 is on its way: its `reportSeq` waits for the archive (§6.2). */
-    /**
-     * Schema 8 bridge (Status §3 item 12, step 1): the derived id a report carries as decimal text,
-     * read from its bytes with nothing allocated; -1, which no row holds, for any other id. Goes when
-     * the store is keyed by the client's own ClOrdID (steps 2-4).
-     */
-    private fun derivedIdOf(report: ClientExecutionReportDecoder): Long =
-        ClOrdId.parseDecimal(report.buffer(), report.offset() + ClientExecutionReportDecoder.clOrdIdEncodingOffset())
+    /** The position of the request whose report is in hand, 0 if none: the trace's join (§9.3). */
+    private var tracedPosition = 0L
 
     private fun delivered(report: ClientExecutionReportDecoder, position: Long) {
         val reportSeq = report.reportSeq()
-        if (trace.enabled) trace.event(TraceFormat.OUT, report.participantId(), derivedIdOf(report), System.nanoTime(), reportSeq, shardId.toByte())
+        if (trace.enabled) trace.event(TraceFormat.OUT, report.participantId(), tracedPosition, System.nanoTime(), reportSeq, shardId.toByte())
         if (reportSeq > 0L) delivery.sent(shardId, report.participantId(), reportSeq, position)
     }
 
@@ -301,17 +298,21 @@ class OutboundReports(
      */
     fun refuse(row: RequestRow, text: String) {
         row.owedText = text
-        onSettled(row.participantId, row.clOrdId, OrderFate.NEVER_SEQUENCED)
+        owe(row, OrderFate.NEVER_SEQUENCED)
     }
 
     /** The SDK settled a request that had no report: its answer is owed on the row (§6.2). */
-    fun onSettled(participantId: Long, clOrdId: Long, fate: OrderFate) {
+    fun onSettled(participantId: Long, clOrdId: ClOrdId, fate: OrderFate) {
         val row = store.find(participantId, clOrdId)
         if (row == null) {
             lostRows++
             log("participant $participantId: $fate for clOrdId $clOrdId, which the store does not hold (Design.md §8.17)")
             return
         }
+        owe(row, fate)
+    }
+
+    private fun owe(row: RequestRow, fate: OrderFate) {
         row.owed = fate
         store.update(row)
         owing += row
@@ -336,7 +337,7 @@ class OutboundReports(
             row.owed = OrderFate.AMBIGUOUS
             store.update(row)
             owing += row
-            log("participant $participantId: order ${row.clOrdId} open in the store, not stated by the mass status: ambiguous (Design.md §3.4)")
+            log("participant $participantId: order ${row.fixClOrdIdAsString()} open in the store, not stated by the mass status: ambiguous (Design.md §3.4)")
         }
     }
 
@@ -366,7 +367,7 @@ class OutboundReports(
             if (fate == null) true else if (!clients.canSend(row.participantId)) false else answerOrderFate(row, fate)
         }
         RowKind.CANCEL -> {
-            val order = store.find(row.participantId, row.origClOrdId) ?: error("cancel ${row.clOrdId} without its order")
+            val order = store.orderOf(row) ?: error("cancel ${row.fixClOrdIdAsString()} without its order")
             val fate = row.owed
             when {
                 fate != null -> clients.canSend(row.participantId) && answerCancelFate(row, order, fate)
@@ -482,7 +483,7 @@ class OutboundReports(
     private fun isOwing(row: RequestRow): Boolean {
         if (row.owed != null) return true
         if (row.kind != RowKind.CANCEL || row.cancelState != CancelState.PARKED) return false
-        val order = store.find(row.participantId, row.origClOrdId) ?: return false
+        val order = store.orderOf(row) ?: return false
         return order.acknowledged || order.ambiguous || RequestRow.isTerminal(order.ordStatus)
     }
 

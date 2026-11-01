@@ -1,5 +1,6 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.store
 
+import nl.lamia.most.exchange.client.ClOrdId
 import nl.lamia.most.exchange.client.OrderFate
 import nl.lamia.most.exchange.sbe.Side
 import org.agrona.DirectBuffer
@@ -8,12 +9,14 @@ import java.nio.ByteOrder
 
 /**
  * A row's RocksDB value (Design.md §6.1). Versioned: a later version appends fields (§5.5) and
- * still reads this one. A version this code does not know is refused, never guessed at.
+ * still reads this one. A version this code does not know is refused, never guessed at. Version 2
+ * (schema 8, §8.30) keys the row by its ClOrdID and replaces version 1, which is refused: the upgrade
+ * is a fresh start.
  *
  * Every code is explicit, never an enum's ordinal, so reordering an enum cannot change a stored row.
  */
 internal object RowCodec {
-    const val VERSION: Int = 1
+    const val VERSION: Int = 2
 
     private val LE = ByteOrder.LITTLE_ENDIAN
 
@@ -28,7 +31,7 @@ internal object RowCodec {
     private const val SMP_STRATEGY_AT = 19 // u8
     private const val ORD_STATUS_AT = 20 // u8
     private const val CANCEL_STATE_AT = 21 // u8
-    private const val CLORDID_LENGTH_AT = 22 // u16
+    // 22, u16: unused (version 1's ClOrdID length)
     private const val EXCHANGE_ORDER_ID_AT = 24
     private const val SECURITY_ID_AT = 32 // i32
     private const val EXPIRE_DATE_AT = 36 // i32
@@ -39,9 +42,12 @@ internal object RowCodec {
     private const val NOTIONAL_HI_AT = 72
     private const val NOTIONAL_LO_AT = 80
     private const val SMP_ID_AT = 88
-    private const val ORIG_CLORDID_AT = 96
+    private const val POSITION_AT = 96
     private const val SHARD_ID_AT = 104 // i32
-    const val FIXED_LENGTH = 108 // the ClOrdID's bytes follow
+    private const val EPOCH_AT = 108 // i32
+    private const val CLORDID_AT = 112 // char[20], NUL-padded
+    private const val ORIG_CLORDID_AT = 132 // char[20], NUL-padded; a cancel's order's, empty for an order
+    const val LENGTH = 152
 
     private const val FLAG_ACKNOWLEDGED = 1
     private const val FLAG_AMBIGUOUS = 2
@@ -57,7 +63,8 @@ internal object RowCodec {
     private const val SIDE_BUY = 1
     private const val SIDE_SELL = 2
 
-    fun encodedLength(row: RequestRow): Int = FIXED_LENGTH + row.fixClOrdIdLength
+    @Suppress("UNUSED_PARAMETER")
+    fun encodedLength(row: RequestRow): Int = LENGTH
 
     /** Writes [row] at offset 0 of [buffer], which must hold [encodedLength]; returns the length. */
     fun encode(row: RequestRow, buffer: MutableDirectBuffer): Int {
@@ -75,7 +82,7 @@ internal object RowCodec {
         buffer.putByte(SMP_STRATEGY_AT, row.smpStrategy)
         buffer.putByte(ORD_STATUS_AT, row.ordStatus)
         buffer.putByte(CANCEL_STATE_AT, cancelCode(row.cancelState).toByte())
-        buffer.putShort(CLORDID_LENGTH_AT, row.fixClOrdIdLength.toShort(), LE)
+        buffer.putShort(22, 0, LE)
         buffer.putLong(EXCHANGE_ORDER_ID_AT, row.exchangeOrderId, LE)
         buffer.putInt(SECURITY_ID_AT, row.securityId, LE)
         buffer.putInt(EXPIRE_DATE_AT, row.expireDate, LE)
@@ -86,21 +93,25 @@ internal object RowCodec {
         buffer.putLong(NOTIONAL_HI_AT, row.notionalHi, LE)
         buffer.putLong(NOTIONAL_LO_AT, row.notionalLo, LE)
         buffer.putLong(SMP_ID_AT, row.smpId, LE)
-        buffer.putLong(ORIG_CLORDID_AT, row.origClOrdId, LE)
+        buffer.putLong(POSITION_AT, row.position, LE)
         buffer.putInt(SHARD_ID_AT, row.shardId, LE)
-        val length = row.getFixClOrdId(buffer, FIXED_LENGTH)
-        return FIXED_LENGTH + length
+        buffer.putInt(EPOCH_AT, row.epoch, LE)
+        buffer.putBytes(CLORDID_AT, row.fixIdView, 0, ClOrdId.LENGTH)
+        buffer.putBytes(ORIG_CLORDID_AT, row.origIdView, 0, ClOrdId.LENGTH)
+        return LENGTH
     }
 
-    /** Reads a value into [row], whose key fields the caller has set. Refuses what it cannot read. */
+    /** Reads a value into [row], whose participant the caller has set from the key. Refuses what it cannot read. */
     fun decode(buffer: DirectBuffer, length: Int, row: RequestRow) {
-        val where = "order store row (participant ${row.participantId}, clOrdId ${row.clOrdId})"
+        val where = "order store row (participant ${row.participantId})"
         check(length >= 1) { "$where is empty" }
         val version = buffer.getByte(VERSION_AT).toInt() and 0xff
+        check(version != 1) {
+            "$where has version 1, written before the exchange's schema 8. The upgrade is a fresh start of the " +
+                "order store and Artio's state (Design.md §6.1, §8.30)"
+        }
         check(version == VERSION) { "$where has version $version; this adapter reads version $VERSION only" }
-        check(length >= FIXED_LENGTH) { "$where is $length bytes, shorter than version $VERSION's $FIXED_LENGTH" }
-        val idLength = buffer.getShort(CLORDID_LENGTH_AT, LE).toInt() and 0xffff
-        check(length == FIXED_LENGTH + idLength) { "$where is $length bytes; its ClOrdID needs ${FIXED_LENGTH + idLength}" }
+        check(length == LENGTH) { "$where is $length bytes; version $VERSION's are $LENGTH" }
 
         row.kind = when (val kind = buffer.getByte(KIND_AT).toInt()) {
             KIND_ORDER -> RowKind.ORDER
@@ -142,9 +153,19 @@ internal object RowCodec {
         row.notionalHi = buffer.getLong(NOTIONAL_HI_AT, LE)
         row.notionalLo = buffer.getLong(NOTIONAL_LO_AT, LE)
         row.smpId = buffer.getLong(SMP_ID_AT, LE)
-        row.origClOrdId = buffer.getLong(ORIG_CLORDID_AT, LE)
+        row.position = buffer.getLong(POSITION_AT, LE)
         row.shardId = buffer.getInt(SHARD_ID_AT, LE)
-        row.fixClOrdId(buffer, FIXED_LENGTH, idLength)
+        row.epoch = buffer.getInt(EPOCH_AT, LE)
+        row.fixClOrdId(buffer, CLORDID_AT, idLength(buffer, CLORDID_AT))
+        val origLength = idLength(buffer, ORIG_CLORDID_AT)
+        if (origLength > 0) row.origClOrdId(buffer, ORIG_CLORDID_AT, origLength)
+    }
+
+    /** The bytes before the first NUL of the `char[20]` at [offset]. */
+    private fun idLength(buffer: DirectBuffer, offset: Int): Int {
+        var length = 0
+        while (length < ClOrdId.LENGTH && buffer.getByte(offset + length).toInt() != 0) length++
+        return length
     }
 
     private fun owedCode(fate: OrderFate?): Int = when (fate) {

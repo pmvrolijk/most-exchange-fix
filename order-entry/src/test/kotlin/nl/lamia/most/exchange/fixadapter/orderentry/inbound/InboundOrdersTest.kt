@@ -1,5 +1,7 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.inbound
 
+import org.agrona.DirectBuffer
+import nl.lamia.most.exchange.client.ClOrdId
 import io.aeron.logbuffer.ControlledFragmentHandler.Action
 import nl.lamia.most.exchange.client.SendResult
 import nl.lamia.most.exchange.fixadapter.codecs.Constants
@@ -44,7 +46,6 @@ class InboundOrdersTest {
     private val venue = VenueModel()
     private val replies = RecordingReplies()
     private val securities = SecuritiesModel()
-    private val collisions = mutableListOf<Long>()
     private lateinit var inbound: InboundOrders
     private lateinit var sends: ArchivedSends
     private lateinit var outbound: OutboundReports
@@ -65,7 +66,7 @@ class InboundOrdersTest {
         sends = ArchivedSends(store, venue, { recorded }) { row, text -> outbound.refuse(row, text) }
         outbound = OutboundReports(store, client, sends, ArchiveModel(store))
         outbound.recover()
-        inbound = InboundOrders(store, venue, securities, { TODAY }, sends, { p, _ -> collisions += p })
+        inbound = InboundOrders(store, venue, securities, { TODAY }, sends)
         venue.store = store
     }
 
@@ -137,14 +138,24 @@ class InboundOrdersTest {
         return findByFixClOrdId(P, UnsafeBuffer(bytes), 0, bytes.size)
     }
 
+    /**
+     * The row of the request at [position] in the participant's epoch (Design.md §3.2): these tests
+     * name a request by its MsgSeqNum. Scans, and allocates: never in a measured path.
+     */
+    private fun OrderStore.find(participantId: Long, position: Long): RequestRow? {
+        var found: RequestRow? = null
+        forEach { if (it.participantId == participantId && it.position == position && it.epoch == epoch(participantId)) found = it }
+        return found
+    }
+
     // ================================================================ 35=D, §5.1
 
     @Test
-    fun `a limit order is written to the store, then sent with the session's participant, the derived clOrdId, and its fields converted`() {
+    fun `a limit order is written to the store, then sent with the session's participant, its own ClOrdID, and its fields converted`() {
         assertEquals(Action.CONTINUE, order(7))
         val sent = venue.orders.single()
         assertEquals(P, sent.participantId, "the session's participant (§2)")
-        assertEquals((0L shl 32) or 7L, sent.clOrdId, "(sequenceIndex << 32) | MsgSeqNum (§3.2)")
+        assertEquals("ORD-7", sent.clOrdId, "the client's ClOrdID as sent, the exchange's id since schema 8 (§3.2)")
         assertEquals(ACME, sent.securityId)
         assertEquals(Side.BUY, sent.side)
         assertEquals(100_25000000L, sent.price, "PriceCodec, 8 implied decimals")
@@ -164,9 +175,10 @@ class InboundOrdersTest {
     }
 
     @Test
-    fun `the derived clOrdId carries Artio's sequenceIndex`() {
+    fun `a request's row keeps its position, Artio's sequenceIndex and the MsgSeqNum, which is never sent`() {
         deliver("D", 7, listOf(11 to "ORD-7", 55 to "ACME", 54 to "2", 60 to TIME, 38 to "1", 40 to "2", 44 to "1"), sequenceIndex = 3)
-        assertEquals((3L shl 32) or 7L, venue.orders.single().clOrdId)
+        assertEquals((3L shl 32) or 7L, store.findByFix("ORD-7")?.position, "(sequenceIndex << 32) | MsgSeqNum (§3.2)")
+        assertEquals("ORD-7", venue.orders.single().clOrdId)
         assertEquals(Side.SELL, venue.orders.single().side)
     }
 
@@ -392,72 +404,64 @@ class InboundOrdersTest {
     }
 
     @Test
-    fun `a cancel refused before the directory, for a collision or for the block names its order, so its status is stated`() {
+    fun `a cancel refused before the directory names its order, so its status is stated`() {
         // Design.md §3.3, "The adapter's own answers": never OrdStatus 8 for an order that may be open.
         order(1)
         acknowledge("ORD-1")
         securities.isReady = false
         cancel(2, "ORD-1")
         securities.isReady = true
-        order(3, "OLD-3")
-        cancel(3, "ORD-1", "CXL-NEW") // MsgSeqNum 3 again: a collision
-        cancel(4, "ORD-1") // blocked
-        assertEquals(
-            listOf(Texts.EXCHANGE_UNAVAILABLE, Texts.SEQUENCE_RESET_REQUIRED, Texts.SEQUENCE_RESET_REQUIRED),
-            replies.sent.filterIsInstance<Reply.CancelReject>().map { it.text },
-        )
-        assertEquals(listOf<String?>("ORD-1", "ORD-1", "ORD-1"), replies.namedOrders)
+        assertEquals(listOf(Texts.EXCHANGE_UNAVAILABLE), replies.sent.filterIsInstance<Reply.CancelReject>().map { it.text })
+        assertEquals(listOf<String?>("ORD-1"), replies.namedOrders)
     }
 
-    // ================================================================ id collision, §8.15
+    // ================================================================ the client's ClOrdID, §3.2 (schema 8)
 
     @Test
-    fun `an id collision is rejected and the session logged out, and its later orders are rejected until reset`() {
-        order(5, "OLD-5")
+    fun `a ClOrdID the exchange cannot carry is refused, OrdRejReason 99, never stored or sent`() {
+        // Design.md §3.2, §3.3: 1 to 20 of A-Z a-z 0-9 - _ + ; : . /, else refused, never mapped.
+        val unfit = listOf("X".repeat(21), "ORD 1", "ORD#1", "ORD@1", "ORD,1", "ORD*1")
+        var seq = 1
+        for (id in unfit) {
+            replies.sent.clear()
+            assertEquals(Action.CONTINUE, order(seq, id), id)
+            assertEquals(listOf<Reply>(Reply.OrderReject(id, 99, Texts.CLORDID_NOT_FIT)), replies.sent, id)
+            assertNull(store.find(P, seq.toLong()), "$id: no row")
+            seq++
+        }
+        assertTrue(venue.orders.isEmpty(), "none sent")
+        assertEquals(seq - 1L, store.highWater(P), "each answered here, so a restart replays none (§8.17)")
+        order(seq, "Az09-_+;:./abcdeXYZ9") // every kind of character allowed, and all 20
+        assertEquals("Az09-_+;:./abcdeXYZ9", venue.orders.single().clOrdId)
+    }
+
+    @Test
+    fun `a cancel whose ClOrdID does not fit is CxlRejReason 99, and one whose OrigClOrdID does not fit names no order`() {
+        order(1)
+        acknowledge("ORD-1")
         replies.sent.clear()
-        // Artio's state wiped at sequenceIndex 0: the client's new MsgSeqNum 5 derives a held id.
-        assertEquals(Action.CONTINUE, order(5, "NEW-5"))
+        cancel(2, "ORD-1", "CXL 2")
+        cancel(3, "ORD-1".padEnd(21, 'x'))
         assertEquals(
-            listOf<Reply>(Reply.OrderReject("NEW-5", 99, Texts.SEQUENCE_RESET_REQUIRED), Reply.Logout(Texts.SEQUENCE_RESET_REQUIRED)),
+            listOf<Reply>(
+                Reply.CancelReject("CXL 2", "ORD-1", 99, Texts.CLORDID_NOT_FIT),
+                Reply.CancelReject("CXL-3", "ORD-1xxxxxxxxxxxxxxxx", 1, Texts.UNKNOWN_ORDER),
+            ),
             replies.sent,
         )
-        assertEquals(listOf(P), collisions)
-        assertEquals("OLD-5", store.find(P, 5L)?.fixClOrdIdAsString(), "nothing written")
-        assertTrue(inbound.isBlocked(P))
-
-        replies.sent.clear()
-        order(6, "NEW-6")
-        assertEquals(listOf<Reply>(Reply.OrderReject("NEW-6", 99, Texts.SEQUENCE_RESET_REQUIRED)), replies.sent)
-        assertEquals(1, venue.orders.size, "only OLD-5 was ever sent")
-        assertNull(store.find(P, 6L))
-    }
-
-    @Test
-    fun `the block is stored at the collision's sequenceIndex, and outlives a restart`() {
-        order(5, "OLD-5")
-        order(5, "NEW-5")
-        assertTrue(store.isBlocked(P))
-        assertFalse(store.liftBlock(P, 0), "found at sequenceIndex 0: only a higher one lifts it")
-        restart()
-        replies.sent.clear()
-        order(6, "NEW-6")
-        assertEquals(listOf<Reply>(Reply.OrderReject("NEW-6", 99, Texts.SEQUENCE_RESET_REQUIRED)), replies.sent)
-        assertEquals(1, venue.orders.size)
-    }
-
-    @Test
-    fun `a cancel's id collision is answered the same way`() {
-        order(5, "OLD-5")
-        acknowledge("OLD-5")
-        order(6, "ORD-6")
-        acknowledge("ORD-6")
-        replies.sent.clear()
-        cancel(5, "ORD-6", "CXL-NEW")
-        assertEquals(
-            listOf<Reply>(Reply.CancelReject("CXL-NEW", "ORD-6", 99, Texts.SEQUENCE_RESET_REQUIRED), Reply.Logout(Texts.SEQUENCE_RESET_REQUIRED)),
-            replies.sent,
-        )
+        assertEquals(listOf<String?>("ORD-1", null), replies.namedOrders, "the first states its order's status (§3.3)")
         assertTrue(venue.cancels.isEmpty())
+    }
+
+    @Test
+    fun `a request at a position another ClOrdID holds is a new request, sent, and nothing blocks the session`() {
+        // §8.15 superseded by schema 8 (R§17): Artio's state lost, the client's MsgSeqNum 5 comes again.
+        order(5, "OLD-5")
+        replies.sent.clear()
+        assertEquals(Action.CONTINUE, order(5, "NEW-5"))
+        assertTrue(replies.sent.isEmpty(), "no reject, no Logout")
+        order(6, "NEW-6")
+        assertEquals(listOf("OLD-5", "NEW-5", "NEW-6"), venue.orders.map { it.clOrdId })
     }
 
     // ================================================================ 35=F, §5.2
@@ -469,8 +473,8 @@ class InboundOrdersTest {
         assertEquals(Action.CONTINUE, cancel(2, "ORD-1"))
         val sent = venue.cancels.single()
         assertEquals(P, sent.participantId)
-        assertEquals(2L, sent.clOrdId, "the cancel's own derived id")
-        assertEquals(1L, sent.origClOrdId)
+        assertEquals("CXL-2", sent.clOrdId, "the cancel's own ClOrdID (§5.2)")
+        assertEquals("ORD-1", sent.origClOrdId, "the order's")
         assertEquals(9001L, sent.exchangeOrderId)
         assertEquals(ACME, sent.securityId)
         assertEquals(Side.BUY, sent.side)
@@ -479,7 +483,7 @@ class InboundOrdersTest {
         val row = assertNotNull(store.find(P, 2L))
         assertEquals(RowKind.CANCEL, row.kind)
         assertEquals(CancelState.SENT, row.cancelState)
-        assertEquals(1L, row.origClOrdId)
+        assertEquals("ORD-1", row.origClOrdIdAsString())
         assertEquals(row, store.find(P, 1L)?.pendingCancel)
         assertTrue(replies.sent.isEmpty())
     }
@@ -659,9 +663,9 @@ class InboundOrdersTest {
         order(3, archived = false)
         recorded = first + 256L
         cycle()
-        assertEquals(listOf(1L, 2L), venue.orders.map { it.clOrdId })
+        assertEquals(listOf("ORD-1", "ORD-2"), venue.orders.map { it.clOrdId })
         archive()
-        assertEquals(listOf(1L, 2L, 3L), venue.orders.map { it.clOrdId })
+        assertEquals(listOf("ORD-1", "ORD-2", "ORD-3"), venue.orders.map { it.clOrdId })
     }
 
     @Test
@@ -678,9 +682,12 @@ class InboundOrdersTest {
         order(1, archived = false)
         order(2, archived = false)
         archive()
-        assertEquals(listOf(1L to SendResult.BACK_PRESSURED), venue.orders.map { it.clOrdId to it.result })
+        assertEquals(listOf("ORD-1" to SendResult.BACK_PRESSURED), venue.orders.map { it.clOrdId to it.result })
         cycle()
-        assertEquals(listOf(1L to SendResult.BACK_PRESSURED, 1L to SendResult.SENT, 2L to SendResult.SENT), venue.orders.map { it.clOrdId to it.result })
+        assertEquals(
+            listOf("ORD-1" to SendResult.BACK_PRESSURED, "ORD-1" to SendResult.SENT, "ORD-2" to SendResult.SENT),
+            venue.orders.map { it.clOrdId to it.result },
+        )
     }
 
     @Test
@@ -691,7 +698,7 @@ class InboundOrdersTest {
         cycle()
         assertTrue(venue.cancels.isEmpty())
         archive()
-        assertEquals(listOf(2L), venue.cancels.map { it.clOrdId })
+        assertEquals(listOf("CXL-2"), venue.cancels.map { it.clOrdId })
     }
 
     @Test
@@ -784,13 +791,6 @@ class InboundOrdersTest {
     }
 
     @Test
-    fun `a blocked session's replayed request is not rebuilt`() {
-        store.block(P, 0)
-        replayOrder(1)
-        assertNull(store.find(P, 1L))
-    }
-
-    @Test
     fun `a recovered order whose security the directory does not know is refused, OrdRejReason 99 unknown security`() {
         replayOrder(1, extra = arrayOf(55 to "NOPE"))
         directoryArrives()
@@ -846,7 +846,7 @@ class InboundOrdersTest {
         replayCancel(5, "ORD-2")
         assertNotNull(store.find(P, 4L))
         assertNotNull(store.find(P, 5L))
-        assertEquals(3L, store.find(P, 2L)?.pendingCancel?.clOrdId, "the first stays the pending one")
+        assertEquals(3L, store.find(P, 2L)?.pendingCancel?.position, "the first stays the pending one")
     }
 
     @Test
@@ -1003,7 +1003,7 @@ class InboundOrdersTest {
         acknowledge("ORD-3", status = '1')
         store.findByFix("ORD-4")!!.ambiguous = true
         store.insert(store.newRow().apply { // another participant's
-            kind = RowKind.ORDER; participantId = P + 1; clOrdId = 1L; fixClOrdId("THEIRS"); securityId = ACME; shardId = 2
+            kind = RowKind.ORDER; participantId = P + 1; position = 1L; fixClOrdId("THEIRS"); securityId = ACME; shardId = 2
         })
         replies.sent.clear()
         assertEquals(Action.CONTINUE, massStatusRequest(5, "MS-1"))
@@ -1108,7 +1108,7 @@ class InboundOrdersTest {
     fun `an order on its way to the exchange allocates nothing`() {
         val quiet = QuietVenue()
         val hotSends = ArchivedSends(store, quiet, { Long.MAX_VALUE }) { _, _ -> error("refused") }
-        val hot = InboundOrders(store, quiet, QuietSecurities, { TODAY }, hotSends, { _, _ -> })
+        val hot = InboundOrders(store, quiet, QuietSecurities, { TODAY }, hotSends)
         val count = 32_000
         val orders = (1..count).map { fix("D", it, listOf(11 to "O$it", 55 to "ACME", 54 to "1", 60 to TIME, 38 to "10", 40 to "2", 44 to "100.25")) }
         val buffers = orders.map { UnsafeBuffer(it) }
@@ -1160,12 +1160,12 @@ class InboundOrdersTest {
     // ================================================================ models
 
     private class SentOrder(
-        val participantId: Long, val clOrdId: Long, val securityId: Int, val side: Side, val price: Long, val qty: Long,
+        val participantId: Long, val clOrdId: String, val securityId: Int, val side: Side, val price: Long, val qty: Long,
         val expireDate: Int, val smpId: Long, val smpStrategy: SmpStrategy, val result: SendResult, val storedBeforeSend: Boolean,
     )
 
     private class SentCancel(
-        val participantId: Long, val clOrdId: Long, val origClOrdId: Long, val exchangeOrderId: Long, val securityId: Int,
+        val participantId: Long, val clOrdId: String, val origClOrdId: String, val exchangeOrderId: Long, val securityId: Int,
         val side: Side, val result: SendResult, val storedBeforeSend: Boolean,
     )
 
@@ -1186,17 +1186,21 @@ class InboundOrdersTest {
         }
 
         override fun newOrder(
-            participantId: Long, clOrdId: Long, securityId: Int, side: Side, price: Long, qty: Long,
+            participantId: Long, clOrdId: DirectBuffer, securityId: Int, side: Side, price: Long, qty: Long,
             expireDate: Int, smpId: Long, smpStrategy: SmpStrategy,
         ): SendResult {
             val result = results.removeFirstOrNull() ?: SendResult.SENT
-            orders += SentOrder(participantId, clOrdId, securityId, side, price, qty, expireDate, smpId, smpStrategy, result, store.find(participantId, clOrdId) != null)
+            val stored = store.findByClOrdIdField(participantId, clOrdId, 0) != null
+            orders += SentOrder(participantId, ClOrdId.toString(clOrdId, 0), securityId, side, price, qty, expireDate, smpId, smpStrategy, result, stored)
             return result
         }
 
-        override fun cancel(participantId: Long, clOrdId: Long, origClOrdId: Long, exchangeOrderId: Long, securityId: Int, side: Side): SendResult {
+        override fun cancel(participantId: Long, clOrdId: DirectBuffer, origClOrdId: DirectBuffer, exchangeOrderId: Long, securityId: Int, side: Side): SendResult {
             val result = results.removeFirstOrNull() ?: SendResult.SENT
-            cancels += SentCancel(participantId, clOrdId, origClOrdId, exchangeOrderId, securityId, side, result, store.find(participantId, clOrdId) != null)
+            val stored = store.findByClOrdIdField(participantId, clOrdId, 0) != null
+            cancels += SentCancel(
+                participantId, ClOrdId.toString(clOrdId, 0), ClOrdId.toString(origClOrdId, 0), exchangeOrderId, securityId, side, result, stored,
+            )
             return result
         }
     }
@@ -1205,11 +1209,11 @@ class InboundOrdersTest {
         var sent = 0
         override fun shardOf(securityId: Int) = 0
         override fun newOrder(
-            participantId: Long, clOrdId: Long, securityId: Int, side: Side, price: Long, qty: Long,
+            participantId: Long, clOrdId: DirectBuffer, securityId: Int, side: Side, price: Long, qty: Long,
             expireDate: Int, smpId: Long, smpStrategy: SmpStrategy,
         ): SendResult = SendResult.SENT.also { sent++ }
 
-        override fun cancel(participantId: Long, clOrdId: Long, origClOrdId: Long, exchangeOrderId: Long, securityId: Int, side: Side) =
+        override fun cancel(participantId: Long, clOrdId: DirectBuffer, origClOrdId: DirectBuffer, exchangeOrderId: Long, securityId: Int, side: Side) =
             SendResult.SENT.also { sent++ }
     }
 

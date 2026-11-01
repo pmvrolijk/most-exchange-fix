@@ -44,7 +44,6 @@ class ArtioReplies(directory: DirectoryIndex, private val clock: EpochClock = Sy
     private val orderId = MutableAsciiBuffer(ByteArray(24))
     private val text = MutableAsciiBuffer(ByteArray(256))
     private val transactTime = UtcTimestampEncoder()
-    private val logoutTexts = HashMap<String, ByteArray>()
 
     override fun sessionReject(refSeqNum: Int, refMsgType: AsciiSequenceView, refTagId: Int, reason: Int): Boolean =
         rejects.sessionReject(session, refSeqNum, refMsgType, refTagId, reason)
@@ -116,10 +115,6 @@ class ArtioReplies(directory: DirectoryIndex, private val clock: EpochClock = Sy
         if (request.hasSecurityIDSource()) instrument.securityIDSource(request.securityIDSource(view))
         e.transactTime(transactTime.buffer(), transactTime.encode(clock.time()))
         return send(e)
-    }
-
-    override fun logout(text: String) {
-        session.logoutAndDisconnect(logoutTexts.getOrPut(text) { text.toByteArray(Charsets.US_ASCII) })
     }
 
     /**

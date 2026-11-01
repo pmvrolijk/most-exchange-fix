@@ -1,5 +1,6 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.inbound
 
+import nl.lamia.most.exchange.client.ClOrdId
 import nl.lamia.most.exchange.fixadapter.trace.Trace
 import nl.lamia.most.exchange.fixadapter.trace.TraceFormat
 import io.aeron.logbuffer.ControlledFragmentHandler.Action
@@ -50,8 +51,6 @@ class InboundOrders(
     /** The adapter's trading date, `YYYYMMDD` (§3.6). */
     private val tradingDate: IntSupplier,
     private val sends: ArchivedSends,
-    /** An id collision (§3.3, §8.15), after the store has blocked the session: for counting and logging, with what collided. */
-    private val onIdCollision: (participantId: Long, detail: String) -> Unit,
 ) {
     /** The trace ring (Design.md §9.3); the backend sets it. */
     var trace: Trace = Trace.OFF
@@ -74,12 +73,6 @@ class InboundOrders(
     private val origClOrdId = AsciiSequenceView()
     private val field = AsciiSequenceView()
     private val field2 = AsciiSequenceView()
-
-    var idCollisions = 0L
-        private set
-
-    /** Blocked after an id collision until its session is reset (§3.3). The store keeps it. */
-    fun isBlocked(participantId: Long): Boolean = store.isBlocked(participantId)
 
     /** The message in hand's position on the engine's inbound stream. */
     private var position = 0L
@@ -149,7 +142,7 @@ class InboundOrders(
         val c = cancel
         c.reset()
         c.decode(message, 0, length)
-        val order = store.find(row.participantId, row.origClOrdId) ?: error("cancel ${row.clOrdId} without its order")
+        val order = store.orderOf(row) ?: error("cancel ${row.fixClOrdIdAsString()} without its order")
         row.securityId = 0
         when {
             order.shardId == RequestRow.NO_SHARD || order.isUnresolved -> {
@@ -167,7 +160,7 @@ class InboundOrders(
     /** A rebuilt row, kept with a copy of its message until the directory arrives. */
     /** A live request, stored, on its way to the archive gate (§6.1): the trace's `IN` (§9.3). */
     private fun queued(row: RequestRow) {
-        if (trace.enabled) trace.event(TraceFormat.IN, row.participantId, row.clOrdId, arrivalNs, engineReceivedNs)
+        if (trace.enabled) trace.event(TraceFormat.IN, row.participantId, row.position, arrivalNs, engineReceivedNs)
         sends.send(row)
     }
 
@@ -203,17 +196,10 @@ class InboundOrders(
         d.decode(message, offset, length)
         if (!d.validate()) return sessionReject(replies, d.header(), d.invalidTagId(), d.rejectReason())
 
-        val id = derive(sequenceIndex, d.header().msgSeqNum())
+        val id = positionOf(sequenceIndex, d.header().msgSeqNum())
         d.clOrdID(clOrdId)
-        if (store.isBlocked(participantId)) return refused(participantId, id, replies.rejectOrder(d, OTHER, Texts.SEQUENCE_RESET_REQUIRED))
-
-        val held = store.find(participantId, id)
-        if (held != null) {
-            if (!held.fixClOrdIdEquals(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)) {
-                return collision(participantId, sequenceIndex, replies.rejectOrder(d, OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies) {
-                    collided("35=D", d.header(), id, held)
-                }
-            }
+        val held = store.findByFixClOrdId(participantId, clOrdId.buffer(), clOrdId.offset(), clOrdId.length)
+        if (held != null && isSameRequest(participantId, held, id)) {
             // Rebuilt by a recovery that stopped before the directory came: its copy is kept again (§8.17).
             if (recovering && held.isUnresolved) keepUnresolved(held, offset, length)
             // The same request again: already sent, on its way, or the SDK's to settle (§3.3).
@@ -221,6 +207,7 @@ class InboundOrders(
         }
         // Handled already with no row: answered here, or dropped (§8.17).
         if (recovering && id <= store.highWater(participantId)) return Action.CONTINUE
+        if (!ClOrdId.isValid(clOrdId)) return refused(participantId, id, replies.rejectOrder(d, OTHER, Texts.CLORDID_NOT_FIT))
 
         val securityId = if (recovering) {
             RequestRow.UNRESOLVED_SECURITY // the directory is not there yet (§8.17)
@@ -255,7 +242,7 @@ class InboundOrders(
         val row = store.newRow()
         row.kind = RowKind.ORDER
         row.participantId = participantId
-        row.clOrdId = id
+        row.position = id
         row.fixClOrdId(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)
         row.entryTradingDate = tradingDate.asInt
         row.securityId = securityId
@@ -280,9 +267,13 @@ class InboundOrders(
                 else refused(participantId, id, replies.rejectOrder(d, DUPLICATE_ORDER, Texts.DUPLICATE_CLORDID))
             }
             // Ruled out by the lookup above; the store says so too if that ever changes.
-            InsertResult.SAME, InsertResult.ID_COLLISION -> error("clOrdId $id held, yet not found")
+            InsertResult.SAME -> error("position ${id ushr 32}:${id and 0xffffffffL} held, yet not found")
         }
     }
+
+    /** The ClOrdID [held] at the message's position, in this epoch: the very request again (§6.1, *same*). */
+    private fun isSameRequest(participantId: Long, held: RequestRow, position: Long): Boolean =
+        held.position == position && held.epoch == store.epoch(participantId)
 
     // ------------------------------------------------------------------ 35=F
 
@@ -292,24 +283,20 @@ class InboundOrders(
         c.decode(message, offset, length)
         if (!c.validate()) return sessionReject(replies, c.header(), c.invalidTagId(), c.rejectReason())
 
-        val id = derive(sequenceIndex, c.header().msgSeqNum())
+        val id = positionOf(sequenceIndex, c.header().msgSeqNum())
         c.clOrdID(clOrdId)
         c.origClOrdID(origClOrdId)
-        if (store.isBlocked(participantId)) {
-            return refused(participantId, id, replies.rejectCancel(c, orderNamed(participantId), OTHER, Texts.SEQUENCE_RESET_REQUIRED))
-        }
-
-        val held = store.find(participantId, id)
-        if (held != null) {
-            if (!held.fixClOrdIdEquals(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)) {
-                return collision(participantId, sequenceIndex, replies.rejectCancel(c, orderNamed(participantId), OTHER, Texts.SEQUENCE_RESET_REQUIRED), replies) {
-                    collided("35=F", c.header(), id, held)
-                }
-            }
+        val held = store.findByFixClOrdId(participantId, clOrdId.buffer(), clOrdId.offset(), clOrdId.length)
+        if (held != null && isSameRequest(participantId, held, id)) {
             if (recovering && held.isUnresolved) keepUnresolved(held, offset, length)
             return Action.CONTINUE
         }
         if (recovering && id <= store.highWater(participantId)) return Action.CONTINUE
+        // A ClOrdID that does not fit is refused. An OrigClOrdID that does not fit names no order,
+        // and gets the unknown order's reject below (§3.3).
+        if (!ClOrdId.isValid(clOrdId)) {
+            return refused(participantId, id, replies.rejectCancel(c, orderNamed(participantId), OTHER, Texts.CLORDID_NOT_FIT))
+        }
         val order = orderNamed(participantId)
         if (!recovering && !securities.isReady) return refused(participantId, id, replies.rejectCancel(c, order, OTHER, Texts.EXCHANGE_UNAVAILABLE))
         if (order == null) return refused(participantId, id, replies.rejectCancel(c, null, UNKNOWN_ORDER, Texts.UNKNOWN_ORDER))
@@ -327,10 +314,10 @@ class InboundOrders(
         val row = store.newRow()
         row.kind = RowKind.CANCEL
         row.participantId = participantId
-        row.clOrdId = id
+        row.position = id
         row.fixClOrdId(clOrdId.buffer(), clOrdId.offset(), clOrdId.length)
         row.entryTradingDate = tradingDate.asInt
-        row.origClOrdId = order.clOrdId
+        row.origClOrdId(order)
         row.shardId = order.shardId
         // Before the order's first report there is no exchangeOrderId to cancel by: parked (§3.3).
         // Recovered, it may have been sent: sent, so it is never sent again (§8.17).
@@ -348,7 +335,7 @@ class InboundOrders(
                 if (isPossDup(c.header())) Action.CONTINUE
                 else refused(participantId, id, replies.rejectCancel(c, order, DUPLICATE_CLORDID, Texts.DUPLICATE_CLORDID))
             }
-            InsertResult.SAME, InsertResult.ID_COLLISION -> error("clOrdId $id held, yet not found")
+            InsertResult.SAME -> error("position ${id ushr 32}:${id and 0xffffffffL} held, yet not found")
         }
     }
 
@@ -391,7 +378,7 @@ class InboundOrders(
         val row = store.findByFixClOrdId(participantId, clOrdId.buffer(), clOrdId.offset(), clOrdId.length)
             ?: return answered(replies.unknownOrderStatus(h))
         // A cancel's ClOrdID: its order's status, 11 the cancel's and 41 the order's.
-        val order = if (row.kind == RowKind.CANCEL) store.find(participantId, row.origClOrdId) ?: error("cancel ${row.clOrdId} without its order") else row
+        val order = if (row.kind == RowKind.CANCEL) store.orderOf(row) ?: error("cancel ${row.fixClOrdIdAsString()} without its order") else row
         val e = stated(order)
         if (row.kind == RowKind.CANCEL) e.cancel = row
         if (h.hasOrdStatusReqID()) h.ordStatusReqID(field).let { e.ordStatusReqId(it.buffer(), it.offset(), it.length) }
@@ -405,13 +392,15 @@ class InboundOrders(
         var participantId = 0L
         var sequenceIndex = -1
         var msgSeqNum = 0
-        var clOrdIds = LongArray(16)
+
+        /** The open orders to state. A stored row never leaves memory while the process runs (§6.1). */
+        var orders = arrayOfNulls<RequestRow>(16)
         var size = 0
         var next = 0
 
-        fun add(clOrdId: Long) {
-            if (size == clOrdIds.size) clOrdIds = clOrdIds.copyOf(size * 2)
-            clOrdIds[size++] = clOrdId
+        fun add(order: RequestRow) {
+            if (size == orders.size) orders = orders.copyOf(size * 2)
+            orders[size++] = order
         }
 
         fun isFor(participantId: Long, sequenceIndex: Int, msgSeqNum: Int) =
@@ -419,6 +408,7 @@ class InboundOrders(
 
         fun clear() {
             sequenceIndex = -1
+            orders.fill(null, 0, size)
             size = 0
             next = 0
         }
@@ -447,10 +437,10 @@ class InboundOrders(
                 if (row.participantId != participantId || row.kind != RowKind.ORDER || RequestRow.isTerminal(row.ordStatus)) return@forEach
                 if (securityId != SecurityLookup.NONE && row.securityId != securityId) return@forEach
                 if (side != Side.NULL_VAL && row.side != side) return@forEach
-                m.add(row.clOrdId)
+                m.add(row)
             }
             if (m.size == 0) return massReject(replies, af, OTHER_BUSINESS_REASON, Texts.NO_OPEN_ORDERS)
-            java.util.Arrays.sort(m.clOrdIds, 0, m.size) // in the order they came (§3.2)
+            java.util.Arrays.sort(m.orders, 0, m.size, IN_ARRIVAL_ORDER) // in the order they came (§3.2)
             m.participantId = participantId
             m.sequenceIndex = sequenceIndex
             m.msgSeqNum = msgSeqNum
@@ -458,7 +448,7 @@ class InboundOrders(
         val total = m.size
         val reqId = af.massStatusReqID(field)
         while (m.next < total) {
-            val order = store.find(participantId, m.clOrdIds[m.next]) ?: error("order ${m.clOrdIds[m.next]} left the store")
+            val order = m.orders[m.next]!!
             val e = stated(order)
             e.massStatusReqId(reqId.buffer(), reqId.offset(), reqId.length)
             e.totNumReports = total
@@ -536,28 +526,14 @@ class InboundOrders(
         return SecurityLookup.NONE
     }
 
-    private inline fun collision(participantId: Long, sequenceIndex: Int, rejected: Boolean, replies: ClientReplies, detail: () -> String): Action {
-        if (!rejected) return Action.ABORT
-        idCollisions++
-        store.block(participantId, sequenceIndex)
-        onIdCollision(participantId, detail())
-        replies.logout(Texts.SEQUENCE_RESET_REQUIRED)
-        return Action.CONTINUE
-    }
-
-    /** What collided, for the log: rare, so it may allocate. */
-    private fun collided(msgType: String, h: HeaderDecoder, id: Long, held: RequestRow): String =
-        "$msgType 49=${h.senderCompIDAsString()} 34=${h.msgSeqNum()} 11=${clOrdId}${if (recovering) ", replayed at startup" else ""}" +
-            " derives clOrdId ${id ushr 32}:${id and 0xffffffffL}, held for 11=${held.fixClOrdIdAsString()}"
-
     private fun sessionReject(replies: ClientReplies, h: HeaderDecoder, tag: Int, reason: Int): Action =
         answered(replies.sessionReject(h.msgSeqNum(), h.msgType(msgType), tag, reason))
 
     private fun answered(accepted: Boolean): Action = if (accepted) Action.CONTINUE else Action.ABORT
 
     /** A 35=D or 35=F answered here with no row: once Artio took the answer, a restart does not replay it (§8.17). */
-    private fun refused(participantId: Long, id: Long, accepted: Boolean): Action {
-        if (accepted) store.handled(participantId, id)
+    private fun refused(participantId: Long, position: Long, accepted: Boolean): Action {
+        if (accepted) store.handled(participantId, position)
         return answered(accepted)
     }
 
@@ -575,14 +551,18 @@ class InboundOrders(
         override fun rejectReplace(replace: OrderCancelReplaceRequestDecoder, order: RequestRow?, cxlRejReason: Int, text: String) = true
         override fun status(status: OutgoingExecution) = true
         override fun unknownOrderStatus(request: OrderStatusRequestDecoder) = true
-        override fun logout(text: String) = Unit
     }
 
     private fun isPossDup(h: HeaderDecoder): Boolean = h.hasPossDupFlag() && h.possDupFlag()
 
     private companion object {
-        /** Design.md §3.2. */
-        fun derive(sequenceIndex: Int, msgSeqNum: Int): Long = (sequenceIndex.toLong() shl 32) or (msgSeqNum.toLong() and 0xffffffffL)
+        /** A request's position (Design.md §3.2): never sent, since schema 8, but kept on its row. */
+        fun positionOf(sequenceIndex: Int, msgSeqNum: Int): Long = (sequenceIndex.toLong() shl 32) or (msgSeqNum.toLong() and 0xffffffffL)
+
+        /** Earlier epochs first, then by position (§3.2). */
+        val IN_ARRIVAL_ORDER = Comparator<RequestRow?> { a, b ->
+            if (a!!.epoch != b!!.epoch) a.epoch.compareTo(b.epoch) else a.position.compareTo(b.position)
+        }
 
         // OrdRejReason (103).
         const val UNKNOWN_SYMBOL = 1

@@ -59,10 +59,10 @@ class ArchivedSends(
             // 0: loaded from the store, no position in this process; it goes at once (§6.1).
             if (row.sendAfter != 0L && row.sendAfter > recordedPosition) break
             // Past the gate: again after each back-pressured cycle, so the trace's first GATE is its own.
-            if (trace.enabled) trace.event(TraceFormat.GATE, row.participantId, row.clOrdId, System.nanoTime(), 0L)
+            if (trace.enabled) trace.event(TraceFormat.GATE, row.participantId, row.position, System.nanoTime(), 0L)
             when (val result = toExchange(row)) {
                 SendResult.SENT -> {
-                    if (trace.enabled) trace.event(TraceFormat.SENT, row.participantId, row.clOrdId, System.nanoTime(), 0L)
+                    if (trace.enabled) trace.event(TraceFormat.SENT, row.participantId, row.position, System.nanoTime(), 0L)
                     row.sendPending = false
                     if (row.kind == RowKind.CANCEL && row.cancelState == CancelState.PARKED) {
                         row.cancelState = CancelState.SENT
@@ -81,14 +81,15 @@ class ArchivedSends(
         return done
     }
 
+    /** The request, with the client's own ClOrdID as the exchange's id (§3.2). */
     private fun toExchange(row: RequestRow): SendResult = when (row.kind) {
         RowKind.ORDER -> venue.newOrder(
-            row.participantId, row.clOrdId, row.securityId, row.side, row.price, row.origQty,
+            row.participantId, row.fixIdView, row.securityId, row.side, row.price, row.origQty,
             row.expireDate, row.smpId, if (row.smpStrategy.toInt() == 2) SmpStrategy.CANCEL_RESTING else SmpStrategy.CANCEL_AGGRESSOR,
         )
         RowKind.CANCEL -> {
-            val order = store.find(row.participantId, row.origClOrdId) ?: error("cancel ${row.clOrdId} without its order")
-            venue.cancel(row.participantId, row.clOrdId, order.clOrdId, order.exchangeOrderId, order.securityId, order.side)
+            val order = store.orderOf(row) ?: error("cancel ${row.fixClOrdIdAsString()} without its order")
+            venue.cancel(row.participantId, row.fixIdView, order.fixIdView, order.exchangeOrderId, order.securityId, order.side)
         }
     }
 }

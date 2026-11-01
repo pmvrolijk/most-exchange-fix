@@ -213,7 +213,7 @@ class ReportTest {
         events.forEachIndexed { k, e ->
             val at = TraceFormat.HEADER_SIZE + k * TraceFormat.RECORD_SIZE
             b.put(at + TraceFormat.R_STAGE, e.stage).put(at + TraceFormat.R_EXEC_TYPE, e.byte)
-                .putLong(at + TraceFormat.R_PARTICIPANT, e.participant).putLong(at + TraceFormat.R_CL_ORD_ID, e.clOrdId)
+                .putLong(at + TraceFormat.R_PARTICIPANT, e.participant).putLong(at + TraceFormat.R_POSITION, e.clOrdId)
                 .putLong(at + TraceFormat.R_TIME, e.time).putLong(at + TraceFormat.R_EXTRA, e.extra)
         }
         file.writeBytes(b.array())

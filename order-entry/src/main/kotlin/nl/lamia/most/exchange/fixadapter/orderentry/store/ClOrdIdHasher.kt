@@ -1,25 +1,21 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.store
 
-import org.agrona.DirectBuffer
-
 /**
- * Hashes a FIX ClOrdID from the message's bytes, allocation-free (Design.md §6.1). Lookups compare
- * bytes along the hash's chain, so a collision costs a step, never a false duplicate. A test passes
- * one that always collides.
+ * Hashes a ClOrdID's three words, as the SDK's `ClOrdId` reads them (Design.md §6.1): allocation-free,
+ * whichever bytes they came from, a FIX message's or a report's. Lookups compare the words along the
+ * hash's chain, so a collision costs a step, never a false duplicate. A test passes one that always
+ * collides.
  */
 internal fun interface ClOrdIdHasher {
-    fun hash(buffer: DirectBuffer, offset: Int, length: Int): Long
+    fun hash(word0: Long, word1: Long, word2: Long): Long
 
     companion object {
-        /** FNV-1a, then MurmurHash3's finaliser to spread FNV's weak low bits. */
-        val DEFAULT = ClOrdIdHasher { buffer, offset, length ->
-            var h = -0x340d631b7bdddcdbL // FNV-1a 64 offset basis
-            for (i in 0 until length) {
-                h = (h xor (buffer.getByte(offset + i).toLong() and 0xff)) * 0x100000001b3L
-            }
-            h = (h xor (h ushr 33)) * -0xae502812aa7333L
-            h = (h xor (h ushr 33)) * -0x3b314601e57a13adL
-            h xor (h ushr 33)
+        /** The SDK's own mix for its in-flight table: each word multiplied in, then the high bits folded down. */
+        val DEFAULT = ClOrdIdHasher { w0, w1, w2 ->
+            var h = w0 * -0x61c8864680b583ebL
+            h = (h xor w1) * -0x61c8864680b583ebL
+            h = (h xor w2) * -0x61c8864680b583ebL
+            h xor (h ushr 29)
         }
     }
 }

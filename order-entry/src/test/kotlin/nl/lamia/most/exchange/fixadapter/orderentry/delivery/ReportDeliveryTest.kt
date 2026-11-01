@@ -1,5 +1,6 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.delivery
 
+import nl.lamia.most.exchange.client.ClOrdId
 import nl.lamia.most.exchange.client.OrderFate
 import nl.lamia.most.exchange.fixadapter.orderentry.store.InsertResult
 import nl.lamia.most.exchange.fixadapter.orderentry.store.OrderStore
@@ -247,11 +248,14 @@ class ReportDeliveryTest {
         assertTrue(0L in windows, "bytes allocated per window of 2,000 reports: $windows")
     }
 
-    private fun order(clOrdId: Long): RequestRow = store.newRow().apply {
+    /** The row of [order]`(n)`, by its ClOrdID (Design.md §6.1). */
+    private fun OrderStore.find(participantId: Long, n: Long): RequestRow? = find(participantId, ClOrdId.of("ORD-$n"))
+
+    private fun order(n: Long): RequestRow = store.newRow().apply {
         kind = RowKind.ORDER
         participantId = P
-        this.clOrdId = clOrdId
-        fixClOrdId("ORD-$clOrdId")
+        position = n
+        fixClOrdId("ORD-$n")
         entryTradingDate = TODAY
         securityId = 42
         shardId = 0

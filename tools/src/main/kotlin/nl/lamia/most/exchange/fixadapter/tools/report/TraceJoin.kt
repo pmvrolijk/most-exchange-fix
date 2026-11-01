@@ -5,7 +5,7 @@ import nl.lamia.most.exchange.fixadapter.trace.TraceLog
 
 /**
  * The adapter's trace joined to the sender's log (Design.md §9.3): each measured request found in
- * the trace by its MsgSeqNum, the low 32 bits of the adapter's `clOrdId`, and its service time cut at
+ * the trace by its MsgSeqNum, the low 32 bits of the request's position (§3.2), and its service time cut at
  * each stage. The stages add up to the service time to the first report:
  *
  * - **client → engine**: the sender's send → Artio's receive at the adapter;
@@ -39,7 +39,7 @@ class TraceJoin(a: Analysis, trace: TraceLog, participantOption: Long?) {
                 if (participants.isEmpty()) "the trace has no IN events" else "the trace holds participants $participants: say which with --participant",
             )
 
-        // Each clOrdId's first time at each stage, the first REPORT's and OUT's reportSeq; and the durable steps.
+        // Each position's first time at each stage, the first REPORT's and OUT's reportSeq; and the durable steps.
         class Stages {
             var inAt = 0L
             var engineAt = 0L
@@ -50,7 +50,7 @@ class TraceJoin(a: Analysis, trace: TraceLog, participantOption: Long?) {
             var outSeq = 0L
             var outShard = 0
         }
-        val byClOrdId = HashMap<Long, Stages>()
+        val byPosition = HashMap<Long, Stages>()
         // Per shard, in time order: when the durable first-missing reportSeq moved, and to what.
         val durableTimes = HashMap<Int, MutableList<Long>>()
         val durableFirstMissing = HashMap<Int, MutableList<Long>>()
@@ -65,7 +65,7 @@ class TraceJoin(a: Analysis, trace: TraceLog, participantOption: Long?) {
                     continue
                 }
             }
-            val s = byClOrdId.getOrPut(trace.clOrdId[r]) { Stages() }
+            val s = byPosition.getOrPut(trace.position[r]) { Stages() }
             when (trace.stage[r]) {
                 TraceFormat.IN -> if (s.inAt == 0L) {
                     s.inAt = t
@@ -81,9 +81,9 @@ class TraceJoin(a: Analysis, trace: TraceLog, participantOption: Long?) {
                 }
             }
         }
-        // MsgSeqNum → the clOrdIds with it (a new sequenceIndex reuses numbers): the one whose IN follows the send.
+        // MsgSeqNum → the positions with it (a new sequenceIndex reuses numbers): the one whose IN follows the send.
         val bySeqNum = HashMap<Int, MutableList<Long>>()
-        for (id in byClOrdId.keys) bySeqNum.getOrPut((id and 0xffffffffL).toInt()) { ArrayList() } += id
+        for (id in byPosition.keys) bySeqNum.getOrPut((id and 0xffffffffL).toInt()) { ArrayList() } += id
 
         // The sender's first answer to each request: the end of the service time.
         val firstArrival = LongArray(a.sends.size)
@@ -109,7 +109,7 @@ class TraceJoin(a: Analysis, trace: TraceLog, participantOption: Long?) {
         var lost = 0
         for (i in a.measured) {
             val z = a.sends.sent[i]
-            val s = bySeqNum[a.sends.msgSeqNum[i]]?.map { byClOrdId.getValue(it) }?.filter { it.inAt >= z }?.minByOrNull { it.inAt }
+            val s = bySeqNum[a.sends.msgSeqNum[i]]?.map { byPosition.getValue(it) }?.filter { it.inAt >= z }?.minByOrNull { it.inAt }
             if (s == null || s.gate == 0L || s.sent == 0L || s.report == 0L || s.out == 0L || firstArrival[i] == 0L) {
                 lost++
                 continue

@@ -21,6 +21,8 @@ import nl.lamia.most.exchange.sbe.RejectReason
 import nl.lamia.most.exchange.sbe.RequestStatus
 import nl.lamia.most.exchange.sbe.Side
 import nl.lamia.most.exchange.sbe.SmpStrategy
+import org.agrona.DirectBuffer
+import org.agrona.collections.Long2ObjectHashMap
 import org.agrona.concurrent.UnsafeBuffer
 import org.junit.jupiter.api.io.TempDir
 import java.io.File
@@ -78,11 +80,22 @@ class OutboundReportsTest {
 
     // ---------------------------------------------------------------- rows, as the inbound path writes them
 
+    /**
+     * Each row's ClOrdID by the test's own number for it, and its order's for a cancel: what a report
+     * for it carries since schema 8 (Design.md §3.2, §5.3). Agrona's map, so a report allocates nothing.
+     */
+    private val ids = Long2ObjectHashMap<ClOrdId>()
+    private val origs = Long2ObjectHashMap<ClOrdId>()
+
+    private fun idOf(seq: Long): ClOrdId = ids.get(seq) ?: ClOrdId.of(seq)
+
     private fun order(seq: Long, fix: String = "ORD-$seq", security: Int = ACME): RequestRow = store.newRow().apply {
         kind = RowKind.ORDER
         participantId = P
-        clOrdId = seq
+        position = seq
         fixClOrdId(fix)
+        ids.put(seq, ClOrdId.of(fix))
+        origs.put(seq, ClOrdId.of(fix))
         entryTradingDate = TODAY
         securityId = security
         shardId = if (security == OTHER_SHARD_SECURITY) 1 else 0
@@ -98,18 +111,20 @@ class OutboundReportsTest {
         store.newRow().apply {
             kind = RowKind.CANCEL
             participantId = P
-            clOrdId = seq
+            position = seq
             fixClOrdId(fix)
+            ids.put(seq, ClOrdId.of(fix))
+            origs.put(seq, order.toClOrdId())
             entryTradingDate = TODAY
             shardId = order.shardId
-            origClOrdId = order.clOrdId
+            origClOrdId(order)
             cancelState = state
         }.also {
             assertEquals(InsertResult.NEW, store.insert(it))
             order.pendingCancel = it
         }
 
-    private fun row(seq: Long) = assertNotNull(store.find(P, seq))
+    private fun row(seq: Long) = assertNotNull(store.find(P, idOf(seq)))
 
     // ---------------------------------------------------------------- reports, as the gateway sends them
 
@@ -131,10 +146,14 @@ class OutboundReportsTest {
             .participantId(P).exchangeOrderId(exchangeOrderId).price(price).lastQty(lastQty)
             .leavesQty(leavesQty).cumQty(cumQty).origQty(10_00000000L).securityId(securityId).rejectReason(reason)
             .execType(execType).side(Side.BUY).enrichment(enrichment).reportSeq(reportSeq)
-        // Schema 8 bridge (Status §3 item 12, step 1): the derived id as decimal text, written with
-        // nothing allocated, so the allocation test below measures the adapter alone.
-        ClOrdId.encodeDecimal(clOrdId, buffer, encoder.offset() + ClientExecutionReportEncoder.clOrdIdEncodingOffset())
-        ClOrdId.encodeDecimal(clOrdId, buffer, encoder.offset() + ClientExecutionReportEncoder.origClOrdIdEncodingOffset())
+        // The row's ClOrdID, and its order's for a cancel (§5.3); a number no row holds as its decimal.
+        // Written with nothing allocated, so the allocation test below measures the adapter alone.
+        val id = ids.get(clOrdId)
+        val idAt = encoder.offset() + ClientExecutionReportEncoder.clOrdIdEncodingOffset()
+        val origAt = encoder.offset() + ClientExecutionReportEncoder.origClOrdIdEncodingOffset()
+        if (id != null) id.writeTo(buffer, idAt) else ClOrdId.encodeDecimal(clOrdId, buffer, idAt)
+        val orig = origs.get(clOrdId)
+        if (orig != null) orig.writeTo(buffer, origAt) else ClOrdId.encodeDecimal(clOrdId, buffer, origAt)
         decoder.wrapAndApplyHeader(buffer, 0, headerDecoder)
         return outbound.onReport(shard, decoder)
     }
@@ -179,6 +198,8 @@ class OutboundReportsTest {
         for ((seq, reason, code) in listOf(
             Triple(1L, RejectReason.UNKNOWN_SECURITY, 1), Triple(2L, RejectReason.MARKET_CLOSED, 2),
             Triple(3L, RejectReason.BOOK_CAPACITY, 99), Triple(4L, RejectReason.ORDER_EXPIRED, 99),
+            // The gateway's own, schema 8: never expected, since the adapter refuses such an id first (§3.2).
+            Triple(5L, RejectReason.INVALID_CL_ORD_ID, 99),
         )) {
             order(seq)
             report(seq, ExecType.REJECTED, exchangeOrderId = 0L, leavesQty = 0L, reason = reason)
@@ -312,7 +333,7 @@ class OutboundReportsTest {
     fun `a fate's answer is stored still owing until the archive has it, and a restart before then gives it again`() {
         order(1)
         delivery.keepingUp = false
-        outbound.onSettled(P, 1L, OrderFate.NEVER_SEQUENCED)
+        outbound.onSettled(P, idOf(1L), OrderFate.NEVER_SEQUENCED)
         outbound.doWork()
         assertEquals(1, sent8().size)
         assertNull(row(1).owed, "answered, in memory")
@@ -405,7 +426,7 @@ class OutboundReportsTest {
     @Test
     fun `a NEVER_SEQUENCED order is rejected, OrdRejReason 99, from the duty cycle`() {
         order(1)
-        outbound.onSettled(P, 1L, OrderFate.NEVER_SEQUENCED)
+        outbound.onSettled(P, idOf(1L), OrderFate.NEVER_SEQUENCED)
         assertTrue(client.sent.isEmpty(), "owed, not sent from the SDK's callback")
         outbound.doWork()
         val r = sent8().single()
@@ -424,7 +445,7 @@ class OutboundReportsTest {
         report(2, ExecType.NEW)
         report(2, ExecType.TRADE, lastQty = 3_00000000L, leavesQty = 7_00000000L, cumQty = 3_00000000L)
         client.sent.clear()
-        outbound.onSettled(P, 1L, OrderFate.AMBIGUOUS)
+        outbound.onSettled(P, idOf(1L), OrderFate.AMBIGUOUS)
         outbound.doWork()
         val unacked = sent8().single()
         assertEquals('I' to 'A', unacked.execType to unacked.ordStatus, "pending new: all the client was told")
@@ -439,7 +460,7 @@ class OutboundReportsTest {
     fun `an owed fate survives a restart, and is sent once the session is held again`() {
         order(1)
         client.held = false
-        outbound.onSettled(P, 1L, OrderFate.NEVER_SEQUENCED)
+        outbound.onSettled(P, idOf(1L), OrderFate.NEVER_SEQUENCED)
         outbound.doWork()
         assertTrue(client.sent.isEmpty())
         restart()
@@ -453,12 +474,12 @@ class OutboundReportsTest {
         val o = order(1)
         report(1, ExecType.NEW)
         cancel(2, o)
-        outbound.onSettled(P, 2L, OrderFate.NEVER_SEQUENCED)
+        outbound.onSettled(P, idOf(2L), OrderFate.NEVER_SEQUENCED)
         outbound.doWork()
         assertEquals(Sent9("CXL-2", "ORD-1", 9001L, '0', 99, Texts.NOT_SEQUENCED_CANCEL, false), sent9().single())
         assertNull(row(1).pendingCancel, "it may be cancelled again")
         cancel(3, o)
-        outbound.onSettled(P, 3L, OrderFate.AMBIGUOUS)
+        outbound.onSettled(P, idOf(3L), OrderFate.AMBIGUOUS)
         outbound.doWork()
         assertEquals(Sent9("CXL-3", "ORD-1", 9001L, '0', 99, Texts.CANCEL_STATUS_UNKNOWN, true), sent9().last())
         assertEquals('0'.code.toByte(), row(1).ordStatus)
@@ -510,7 +531,7 @@ class OutboundReportsTest {
         assertEquals(CancelState.PARKED, row(2).cancelState)
         venue.next = SendResult.SENT
         cycle()
-        assertEquals(listOf(SentCancel(2L, 1L, 777L)), venue.cancels.filter { it.result == SendResult.SENT }.map { it.copy(result = null) })
+        assertEquals(listOf(SentCancel("CXL-2", "ORD-1", 777L)), venue.cancels.filter { it.result == SendResult.SENT }.map { it.copy(result = null) })
         assertEquals(CancelState.SENT, row(2).cancelState)
     }
 
@@ -530,7 +551,7 @@ class OutboundReportsTest {
     fun `a parked cancel of an order settled ambiguous is answered status unknown`() {
         val o = order(1)
         cancel(2, o, CancelState.PARKED)
-        outbound.onSettled(P, 1L, OrderFate.AMBIGUOUS)
+        outbound.onSettled(P, idOf(1L), OrderFate.AMBIGUOUS)
         outbound.doWork()
         val r = sent9().single()
         assertEquals(99, r.cxlRejReason)
@@ -561,7 +582,7 @@ class OutboundReportsTest {
         assertTrue(venue.cancels.isEmpty())
         recorded = 5_000L
         cycle()
-        assertEquals(listOf(SentCancel(2L, 1L, 777L, SendResult.SENT)), venue.cancels)
+        assertEquals(listOf(SentCancel("CXL-2", "ORD-1", 777L, SendResult.SENT)), venue.cancels)
     }
 
     @Test
@@ -571,13 +592,13 @@ class OutboundReportsTest {
         recorded = 0L
         report(1, ExecType.NEW, exchangeOrderId = 777L)
         cycle()
-        outbound.onSettled(P, 1L, OrderFate.AMBIGUOUS) // the fate's answer owes the parked cancel again
+        outbound.onSettled(P, idOf(1L), OrderFate.AMBIGUOUS) // the fate's answer owes the parked cancel again
         cycle()
         cycle()
         assertTrue(sent9().isEmpty(), "on its way: the exchange answers it")
         recorded = Long.MAX_VALUE
         cycle()
-        assertEquals(listOf(SentCancel(2L, 1L, 777L, SendResult.SENT)), venue.cancels)
+        assertEquals(listOf(SentCancel("CXL-2", "ORD-1", 777L, SendResult.SENT)), venue.cancels)
     }
 
     // ================================================================ refused sends, §3.3, §6.1
@@ -656,12 +677,12 @@ class OutboundReportsTest {
         val cancels = mutableListOf<SentCancel>()
 
         override fun newOrder(
-            participantId: Long, clOrdId: Long, securityId: Int, side: Side, price: Long, qty: Long,
+            participantId: Long, clOrdId: DirectBuffer, securityId: Int, side: Side, price: Long, qty: Long,
             expireDate: Int, smpId: Long, smpStrategy: SmpStrategy,
         ): SendResult = error("the outbound path sends no order")
 
-        override fun cancel(participantId: Long, clOrdId: Long, origClOrdId: Long, exchangeOrderId: Long, securityId: Int, side: Side): SendResult {
-            cancels += SentCancel(clOrdId, origClOrdId, exchangeOrderId, next)
+        override fun cancel(participantId: Long, clOrdId: DirectBuffer, origClOrdId: DirectBuffer, exchangeOrderId: Long, securityId: Int, side: Side): SendResult {
+            cancels += SentCancel(ClOrdId.toString(clOrdId, 0), ClOrdId.toString(origClOrdId, 0), exchangeOrderId, next)
             return next
         }
     }
@@ -674,7 +695,7 @@ class OutboundReportsTest {
     }
 }
 
-data class SentCancel(val clOrdId: Long, val origClOrdId: Long, val exchangeOrderId: Long, val result: SendResult? = null)
+data class SentCancel(val clOrdId: String, val origClOrdId: String, val exchangeOrderId: Long, val result: SendResult? = null)
 
 /** A 35=8 as the client would read it. [execId] is the reportSeq, 0 for the adapter's own; [orderId] 0 is `NONE`. */
 data class Sent8(

@@ -1,5 +1,7 @@
 package nl.lamia.most.exchange.fixadapter.orderentry
 
+import nl.lamia.most.exchange.fixadapter.orderentry.store.RequestRow
+import nl.lamia.most.exchange.client.ClOrdId
 import nl.lamia.most.exchange.client.GatewayEndpoint
 import nl.lamia.most.exchange.fixadapter.codecs.Constants
 import nl.lamia.most.exchange.fixadapter.codecs.builder.NewOrderSingleEncoder
@@ -175,7 +177,7 @@ class OrderEntryBackendTest {
     // ================================================================ the order path, §3.3, §3.5
 
     @Test
-    fun `a 35=D reaches its security's shard as a NewOrderSingle for the session's participant, with the derived clOrdId`() {
+    fun `a 35=D reaches its security's shard as a NewOrderSingle for the session's participant, with its own ClOrdID`() {
         val adapter = start()
         adapter.awaitExchange()
         val session = adapter.logon()
@@ -187,15 +189,17 @@ class OrderEntryBackendTest {
 
         val acme = adapter.gateway(0).orders.single()
         assertEquals(1001L, acme.participantId, "the session's participant (§2)")
-        // The acceptor's sequenceIndex, 0 for a session never reset (the client's own counts its side).
-        assertEquals((0L shl 32) or acmeSeq.toLong(), acme.clOrdId, "(sequenceIndex << 32) | MsgSeqNum (§3.2)")
+        assertEquals("ORD-A", acme.clOrdId, "the client's ClOrdID as sent, the exchange's id since schema 8 (§3.2)")
+        // The row keeps its position: the acceptor's sequenceIndex, 0 for a session never reset, and the MsgSeqNum.
+        assertEquals(acmeSeq.toLong(), adapter.rig.backend.store.findByFix(1001L, "ORD-A")?.position, "never sent (§3.2)")
         assertEquals(42, acme.securityId)
         assertEquals(Side.BUY, acme.side)
         assertEquals(100_25000000L, acme.price)
         assertEquals(10_00000000L, acme.qty)
         assertEquals(OrderEntryRig.TODAY, acme.expireDate, "a day order: the adapter's trading date (§3.6)")
         assertEquals(43, adapter.gateway(1).orders.single().securityId, "BETA's shard is 1")
-        assertEquals(betaSeq.toLong(), adapter.gateway(1).orders.single().clOrdId and 0xffffffffL)
+        assertEquals("ORD-B", adapter.gateway(1).orders.single().clOrdId)
+        assertEquals(betaSeq.toLong(), adapter.rig.backend.store.findByFix(1001L, "ORD-B")?.position)
         assertTrue(session.messages().none { it.msgType == "8" || it.msgType == "j" || it.msgType == "3" }, "${session.messages()}")
     }
 
@@ -451,9 +455,9 @@ class OrderEntryBackendTest {
         val stages = listOf(TraceFormat.IN, TraceFormat.GATE, TraceFormat.SENT, TraceFormat.REPORT, TraceFormat.OUT, TraceFormat.DURABLE)
         val first = stages.associateWith { stage -> events.first { t.stage[it] == stage } }
         for (stage in listOf(TraceFormat.IN, TraceFormat.GATE, TraceFormat.SENT, TraceFormat.REPORT, TraceFormat.OUT)) {
-            assertEquals(o.clOrdId, t.clOrdId[first.getValue(stage)], TraceFormat.name(stage))
+            // The request's position, whose low 32 bits are the 35=D's MsgSeqNum (§3.2, §9.3).
+            assertEquals(msgSeqNum.toLong(), t.position[first.getValue(stage)], TraceFormat.name(stage))
         }
-        assertEquals(msgSeqNum.toLong(), o.clOrdId and 0xffffffffL, "the clOrdId's low 32 bits are the 35=D's MsgSeqNum (CLAUDE.md 8)")
         val times = stages.map { t.time[first.getValue(it)] }
         assertEquals(times.sorted(), times, "in order")
         assertEquals(ExecType.NEW.value(), t.execType[first.getValue(TraceFormat.REPORT)])
@@ -552,7 +556,7 @@ class OrderEntryBackendTest {
         val c = adapter.gateway(0).cancels.single()
         assertEquals(o.clOrdId, c.origClOrdId)
         assertEquals(5001L, c.exchangeOrderId)
-        assertEquals(session.lastSentMsgSeqNum().toLong(), c.clOrdId and 0xffffffffL, "the 35=F's own derived id")
+        assertEquals("CXL-1", c.clOrdId, "the 35=F's own ClOrdID (§5.2)")
         adapter.gateway(0).report(1001L, c.clOrdId, ExecType.CANCELED, 5001L, price = o.price, leavesQty = 0L, cumQty = 0L, origQty = o.qty)
         pollUntil(*adapter.all(), what = "the cancel's 35=8") { adapter.reports(session).size == 2 }
         val done = adapter.reports(session).last()
@@ -609,7 +613,7 @@ class OrderEntryBackendTest {
      * host crash loses it from the unsynced WAL while the archive has the 35=D (§6.1, §8.20). Returns
      * the client's last sent and received MsgSeqNums, and the lost row's `clOrdId`.
      */
-    private fun sentThenLost(): Triple<Int, Int, Long> {
+    private fun sentThenLost(): Triple<Int, Int, String> {
         val (sent, received) = start().use { adapter ->
             adapter.awaitExchange()
             val session = adapter.logon()
@@ -621,8 +625,8 @@ class OrderEntryBackendTest {
         }
         val clOrdId = OrderStore.open(OrderEntryRig.storeDir(adapterDir)).use { store ->
             store.load(OrderEntryRig.TODAY)
-            var lost = 0L
-            store.forEach { if (it.kind == RowKind.ORDER) lost = it.clOrdId }
+            var lost = ""
+            store.forEach { if (it.kind == RowKind.ORDER) lost = it.fixClOrdIdAsString() }
             store.loseForTest(1001L, lost)
             lost
         }
@@ -634,7 +638,7 @@ class OrderEntryBackendTest {
         // Design.md §8.17.
         val (sent, received, clOrdId) = sentThenLost()
         start().use { adapter ->
-            val row = assertNotNull(adapter.rig.backend.store.find(1001L, clOrdId), "rebuilt before the bind: ${adapter.rig.log}")
+            val row = assertNotNull(adapter.rig.backend.store.findByFix(1001L, clOrdId), "rebuilt before the bind: ${adapter.rig.log}")
             assertEquals("ORD-1", row.fixClOrdIdAsString())
             adapter.awaitExchange()
             val session = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
@@ -692,20 +696,18 @@ class OrderEntryBackendTest {
         val expected = OrderStore.open(OrderEntryRig.storeDir(adapterDir)).use { store ->
             store.load(OrderEntryRig.TODAY)
             val byParticipant = mutableMapOf<Long, MutableList<Pair<Long, String>>>()
-            store.forEach { if (it.kind == RowKind.ORDER) byParticipant.getOrPut(it.participantId) { mutableListOf() } += it.clOrdId to it.fixClOrdIdAsString() }
+            store.forEach { if (it.kind == RowKind.ORDER) byParticipant.getOrPut(it.participantId) { mutableListOf() } += it.position to it.fixClOrdIdAsString() }
             byParticipant.mapValues { (participantId, rows) ->
-                rows.sortedBy { it.first }.takeLast(lost).onEach { (clOrdId, _) -> store.loseForTest(participantId, clOrdId) }
+                rows.sortedBy { it.first }.takeLast(lost).onEach { (_, fixClOrdId) -> store.loseForTest(participantId, fixClOrdId) }
             }
         }
         assertEquals(setOf(1001L, 1002L), expected.keys)
 
         start().use { adapter ->
             val store = adapter.rig.backend.store
-            assertTrue(adapter.rig.log.none { "id collision" in it }, "no collision: ${adapter.rig.log}")
-            assertTrue(!store.isBlocked(1001L) && !store.isBlocked(1002L), "neither session blocked")
             for ((participantId, rows) in expected) {
-                for ((clOrdId, fixClOrdId) in rows) {
-                    val row = assertNotNull(store.find(participantId, clOrdId), "participant $participantId's $fixClOrdId rebuilt: ${adapter.rig.log}")
+                for ((_, fixClOrdId) in rows) {
+                    val row = assertNotNull(store.findByFix(participantId, fixClOrdId), "participant $participantId's $fixClOrdId rebuilt: ${adapter.rig.log}")
                     assertEquals(fixClOrdId, row.fixClOrdIdAsString(), "participant $participantId's own order")
                 }
             }
@@ -893,7 +895,8 @@ class OrderEntryBackendTest {
         pollUntil(adapter.exchange, client, what = "a 35=D sent") { again.trySend(order("ORD-2")) > 0 }
         pollFor(200, adapter.exchange, client)
         pollUntil(*adapter.all(), what = "the 35=D at the gateway (${adapter.rig.log})") { adapter.gateway(0).orders.size == 1 }
-        assertEquals(again.lastSentMsgSeqNum().toLong(), adapter.gateway(0).orders.single().clOrdId and 0xffffffffL)
+        assertEquals("ORD-2", adapter.gateway(0).orders.single().clOrdId)
+        assertEquals(again.lastSentMsgSeqNum().toLong(), adapter.rig.backend.store.findByFix(1001L, "ORD-2")?.position)
     }
 
     @Test
@@ -945,8 +948,11 @@ class OrderEntryBackendTest {
         pollUntil(*polled(), what = "the raw client's Logon answered") { c.received("A").isNotEmpty() }
     }
 
-    /** The MsgSeqNums of the 35=Ds that reached shard 0's gateway, from their derived clOrdIds (§3.2). */
-    private fun Adapter.sequenced(): List<Int> = gateway(0).orders.map { (it.clOrdId and 0xffffffffL).toInt() }
+    /** The MsgSeqNums of the 35=Ds that reached shard 0's gateway, from their rows' positions (§3.2). */
+    private fun Adapter.sequenced(): List<Int> =
+        gateway(0).orders.map { (assertNotNull(rig.backend.store.findByFix(it.participantId, it.clOrdId)).position and 0xffffffffL).toInt() }
+
+    private fun OrderStore.findByFix(participantId: Long, clOrdId: String): RequestRow? = find(participantId, ClOrdId.of(clOrdId))
 
     /** Spike (h4)'s client: a gap at 3–4, new orders during the resend, an answer that stops at 4, then more. */
     private fun Adapter.answerShort(c: RawFixClient) {
@@ -1151,19 +1157,20 @@ class OrderEntryBackendTest {
         assertTrue("sequenceIndex" in refusal.message.orEmpty(), refusal.message)
     }
 
-    // ================================================================ the id collision, §3.3
+    // ================================================================ no id collision since schema 8, §8.15 superseded
 
     @Test
-    fun `an id collision logs the session out, and it stays out across a restart until a 141=Y Logon`() {
+    fun `a 35=D at a position an earlier life's rows hold reaches the exchange with its own ClOrdID, and the session stays logged on`() {
+        // Design.md §3.2, R§17: what was an id collision is a new request, never a block.
         // A first life: Artio comes to know CLIENT1's session, at sequenceIndex 0.
-        var (sent, received) = start().use { adapter ->
+        val (sent, received) = start().use { adapter ->
             adapter.awaitExchange()
             val session = adapter.logon()
             pollUntil(*adapter.all(), what = "logout sent") { session.startLogout() > 0 }
             pollUntil(*adapter.all(), what = "logged out") { !session.isConnected }
             session.lastSentMsgSeqNum() to session.lastReceivedMsgSeqNum()
         }
-        // Rows from an earlier life of the same sequence: every clOrdId the client derives next is held.
+        // Rows from an earlier life of the same sequence: every position the client takes next is held.
         OrderStore.open(OrderEntryRig.storeDir(adapterDir)).use { store ->
             store.load(OrderEntryRig.TODAY)
             for (n in 1..sent + 20) store.insert(row(store, 1001L, n.toLong(), "WIPED-$n"))
@@ -1175,50 +1182,21 @@ class OrderEntryBackendTest {
             adapter.awaitExchange()
             val session = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
             adapter.send(session, order("NEW-1"))
-            // The client's session id is the same at every logon: only what follows this Logon counts.
-            val reject = adapter.awaitReply(session, "the collision's reject") { it.msgType == "8" && it.seqNum > received }
-            assertEquals(Texts.SEQUENCE_RESET_REQUIRED, reject[58])
-            assertEquals("99", reject[103])
-            val logout = adapter.awaitReply(session, "the Logout") { it.msgType == "5" && it.seqNum > received }
-            assertEquals(Texts.SEQUENCE_RESET_REQUIRED, logout[58])
-            pollUntil(*adapter.all(), what = "disconnected") { !session.isConnected }
-            assertTrue(adapter.exchange.gateways.values.all { it.orders.isEmpty() }, "never sent")
-            sent = session.lastSentMsgSeqNum()
-            received = session.lastReceivedMsgSeqNum()
-
-            // Logging on again: accepted by the engine, then logged out by the library.
-            val again = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
-            val out = adapter.awaitReply(again, "logged out on arrival") { it.msgType == "5" && it.seqNum > received }
-            assertEquals(Texts.SEQUENCE_RESET_REQUIRED, out[58])
-            pollUntil(*adapter.all(), what = "disconnected again") { !again.isConnected }
-            sent = again.lastSentMsgSeqNum()
-            received = again.lastReceivedMsgSeqNum()
-        }
-
-        start().use { adapter ->
-            adapter.awaitExchange()
-            val stillBlocked = adapter.logon(initialSent = sent + 1, initialReceived = received + 1)
-            val out = adapter.awaitReply(stillBlocked, "still blocked after the restart") { it.msgType == "5" && it.seqNum > received }
-            assertEquals(Texts.SEQUENCE_RESET_REQUIRED, out[58])
-            pollUntil(*adapter.all(), what = "disconnected") { !stillBlocked.isConnected }
-
-            // The client's own reset raises the sequenceIndex: the derived ids are new, and it trades.
-            val reset = adapter.logon(reset = true)
-            // Raised at the claim itself, before the client sends anything, for the guard (§3.2).
-            pollUntil(*adapter.all(), what = "sequenceIndex 1 stored") { adapter.rig.backend.store.highestSequenceIndex(1001L) == 1 }
-            adapter.send(reset, order("AFTER-RESET"))
-            pollUntil(*adapter.all(), what = "the order at the gateway") { adapter.gateway(0).orders.size == 1 }
-            assertEquals((1L shl 32) or reset.lastSentMsgSeqNum().toLong(), adapter.gateway(0).orders.single().clOrdId, "141=Y raised the sequenceIndex to 1")
+            pollUntil(*adapter.all(), what = "the order at the gateway (${adapter.rig.log})") { adapter.gateway(0).orders.size == 1 }
+            assertEquals("NEW-1", adapter.gateway(0).orders.single().clOrdId)
             pollFor(200, *adapter.all())
-            assertTrue(reset.isConnected, "not logged out")
-            assertTrue(!adapter.rig.backend.store.isBlocked(1001L))
+            assertTrue(session.isConnected, "not logged out")
+            assertTrue(
+                session.messages().none { (it.msgType == "8" || it.msgType == "5") && it.seqNum > received },
+                "no reject, no Logout: ${session.messages()}",
+            )
         }
     }
 
-    private fun row(store: OrderStore, participantId: Long, clOrdId: Long, fixClOrdId: String) = store.newRow().apply {
+    private fun row(store: OrderStore, participantId: Long, position: Long, fixClOrdId: String) = store.newRow().apply {
         kind = RowKind.ORDER
         this.participantId = participantId
-        this.clOrdId = clOrdId
+        this.position = position
         fixClOrdId(fixClOrdId)
         entryTradingDate = OrderEntryRig.TODAY
         securityId = 42
@@ -1228,7 +1206,7 @@ class OrderEntryBackendTest {
         leavesQty = 1_00000000L
         timeInForce = '1'.code.toByte()
         acknowledged = true
-        exchangeOrderId = 7_000L + clOrdId
+        exchangeOrderId = 7_000L + position
         ordStatus = '0'.code.toByte()
     }
 

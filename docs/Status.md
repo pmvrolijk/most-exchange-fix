@@ -706,16 +706,31 @@ priority, 2026-11-01). Then §8.24's investigation with the user's Linux run.
        `origClOrdId` and echoes `toSeq`. `./gradlew build` green: 367 tests, `order-entry` 247.
        No fence test failed under the SDK's new settling rule; step 6 checks they still cover it.
        Not run: the e2e (needs v8 installs, step 7).
-    2. **The store:** keyed by (`participantId`, ClOrdID, 20 bytes); the position and epoch on the
-       row; one in-memory index by the ClOrdID's three words (`ClOrdIdHasher`'s chain and the
-       `clOrdId` map go); `ID_COLLISION`, the block, `requireSequenceIndex` go; the high-water and
-       floor by position within the epoch; a new row version, and a store written before it
-       refused. `OrderStoreTest` first.
-    3. **Inbound:** `ClOrdId.isValid` on 11 and 41, refused as §3.3 says; the collision paths go;
-       *same* is the ClOrdID at the same position; the 35=AF order by position.
-    4. **Outbound and the SDK:** a report's row found from its `clOrdId` bytes; `onSettled` and
-       `restoreInFlight` with `ClOrdId`; `INVALID_CL_ORD_ID` mapped (OrdRejReason 99, its name as
-       Text); `Ports` and `ShardVenue` pass `ClOrdId`; the trace records the position.
+    2. ~~**The store**~~, 3. ~~**Inbound**~~ and 4. ~~**Outbound and the SDK**~~ **Done 2026-11-01, as
+       one change:** re-keying the store removed the lookup by derived id the step 1 bridge rested on,
+       so none of the three builds alone.
+       - **The store:** rows keyed (`participantId`, ClOrdID's 20 bytes); position and epoch on the
+         row (`RowCodec` version 2); one index by the id's three words, from a FIX message, a
+         report's `char[20]` or the SDK's `ClOrdId`; a cancel names its order by ClOrdID
+         (`orderOf`); `ID_COLLISION`, the block and the derived-id map gone; the high-water, floor
+         and replay by position within the epoch; `beginEpoch` for step 5; a format mark in `meta`,
+         so a store from before schema 8 refuses the start, saying the upgrade is a fresh start.
+       - **Inbound:** `ClOrdId.isValid` on 11, refused as §3.3 says (`Texts.CLORDID_NOT_FIT`); an
+         unfit 41 finds no order; *same* is the ClOrdID at the same position and epoch; the 35=AF
+         order by (epoch, position); the collision, its Logout and `ClientReplies.logout` gone.
+       - **Outbound:** a report's row found from its `clOrdId` bytes; `onSettled` and
+         `restoreInFlight` with the SDK's `ClOrdId`; `INVALID_CL_ORD_ID` is OrdRejReason 99 with its
+         name, as §5.3's "every other" already said (pinned by a test).
+       - **Changed from the plan:** the venue port takes the id's 20 bytes, not a `ClOrdId`, so the
+         inbound path stays allocation-free and its test still measures 0; `ShardVenue` makes the
+         SDK's object, the one allocation per send of §8.30. The trace ring's field is renamed
+         `position` (`R_POSITION`), the same value.
+       - **Tests:** `OrderStoreTest` rewritten from §3.2 and §6.1 first (30), then the inbound,
+         outbound and backend tests; collision tests replaced by their opposite (a held position
+         is a new request, end to end included). Mutations, each caught: *same* ignoring the
+         position (store and inbound), the high-water ignoring the epoch, no format check, a NUL
+         accepted in a FIX lookup, an unfit ClOrdID let through. `./gradlew build` green: 370 tests,
+         `order-entry` 250.
     5. **Startup:** `StartupGuards` finds Artio's state lost as §3.2 says, and starts a new epoch.
     6. **The test fakes on v8:** `OrderEntryRig` and the spikes' `Messages` echo `toSeq` and stop at
        it; fence tests follow the SDK's new settling rule.

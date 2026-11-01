@@ -17,7 +17,6 @@ sealed interface Reply {
         val clOrdId: String, val origClOrdId: String, val cxlRejReason: Int, val text: String, val statusUnknown: Boolean = false,
     ) : Reply
     data class ReplaceReject(val clOrdId: String, val origClOrdId: String, val cxlRejReason: Int, val text: String) : Reply
-    data class Logout(val text: String) : Reply
 
     /** A 35=8 ExecType I from the store (§3.3): what it says of the order, and the ids it echoes. */
     data class Status(
@@ -80,10 +79,6 @@ class RecordingReplies : ClientReplies {
 
     override fun rejectReplace(replace: OrderCancelReplaceRequestDecoder, order: RequestRow?, cxlRejReason: Int, text: String) =
         record(Reply.ReplaceReject(replace.clOrdIDAsString(), replace.origClOrdIDAsString(), cxlRejReason, text))
-
-    override fun logout(text: String) {
-        if (accepting) sent += Reply.Logout(text)
-    }
 }
 
 /** Accepts every reply and keeps nothing: for measuring the path, not its answers. */
@@ -95,7 +90,6 @@ object NoReplies : ClientReplies {
     override fun rejectReplace(replace: OrderCancelReplaceRequestDecoder, order: RequestRow?, cxlRejReason: Int, text: String) = true
     override fun status(status: OutgoingExecution) = true
     override fun unknownOrderStatus(request: OrderStatusRequestDecoder) = true
-    override fun logout(text: String) = Unit
 }
 
 /**

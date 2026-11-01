@@ -8,6 +8,7 @@ import nl.lamia.most.exchange.client.SendResult
 import nl.lamia.most.exchange.fixadapter.orderentry.inbound.OrderVenue
 import nl.lamia.most.exchange.sbe.Side
 import nl.lamia.most.exchange.sbe.SmpStrategy
+import org.agrona.DirectBuffer
 import org.agrona.collections.Int2IntHashMap
 import org.agrona.collections.Int2ObjectHashMap
 
@@ -53,18 +54,17 @@ class ShardVenue : OrderVenue {
     }
 
     override fun newOrder(
-        participantId: Long, clOrdId: Long, securityId: Int, side: Side, price: Long, qty: Long,
+        participantId: Long, clOrdId: DirectBuffer, securityId: Int, side: Side, price: Long, qty: Long,
         expireDate: Int, smpId: Long, smpStrategy: SmpStrategy,
     ): SendResult {
         val session = sessionFor(securityId) ?: return SendResult.NO_GATEWAY
-        // Schema 8 bridge (Status §3 item 12, step 1): the derived id as its decimal text, until the
-        // store sends the client's own ClOrdID (steps 2-4). Allocates.
-        return session.newOrder(participantId, ClOrdId.of(clOrdId), securityId, side, price, qty, expireDate, smpId, smpStrategy)
+        // The SDK takes the id as an object: one allocation per send (Design.md §8.30).
+        return session.newOrder(participantId, ClOrdId.read(clOrdId, 0), securityId, side, price, qty, expireDate, smpId, smpStrategy)
     }
 
-    override fun cancel(participantId: Long, clOrdId: Long, origClOrdId: Long, exchangeOrderId: Long, securityId: Int, side: Side): SendResult {
+    override fun cancel(participantId: Long, clOrdId: DirectBuffer, origClOrdId: DirectBuffer, exchangeOrderId: Long, securityId: Int, side: Side): SendResult {
         val session = sessionFor(securityId) ?: return SendResult.NO_GATEWAY
-        return session.cancel(participantId, ClOrdId.of(clOrdId), ClOrdId.of(origClOrdId), exchangeOrderId, securityId, side)
+        return session.cancel(participantId, ClOrdId.read(clOrdId, 0), ClOrdId.read(origClOrdId, 0), exchangeOrderId, securityId, side)
     }
 
     private fun sessionFor(securityId: Int): OrderEntrySession? {

@@ -32,7 +32,7 @@ class TraceTest {
         assertContentEquals(byteArrayOf(TraceFormat.IN, TraceFormat.GATE, TraceFormat.REPORT, TraceFormat.DURABLE), log.stage)
         assertContentEquals(byteArrayOf(0, 0, 3, 1), log.execType)
         assertContentEquals(longArrayOf(1001L, 1001L, 1001L, 1002L), log.participant)
-        assertContentEquals(longArrayOf((2L shl 32) or 7L, (2L shl 32) or 7L, (2L shl 32) or 7L, 0L), log.clOrdId)
+        assertContentEquals(longArrayOf((2L shl 32) or 7L, (2L shl 32) or 7L, (2L shl 32) or 7L, 0L), log.position)
         assertContentEquals(longArrayOf(100L, 200L, 300L, 400L), log.time)
         assertContentEquals(longArrayOf(555L, 0L, 12L, 13L), log.extra)
     }

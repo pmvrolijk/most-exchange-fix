@@ -1,5 +1,6 @@
 package nl.lamia.most.exchange.fixadapter.orderentry.store
 
+import nl.lamia.most.exchange.client.ClOrdId
 import nl.lamia.most.exchange.client.OrderFate
 import nl.lamia.most.exchange.sbe.Side
 import org.agrona.DirectBuffer
@@ -15,14 +16,14 @@ enum class CancelState { PARKED, SENT, ANSWERED }
 enum class InsertResult {
     NEW,
 
-    /** The very request again, same `clOrdId` and ClOrdID: a back-pressure redelivery or a PossDup resend. */
+    /**
+     * The very request again, its ClOrdID held at the same position and epoch: a back-pressure
+     * redelivery, a PossDup resend or a replay.
+     */
     SAME,
 
-    /** Another of the participant's rows, an order or a cancel, holds the FIX ClOrdID. */
+    /** Another of the participant's requests, an order or a cancel, holds the FIX ClOrdID. */
     DUPLICATE_CLORDID,
-
-    /** Another FIX ClOrdID holds the `clOrdId`: Artio's sequence went back (§3.2, §8.15). */
-    ID_COLLISION,
 }
 
 /**
@@ -36,8 +37,15 @@ class RequestRow internal constructor() {
     var kind = RowKind.ORDER
     var participantId = 0L
 
-    /** The exchange's id, derived (Design.md §3.2). */
-    var clOrdId = 0L
+    /**
+     * The request's position (Design.md §3.2): `(sequenceIndex << 32) | MsgSeqNum` of its 35=D or 35=F.
+     * Never sent: recovery's high-water, the order a 35=AF answers in, and the trace's join.
+     */
+    var position = 0L
+
+    /** The participant's epoch when the row was inserted: positions compare only within one (§3.2). Set by the store. */
+    var epoch = 0
+        internal set
     var entryTradingDate = 0
 
     /**
@@ -77,14 +85,34 @@ class RequestRow internal constructor() {
     var ambiguous = false
 
     // A cancel's fields.
-    var origClOrdId = 0L
     var cancelState = CancelState.SENT
 
-    private var fixId = ByteArray(INITIAL_CLORDID_CAPACITY)
-    internal var fixIdView = UnsafeBuffer(fixId)
-        private set
+    /**
+     * The FIX ClOrdID, since schema 8 the exchange's `clOrdId` and the row's key (§3.2, §6.1): its bytes
+     * NUL-padded to 20, as the exchange carries it, and the three words the store compares.
+     */
+    private val fixId = ByteArray(ClOrdId.LENGTH)
+    internal val fixIdView = UnsafeBuffer(fixId)
 
     var fixClOrdIdLength = 0
+        private set
+    internal var word0 = 0L
+        private set
+    internal var word1 = 0L
+        private set
+    internal var word2 = 0L
+        private set
+
+    /** A cancel's order's ClOrdID (FIX 41), as [fixIdView] holds the cancel's own; empty for an order. */
+    private val origId = ByteArray(ClOrdId.LENGTH)
+    internal val origIdView = UnsafeBuffer(origId)
+    var origClOrdIdLength = 0
+        private set
+    internal var origWord0 = 0L
+        private set
+    internal var origWord1 = 0L
+        private set
+    internal var origWord2 = 0L
         private set
 
     // In memory only, never stored.
@@ -116,15 +144,15 @@ class RequestRow internal constructor() {
     internal var nextSameHash: RequestRow? = null
     internal var stored = false
 
-    /** Copies the FIX ClOrdID from the message's bytes. */
+    /**
+     * Copies the FIX ClOrdID from the message's bytes. The inbound path has checked it against the
+     * exchange's rule (§3.2); a row takes none it cannot key on: 1 to 20 bytes, no NUL.
+     */
     fun fixClOrdId(buffer: DirectBuffer, offset: Int, length: Int) {
-        require(length in 0..MAX_FIX_CLORDID_LENGTH) { "ClOrdID of $length bytes" }
-        if (length > fixId.size) {
-            fixId = ByteArray(maxOf(length, fixId.size * 2))
-            fixIdView = UnsafeBuffer(fixId)
-        }
-        buffer.getBytes(offset, fixId, 0, length)
-        fixClOrdIdLength = length
+        fixClOrdIdLength = copyId(buffer, offset, length, fixIdView)
+        word0 = ClOrdId.word0(fixIdView, 0)
+        word1 = ClOrdId.word1(fixIdView, 0)
+        word2 = ClOrdId.word2(fixIdView, 0)
     }
 
     /** For tests and tools: allocates. */
@@ -132,6 +160,34 @@ class RequestRow internal constructor() {
         val bytes = ascii.toByteArray(Charsets.US_ASCII)
         fixClOrdId(UnsafeBuffer(bytes), 0, bytes.size)
     }
+
+    /** A cancel's order's ClOrdID, from the message's 41 or a stored row. */
+    fun origClOrdId(buffer: DirectBuffer, offset: Int, length: Int) {
+        origClOrdIdLength = copyId(buffer, offset, length, origIdView)
+        origWord0 = ClOrdId.word0(origIdView, 0)
+        origWord1 = ClOrdId.word1(origIdView, 0)
+        origWord2 = ClOrdId.word2(origIdView, 0)
+    }
+
+    /** A cancel of [order]: its ClOrdID is the cancel's 41. */
+    fun origClOrdId(order: RequestRow) = origClOrdId(order.fixIdView, 0, order.fixClOrdIdLength)
+
+    /** For tests: allocates. */
+    fun origClOrdId(ascii: String) {
+        val bytes = ascii.toByteArray(Charsets.US_ASCII)
+        origClOrdId(UnsafeBuffer(bytes), 0, bytes.size)
+    }
+
+    /** Allocates. */
+    fun origClOrdIdAsString(): String = String(origId, 0, origClOrdIdLength, Charsets.US_ASCII)
+
+    /** The ClOrdID as the SDK takes it, for a send or `restoreInFlight`. Allocates. */
+    fun toClOrdId(): ClOrdId = ClOrdId.read(fixIdView, 0)
+
+    /** The order's ClOrdID as the SDK takes it, for a cancel's send. Allocates. */
+    fun origToClOrdId(): ClOrdId = ClOrdId.read(origIdView, 0)
+
+    internal fun hasId(w0: Long, w1: Long, w2: Long): Boolean = word0 == w0 && word1 == w1 && word2 == w2
 
     fun fixClOrdIdEquals(buffer: DirectBuffer, offset: Int, length: Int): Boolean {
         if (length != fixClOrdIdLength) return false
@@ -176,7 +232,8 @@ class RequestRow internal constructor() {
     internal fun clear() {
         kind = RowKind.ORDER
         participantId = 0L
-        clOrdId = 0L
+        position = 0L
+        epoch = 0
         entryTradingDate = 0
         shardId = NO_SHARD
         lastReportSeq = 0L
@@ -197,9 +254,17 @@ class RequestRow internal constructor() {
         smpStrategy = 0
         ordStatus = 0
         ambiguous = false
-        origClOrdId = 0L
         cancelState = CancelState.SENT
+        fixId.fill(0)
         fixClOrdIdLength = 0
+        word0 = 0L
+        word1 = 0L
+        word2 = 0L
+        origId.fill(0)
+        origClOrdIdLength = 0
+        origWord0 = 0L
+        origWord1 = 0L
+        origWord2 = 0L
         sendPending = false
         sendAfter = 0L
         owedText = null
@@ -211,9 +276,6 @@ class RequestRow internal constructor() {
     }
 
     companion object {
-        /** The row stores the length in 16 bits. What a client may send is the backend's to bound. */
-        const val MAX_FIX_CLORDID_LENGTH = 0xffff
-
         /** A request that reached no shard: refused before it was sent. */
         const val NO_SHARD = -1
 
@@ -222,7 +284,17 @@ class RequestRow internal constructor() {
 
         /** [securityId] of a recovered order the directory does not know: refused, and stated with no 48. */
         const val NO_SECURITY = -1
-        private const val INITIAL_CLORDID_CAPACITY = 32
+
+        /** Copies 1 to 20 bytes with no NUL into [to], NUL-padded; returns the length. */
+        private fun copyId(buffer: DirectBuffer, offset: Int, length: Int, to: UnsafeBuffer): Int {
+            require(length in 1..ClOrdId.LENGTH) { "a ClOrdID of $length bytes: the exchange carries 1 to ${ClOrdId.LENGTH}" }
+            for (i in 0 until ClOrdId.LENGTH) {
+                val b: Byte = if (i < length) buffer.getByte(offset + i) else 0
+                require(i >= length || b.toInt() != 0) { "a ClOrdID with a NUL at $i" }
+                to.putByte(i, b)
+            }
+            return length
+        }
 
         /** OrdStatus filled, canceled, expired, rejected. */
         fun isTerminal(ordStatus: Byte): Boolean = when (ordStatus.toInt().toChar()) {

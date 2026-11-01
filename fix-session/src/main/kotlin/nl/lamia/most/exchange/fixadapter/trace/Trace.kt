@@ -35,7 +35,8 @@ object TraceFormat {
     const val R_STAGE = 0
     const val R_EXEC_TYPE = 1 // REPORT's ExecType; OUT's and DURABLE's shard
     const val R_PARTICIPANT = 8
-    const val R_CL_ORD_ID = 16
+    /** The request's position (Design.md §3.2): its low 32 bits are the MsgSeqNum. The exchange's derived `clOrdId` until schema 8. */
+    const val R_POSITION = 16
     const val R_TIME = 24
     const val R_EXTRA = 32
 
@@ -112,7 +113,7 @@ class Trace private constructor(file: File?, ringBytes: Int, epochClock: EpochNa
     val droppedEvents: Long get() = dropped.get()
 
     /** One event (Design.md §9.3). Call only when [enabled]; from one thread only. */
-    fun event(stage: Byte, participantId: Long, clOrdId: Long, timeNs: Long, extra: Long, execType: Byte = 0) {
+    fun event(stage: Byte, participantId: Long, position: Long, timeNs: Long, extra: Long, execType: Byte = 0) {
         val ring = ring ?: return
         val index = ring.tryClaim(stage.toInt(), TraceFormat.RECORD_SIZE)
         if (index <= 0) {
@@ -123,7 +124,7 @@ class Trace private constructor(file: File?, ringBytes: Int, epochClock: EpochNa
         b.putByte(index + TraceFormat.R_STAGE, stage)
         b.putByte(index + TraceFormat.R_EXEC_TYPE, execType)
         b.putLong(index + TraceFormat.R_PARTICIPANT, participantId)
-        b.putLong(index + TraceFormat.R_CL_ORD_ID, clOrdId)
+        b.putLong(index + TraceFormat.R_POSITION, position)
         b.putLong(index + TraceFormat.R_TIME, timeNs)
         b.putLong(index + TraceFormat.R_EXTRA, extra)
         ring.commit(index)
@@ -195,7 +196,7 @@ class TraceLog private constructor(
     val stage = ByteArray(size)
     val execType = ByteArray(size)
     val participant = LongArray(size)
-    val clOrdId = LongArray(size)
+    val position = LongArray(size)
     val time = LongArray(size)
     val extra = LongArray(size)
 
@@ -218,7 +219,7 @@ class TraceLog private constructor(
                     t.stage[r] = all.get(at + TraceFormat.R_STAGE)
                     t.execType[r] = all.get(at + TraceFormat.R_EXEC_TYPE)
                     t.participant[r] = all.getLong(at + TraceFormat.R_PARTICIPANT)
-                    t.clOrdId[r] = all.getLong(at + TraceFormat.R_CL_ORD_ID)
+                    t.position[r] = all.getLong(at + TraceFormat.R_POSITION)
                     t.time[r] = all.getLong(at + TraceFormat.R_TIME)
                     t.extra[r] = all.getLong(at + TraceFormat.R_EXTRA)
                 }
